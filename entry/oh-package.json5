@@ -1,0 +1,11 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "MetroSpeed entry module.",
+  "main": "",
+  "author": "Jinitaemay",
+  "license": "MIT",
+  "dependencies": {}
+}
+

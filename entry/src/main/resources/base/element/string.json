@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "地铁和轨交惯性测速"
+    },
+    {
+      "name": "permission_accelerometer_reason",
+      "value": "用于读取设备运动传感器并估算速度"
+    },
+    {
+      "name": "permission_gyroscope_reason",
+      "value": "用于识别设备转动和弯道状态"
+    },
+    {
+      "name": "permission_location_reason",
+      "value": "用于研究记录模式中记录系统定位、速度和航向"
+    },
+    {
+      "name": "permission_background_running_reason",
+      "value": "用于研究记录模式在后台持续采集传感器和定位数据"
+    }
+  ]
+}

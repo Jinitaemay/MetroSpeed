@@ -1,0 +1,37 @@
+# 构建产物
+build/
+entry/build/
+*.hap
+*.app
+
+# 签名文件
+signing/
+*.p12
+*.cer
+*.p7b
+*.csr
+
+# IDE 和工具
+.hvigor/
+.idea/
+*.iml
+local.properties
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node
+node_modules/
+oh_modules/
+
+# 临时文件
+*.tmp
+*.temp
+*.log
