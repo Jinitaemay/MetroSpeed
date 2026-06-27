@@ -641,13 +641,13 @@ struct Index {
       Button() {
         Text('停车校准')
           .fontSize(16)
-          .fontColor(this.isRunning ? '#0B1020' : '#64748B')
+          .fontColor(this.isRunning ? '#0B1020' : '#94A3B8')
       }
         .height(48)
         .width(0)
         .layoutWeight(1)
         .enabled(this.isRunning)
-        .backgroundColor(this.isRunning ? '#F59E0B' : '#1F2937')
+        .backgroundColor(this.isRunning ? '#F59E0B' : '#1E293B')
         .borderRadius(8)
         .onClick(() => {
           this.calibrateAtStop();
@@ -799,12 +799,12 @@ struct Index {
         Button() {
           Text('导出')
             .fontSize(14)
-            .fontColor('#0B1020')
+            .fontColor(this.hasResearchLog() ? '#0B1020' : '#94A3B8')
         }
           .height(40)
           .width(86)
           .enabled(this.hasResearchLog())
-          .backgroundColor(this.hasResearchLog() ? '#F59E0B' : '#1F2937')
+          .backgroundColor(this.hasResearchLog() ? '#F59E0B' : '#1E293B')
           .borderRadius(8)
           .onClick(() => {
             this.exportResearchLog();

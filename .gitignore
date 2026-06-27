@@ -16,6 +16,11 @@ signing/
 .idea/
 *.iml
 local.properties
+.appanalyzer/
+.vscode/
+
+# 构建签名配置（含本地 debug 签名，从 build-profile.template.json5 复制后由 DevEco 填充）
+build-profile.json5
 
 # Python 缓存
 __pycache__/
