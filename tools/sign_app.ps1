@@ -2,7 +2,8 @@
 # 使用前设置环境变量 METROSPEED_KEYSTORE_PASSWORD
 param(
     [string]$AppPath = "",
-    [string]$OutputPath = ""
+    [string]$OutputPath = "",
+    [string]$SignToolPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,7 +15,14 @@ if (-not $AppPath) { $AppPath = Join-Path $buildDir "MetroSpeed-default-unsigned
 if (-not $OutputPath) { $OutputPath = Join-Path $buildDir "MetroSpeed-release.app" }
 
 $signingDir = Join-Path $projectRoot "signing"
-$signTool = "C:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\lib\hap-sign-tool.jar"
+
+if ($SignToolPath) {
+    $signTool = $SignToolPath
+} elseif ($env:DEVECO_SDK_HOME) {
+    $signTool = Join-Path $env:DEVECO_SDK_HOME "default\openharmony\toolchains\lib\hap-sign-tool.jar"
+} else {
+    $signTool = "C:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\lib\hap-sign-tool.jar"
+}
 $keystore = Join-Path $signingDir "release.p12"
 $cert = Join-Path $signingDir "release.cer"
 $profile = Join-Path $signingDir "releaseRelease.p7b"

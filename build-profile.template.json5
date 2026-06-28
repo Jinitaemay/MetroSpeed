@@ -1,0 +1,40 @@
+{
+  "app": {
+    // DevEco Studio 会在本地 build-profile.json5 中自动填充 debug 签名配置。
+    // 仓库中只保留此模板（signingConfigs 为空），实际构建使用本地 build-profile.json5。
+    // 首次 clone 后请复制为 build-profile.json5，并在 DevEco Studio 中打开工程让其自动配置签名；
+    // 或手动执行签名配置流程。
+    "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "5.0.0(12)",
+        "runtimeOS": "HarmonyOS",
+        "targetSdkVersion": "5.0.0(12)"
+      },
+      {
+        "name": "release",
+        "signingConfig": "release",
+        "compatibleSdkVersion": "5.0.0(12)",
+        "runtimeOS": "HarmonyOS",
+        "targetSdkVersion": "5.0.0(12)"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default",
+            "release"
+          ]
+        }
+      ]
+    }
+  ]
+}

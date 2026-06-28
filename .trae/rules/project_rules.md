@@ -52,9 +52,13 @@ $env:PATH = "$env:NODE_HOME;$env:JAVA_HOME\bin;" + $env:PATH
 
 ### 2.3 签名
 
-当前 `build-profile.json5` 的 `signingConfigs` 为空数组，构建时跳过自动签名。使用 `tools/sign_app.ps1` 脚本手动签名。
+`build-profile.json5` 已从版本控制移除（含 DevEco 自动填充的 debug 签名，属本地敏感配置）。仓库只保留 `build-profile.template.json5` 模板（`signingConfigs` 为空数组），由 `.gitignore` 排除实际文件。
 
-签名前需设置环境变量：
+首次 clone 后需：
+1. 复制模板：`Copy-Item build-profile.template.json5 build-profile.json5`
+2. 用 DevEco Studio 打开工程，让其自动填充 debug 签名；或手动配置签名
+
+release 签名使用 `tools/sign_app.ps1` 脚本手动签名。签名前需设置环境变量：
 ```powershell
 $env:METROSPEED_KEYSTORE_PASSWORD = "<密钥库密码>"
 ```
@@ -65,11 +69,14 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 
 # 指定输入输出
 powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -AppPath "输入.app" -OutputPath "输出.app"
+
+# 指定签名工具路径（默认自动从 DEVECO_SDK_HOME 或默认安装路径推断）
+powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -SignToolPath "D:\sdk\...\hap-sign-tool.jar"
 ```
 
 签名流程：解压 .app → 签内部 HAP → 重新打包 → 签 .app 本身。
 
-签名文件位于 `signing/` 目录：
+签名文件位于 `signing/` 目录（不提交）：
 - `release.p12`：密钥库（EC 256位）
 - `release.cer`：发布证书
 - `releaseRelease.p7b`：Profile 文件

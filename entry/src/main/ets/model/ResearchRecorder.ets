@@ -12,8 +12,8 @@ import {
 
 const SENSOR_RECORD_INTERVAL_MS = 20;
 const ESTIMATOR_RECORD_INTERVAL_MS = 500;
-const RECORD_SCHEMA_VERSION = 11;
-const APP_VERSION_CODE = 1782469616;
+const RECORD_SCHEMA_VERSION = 13;
+const APP_VERSION_CODE = 1782645138;
 const ALGORITHM_VERSION = 'anchor-delta-20260626-r1';
 const TEMP_LOG_FILE_NAME = 'research-current.jsonl';
 const WRITE_BUFFER_LIMIT = 16;
@@ -88,7 +88,6 @@ interface SensorResearchRecord {
   measurementActive: boolean;
   measurementElapsedMs: number | null;
   sensorTimestamp: number | null;
-  gyroscopeTimestamp: number | null;
   sensorIntervalMs: number | null;
   accX: number;
   accY: number;
@@ -96,6 +95,24 @@ interface SensorResearchRecord {
   gyroX: number | null;
   gyroY: number | null;
   gyroZ: number | null;
+  gyroscopeTimestamp: number | null;
+  sysGravityX: number | null;
+  sysGravityY: number | null;
+  sysGravityZ: number | null;
+  sysGravityTimestamp: number | null;
+  linearAccX: number | null;
+  linearAccY: number | null;
+  linearAccZ: number | null;
+  linearAccTimestamp: number | null;
+  rotVecX: number | null;
+  rotVecY: number | null;
+  rotVecZ: number | null;
+  rotVecW: number | null;
+  rotVecTimestamp: number | null;
+  magX: number | null;
+  magY: number | null;
+  magZ: number | null;
+  magTimestamp: number | null;
 }
 
 export class ResearchRecorder {
@@ -471,14 +488,31 @@ export class ResearchRecorder {
       measurementActive: this.measurementActive,
       measurementElapsedMs,
       sensorTimestamp: frame.sensorTimestamp,
-      gyroscopeTimestamp: frame.gyroscopeTimestamp !== undefined ? frame.gyroscopeTimestamp : null,
       sensorIntervalMs: this.lastSensorIntervalMs,
       accX: frame.acceleration.x,
       accY: frame.acceleration.y,
       accZ: frame.acceleration.z,
       gyroX: frame.gyroscope ? frame.gyroscope.x : null,
       gyroY: frame.gyroscope ? frame.gyroscope.y : null,
-      gyroZ: frame.gyroscope ? frame.gyroscope.z : null
+      gyroZ: frame.gyroscope ? frame.gyroscope.z : null,
+      gyroscopeTimestamp: frame.gyroscopeTimestamp !== undefined ? frame.gyroscopeTimestamp : null,
+      sysGravityX: frame.gravity ? frame.gravity.x : null,
+      sysGravityY: frame.gravity ? frame.gravity.y : null,
+      sysGravityZ: frame.gravity ? frame.gravity.z : null,
+      sysGravityTimestamp: frame.gravityTimestamp !== undefined ? frame.gravityTimestamp : null,
+      linearAccX: frame.linearAcceleration ? frame.linearAcceleration.x : null,
+      linearAccY: frame.linearAcceleration ? frame.linearAcceleration.y : null,
+      linearAccZ: frame.linearAcceleration ? frame.linearAcceleration.z : null,
+      linearAccTimestamp: frame.linearAccelerationTimestamp !== undefined ? frame.linearAccelerationTimestamp : null,
+      rotVecX: frame.rotationVector ? frame.rotationVector.x : null,
+      rotVecY: frame.rotationVector ? frame.rotationVector.y : null,
+      rotVecZ: frame.rotationVector ? frame.rotationVector.z : null,
+      rotVecW: frame.rotationVector ? frame.rotationVector.w : null,
+      rotVecTimestamp: frame.rotationVectorTimestamp !== undefined ? frame.rotationVectorTimestamp : null,
+      magX: frame.magneticField ? frame.magneticField.x : null,
+      magY: frame.magneticField ? frame.magneticField.y : null,
+      magZ: frame.magneticField ? frame.magneticField.z : null,
+      magTimestamp: frame.magneticFieldTimestamp !== undefined ? frame.magneticFieldTimestamp : null
     };
 
     this.writeJsonLine(JSON.stringify(record));

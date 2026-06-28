@@ -1,34 +1,89 @@
 import sensor from '@ohos.sensor';
 import { BusinessError } from '@ohos.base';
-import { SensorFrame, Vector3 } from './SpeedTypes';
+import { SensorFrame, Vector3, Quaternion } from './SpeedTypes';
 
 type SensorFrameCallback = (frame: SensorFrame) => void;
 type SensorStatusCallback = (message: string) => void;
 const HIGH_RATE_INTERVAL_NS = 20000000;
 const HIGH_RATE_HZ = 1000000000 / HIGH_RATE_INTERVAL_NS;
-const MAX_GYROSCOPE_AGE_NS = 60000000;
+const MAX_SENSOR_AGE_NS = 60000000;
 
 export class SensorController {
   private frameCallback?: SensorFrameCallback;
   private statusCallback?: SensorStatusCallback;
+
+  // 陀螺仪
   private latestGyroscope?: Vector3;
   private latestGyroscopeTimestamp: number | null = null;
   private gyroscopeAvailable: boolean = false;
+
+  // 系统重力
+  private latestGravity?: Vector3;
+  private latestGravityTimestamp: number | null = null;
+  private gravityAvailable: boolean = false;
+
+  // 系统线性加速度
+  private latestLinearAcceleration?: Vector3;
+  private latestLinearAccelerationTimestamp: number | null = null;
+  private linearAccelerationAvailable: boolean = false;
+
+  // 旋转矢量（9DOF含磁力计）
+  private latestRotationVector?: Quaternion;
+  private latestRotationVectorTimestamp: number | null = null;
+  private rotationVectorAvailable: boolean = false;
+
+  // 磁场
+  private latestMagneticField?: Vector3;
+  private latestMagneticFieldTimestamp: number | null = null;
+  private magneticFieldAvailable: boolean = false;
+
   private running: boolean = false;
 
   start(frameCallback: SensorFrameCallback, statusCallback: SensorStatusCallback): boolean {
     this.stop();
     this.frameCallback = frameCallback;
     this.statusCallback = statusCallback;
+
+    // 重置所有传感器缓存
     this.latestGyroscope = undefined;
     this.latestGyroscopeTimestamp = null;
     this.gyroscopeAvailable = false;
+    this.latestGravity = undefined;
+    this.latestGravityTimestamp = null;
+    this.gravityAvailable = false;
+    this.latestLinearAcceleration = undefined;
+    this.latestLinearAccelerationTimestamp = null;
+    this.linearAccelerationAvailable = false;
+    this.latestRotationVector = undefined;
+    this.latestRotationVectorTimestamp = null;
+    this.rotationVectorAvailable = false;
+    this.latestMagneticField = undefined;
+    this.latestMagneticFieldTimestamp = null;
+    this.magneticFieldAvailable = false;
+
     this.running = true;
+
+    // 订阅所有辅助传感器
     this.subscribeGyroscope();
+    this.subscribeGravity();
+    this.subscribeLinearAcceleration();
+    this.subscribeRotationVector();
+    this.subscribeMagneticField();
+
+    // 加速度计是必须的
     const accelerationStarted = this.subscribeAcceleration();
     if (!accelerationStarted) {
       this.stop();
     }
+
+    const availableSensors: string[] = ['加速度计'];
+    if (this.gyroscopeAvailable) availableSensors.push('陀螺仪');
+    if (this.gravityAvailable) availableSensors.push('系统重力');
+    if (this.linearAccelerationAvailable) availableSensors.push('线性加速度');
+    if (this.rotationVectorAvailable) availableSensors.push('旋转矢量');
+    if (this.magneticFieldAvailable) availableSensors.push('磁场');
+    this.emitStatus(`已启动传感器：${availableSensors.join('、')}，请求 ${HIGH_RATE_HZ}Hz`);
+
     return accelerationStarted;
   }
 
@@ -36,9 +91,26 @@ export class SensorController {
     this.running = false;
     this.safeOffAccelerometer();
     this.safeOffGyroscope();
+    this.safeOffGravity();
+    this.safeOffLinearAcceleration();
+    this.safeOffRotationVector();
+    this.safeOffMagneticField();
+
     this.latestGyroscope = undefined;
     this.latestGyroscopeTimestamp = null;
     this.gyroscopeAvailable = false;
+    this.latestGravity = undefined;
+    this.latestGravityTimestamp = null;
+    this.gravityAvailable = false;
+    this.latestLinearAcceleration = undefined;
+    this.latestLinearAccelerationTimestamp = null;
+    this.linearAccelerationAvailable = false;
+    this.latestRotationVector = undefined;
+    this.latestRotationVectorTimestamp = null;
+    this.rotationVectorAvailable = false;
+    this.latestMagneticField = undefined;
+    this.latestMagneticFieldTimestamp = null;
+    this.magneticFieldAvailable = false;
   }
 
   private subscribeAcceleration(): boolean {
@@ -46,7 +118,6 @@ export class SensorController {
       sensor.on(sensor.SensorId.ACCELEROMETER, (data: sensor.AccelerometerResponse) => {
         this.emitFrame({ x: data.x, y: data.y, z: data.z }, data.timestamp);
       }, { interval: HIGH_RATE_INTERVAL_NS });
-      this.emitStatus(this.withGyroscopeStatus(`已使用加速度传感器（含重力），请求 ${HIGH_RATE_HZ}Hz`));
       return true;
     } catch (error) {
       const err = error as BusinessError;
@@ -65,7 +136,63 @@ export class SensorController {
     } catch (error) {
       const err = error as BusinessError;
       this.gyroscopeAvailable = false;
-      this.emitStatus(`陀螺仪不可用，弯道识别将降级：${err.message}`);
+      this.emitStatus(`陀螺仪不可用：${err.message}`);
+    }
+  }
+
+  private subscribeGravity(): void {
+    try {
+      sensor.on(sensor.SensorId.GRAVITY, (data: sensor.GravityResponse) => {
+        this.latestGravity = { x: data.x, y: data.y, z: data.z };
+        this.latestGravityTimestamp = data.timestamp;
+      }, { interval: HIGH_RATE_INTERVAL_NS });
+      this.gravityAvailable = true;
+    } catch (error) {
+      const err = error as BusinessError;
+      this.gravityAvailable = false;
+      console.info(`Gravity sensor unavailable: ${err.message}`);
+    }
+  }
+
+  private subscribeLinearAcceleration(): void {
+    try {
+      sensor.on(sensor.SensorId.LINEAR_ACCELEROMETER, (data: sensor.LinearAccelerometerResponse) => {
+        this.latestLinearAcceleration = { x: data.x, y: data.y, z: data.z };
+        this.latestLinearAccelerationTimestamp = data.timestamp;
+      }, { interval: HIGH_RATE_INTERVAL_NS });
+      this.linearAccelerationAvailable = true;
+    } catch (error) {
+      const err = error as BusinessError;
+      this.linearAccelerationAvailable = false;
+      console.info(`Linear acceleration sensor unavailable: ${err.message}`);
+    }
+  }
+
+  private subscribeRotationVector(): void {
+    try {
+      sensor.on(sensor.SensorId.ROTATION_VECTOR, (data: sensor.RotationVectorResponse) => {
+        this.latestRotationVector = { x: data.x, y: data.y, z: data.z, w: data.w };
+        this.latestRotationVectorTimestamp = data.timestamp;
+      }, { interval: HIGH_RATE_INTERVAL_NS });
+      this.rotationVectorAvailable = true;
+    } catch (error) {
+      const err = error as BusinessError;
+      this.rotationVectorAvailable = false;
+      console.info(`Rotation vector sensor unavailable: ${err.message}`);
+    }
+  }
+
+  private subscribeMagneticField(): void {
+    try {
+      sensor.on(sensor.SensorId.MAGNETIC_FIELD, (data: sensor.MagneticFieldResponse) => {
+        this.latestMagneticField = { x: data.x, y: data.y, z: data.z };
+        this.latestMagneticFieldTimestamp = data.timestamp;
+      }, { interval: HIGH_RATE_INTERVAL_NS });
+      this.magneticFieldAvailable = true;
+    } catch (error) {
+      const err = error as BusinessError;
+      this.magneticFieldAvailable = false;
+      console.info(`Magnetic field sensor unavailable: ${err.message}`);
     }
   }
 
@@ -73,30 +200,65 @@ export class SensorController {
     if (!this.running || !this.frameCallback) {
       return;
     }
+
+    const frame: SensorFrame = {
+      timestampMs: Date.now(),
+      sensorTimestamp,
+      acceleration
+    };
+
+    // 陀螺仪
     const gyroAgeNs = sensorTimestamp !== null && this.latestGyroscopeTimestamp !== null
       ? sensorTimestamp - this.latestGyroscopeTimestamp
       : null;
-    const gyroFresh = gyroAgeNs !== null && Math.abs(gyroAgeNs) <= MAX_GYROSCOPE_AGE_NS;
-    this.frameCallback({
-      timestampMs: Date.now(),
-      sensorTimestamp,
-      acceleration,
-      gyroscope: gyroFresh ? this.latestGyroscope : undefined,
-      gyroscopeTimestamp: gyroFresh ? this.latestGyroscopeTimestamp : null
-    });
+    if (this.gyroscopeAvailable && gyroAgeNs !== null && Math.abs(gyroAgeNs) <= MAX_SENSOR_AGE_NS) {
+      frame.gyroscope = this.latestGyroscope;
+      frame.gyroscopeTimestamp = this.latestGyroscopeTimestamp;
+    }
+
+    // 系统重力
+    const gravityAgeNs = sensorTimestamp !== null && this.latestGravityTimestamp !== null
+      ? sensorTimestamp - this.latestGravityTimestamp
+      : null;
+    if (this.gravityAvailable && gravityAgeNs !== null && Math.abs(gravityAgeNs) <= MAX_SENSOR_AGE_NS) {
+      frame.gravity = this.latestGravity;
+      frame.gravityTimestamp = this.latestGravityTimestamp;
+    }
+
+    // 系统线性加速度
+    const linearAccAgeNs = sensorTimestamp !== null && this.latestLinearAccelerationTimestamp !== null
+      ? sensorTimestamp - this.latestLinearAccelerationTimestamp
+      : null;
+    if (this.linearAccelerationAvailable && linearAccAgeNs !== null && Math.abs(linearAccAgeNs) <= MAX_SENSOR_AGE_NS) {
+      frame.linearAcceleration = this.latestLinearAcceleration;
+      frame.linearAccelerationTimestamp = this.latestLinearAccelerationTimestamp;
+    }
+
+    // 旋转矢量
+    const rotVecAgeNs = sensorTimestamp !== null && this.latestRotationVectorTimestamp !== null
+      ? sensorTimestamp - this.latestRotationVectorTimestamp
+      : null;
+    if (this.rotationVectorAvailable && rotVecAgeNs !== null && Math.abs(rotVecAgeNs) <= MAX_SENSOR_AGE_NS) {
+      frame.rotationVector = this.latestRotationVector;
+      frame.rotationVectorTimestamp = this.latestRotationVectorTimestamp;
+    }
+
+    // 磁场
+    const magAgeNs = sensorTimestamp !== null && this.latestMagneticFieldTimestamp !== null
+      ? sensorTimestamp - this.latestMagneticFieldTimestamp
+      : null;
+    if (this.magneticFieldAvailable && magAgeNs !== null && Math.abs(magAgeNs) <= MAX_SENSOR_AGE_NS) {
+      frame.magneticField = this.latestMagneticField;
+      frame.magneticFieldTimestamp = this.latestMagneticFieldTimestamp;
+    }
+
+    this.frameCallback(frame);
   }
 
   private emitStatus(message: string): void {
     if (this.statusCallback) {
       this.statusCallback(message);
     }
-  }
-
-  private withGyroscopeStatus(message: string): string {
-    if (this.gyroscopeAvailable) {
-      return message;
-    }
-    return `${message}；陀螺仪不可用，弯道识别降级`;
   }
 
   private safeOffAccelerometer(): void {
@@ -114,6 +276,42 @@ export class SensorController {
     } catch (error) {
       const err = error as BusinessError;
       console.warn(`gyroscope off failed: ${err.message}`);
+    }
+  }
+
+  private safeOffGravity(): void {
+    try {
+      sensor.off(sensor.SensorId.GRAVITY);
+    } catch (error) {
+      const err = error as BusinessError;
+      console.warn(`gravity off failed: ${err.message}`);
+    }
+  }
+
+  private safeOffLinearAcceleration(): void {
+    try {
+      sensor.off(sensor.SensorId.LINEAR_ACCELEROMETER);
+    } catch (error) {
+      const err = error as BusinessError;
+      console.warn(`linear acceleration off failed: ${err.message}`);
+    }
+  }
+
+  private safeOffRotationVector(): void {
+    try {
+      sensor.off(sensor.SensorId.ROTATION_VECTOR);
+    } catch (error) {
+      const err = error as BusinessError;
+      console.warn(`rotation vector off failed: ${err.message}`);
+    }
+  }
+
+  private safeOffMagneticField(): void {
+    try {
+      sensor.off(sensor.SensorId.MAGNETIC_FIELD);
+    } catch (error) {
+      const err = error as BusinessError;
+      console.warn(`magnetic field off failed: ${err.message}`);
     }
   }
 }

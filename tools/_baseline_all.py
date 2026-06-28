@@ -9,10 +9,16 @@ TOOLS_DIR = Path(__file__).resolve().parent
 REPLAY = TOOLS_DIR / "replay_estimator.py"
 
 dir_override = None
+files_override: str | None = None
 extra_args: list = []
 for i, arg in enumerate(sys.argv):
     if arg == "--dir" and i + 1 < len(sys.argv):
         dir_override = Path(sys.argv[i + 1])
+        sys.argv = sys.argv[:i] + sys.argv[i+2:]
+        break
+for i, arg in enumerate(sys.argv):
+    if arg == "--files" and i + 1 < len(sys.argv):
+        files_override = sys.argv[i + 1]
         sys.argv = sys.argv[:i] + sys.argv[i+2:]
         break
 for i, arg in enumerate(sys.argv):
@@ -40,12 +46,16 @@ for i, arg in enumerate(sys.argv):
 if dir_override:
     DATA_DIR = dir_override
 
-ALL_FILES = sorted(Path(DATA_DIR).glob("*.jsonl"))
-ALL_FILES = [f for f in ALL_FILES if "_replay_" not in f.name]
+FILES: list[str] = []
 
-if ALL_FILES:
+if files_override:
+    FILES = [f.strip() for f in files_override.split(",") if f.strip()]
+elif DATA_DIR and DATA_DIR.exists():
+    ALL_FILES = sorted(DATA_DIR.glob("*.jsonl"))
+    ALL_FILES = [f for f in ALL_FILES if "_replay_" not in f.name]
     FILES = [f.name for f in ALL_FILES]
-else:
+
+if not FILES:
     FILES = [
         "地铁_航津路-外高桥保税区北_靠在车窗上_20260619.jsonl",
         "地铁_上海赛车场-嘉定新城-马陆_平放在地板上_20260621.jsonl",

@@ -44,10 +44,25 @@ export interface CalibrationState {
   mainAxis: Vector3;
 }
 
+export interface Quaternion {
+  x: number;
+  y: number;
+  z: number;
+  w: number;
+}
+
 export interface SensorFrame {
   timestampMs: number;
   sensorTimestamp: number | null;
   acceleration: Vector3;
+  gravity?: Vector3;
+  gravityTimestamp?: number | null;
+  linearAcceleration?: Vector3;
+  linearAccelerationTimestamp?: number | null;
+  rotationVector?: Quaternion;
+  rotationVectorTimestamp?: number | null;
+  magneticField?: Vector3;
+  magneticFieldTimestamp?: number | null;
   gyroscope?: Vector3;
   gyroscopeTimestamp?: number | null;
 }
