@@ -222,7 +222,7 @@ export class SpeedEstimator {
     const rawGravityError = Math.abs(gravMag - 9.80665);
     const gyroAverage = calGyroSum / windowFrames;
     const motion = gyroAverage > 0.08 || calGyroMax > 0.25 || calMaxStep > 0.65;
-    const stable = rmsDeviation < 0.12 && rawGravityError < 0.25 && !motion;
+    const stable = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motion;
 
     if (stable) {
       this.gravityEstimate = candidate;
@@ -385,7 +385,7 @@ export class SpeedEstimator {
         const rawGravityError = Math.abs(gravityMagnitude - 9.80665);
         const gyroAverage = calGyroSum / windowFrames;
         const motionDuringCalibration = gyroAverage > 0.08 || calGyroMax > 0.25 || calMaxStep > 0.65;
-        stableResult = rmsDeviation < 0.12 && rawGravityError < 0.25 && !motionDuringCalibration;
+        stableResult = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motionDuringCalibration;
         parkingWindowEndVelocityMps = this.preCalBuffer[bestStart + windowFrames - 1].velocityMps;
       } else {
         gravityCandidate = scale(this.calibrationSum, 1 / this.calibrationSamples);
@@ -396,7 +396,7 @@ export class SpeedEstimator {
         const rawGravityError = Math.abs(gravityMagnitude - 9.80665);
         const gyroAverage = this.calibrationGyroSum / this.calibrationSamples;
         const motionDuringCalibration = gyroAverage > 0.08 || this.calibrationGyroMax > 0.25 || this.calibrationMaxStep > 0.65;
-        stableResult = rmsDeviation < 0.12 && rawGravityError < 0.25 && !motionDuringCalibration;
+        stableResult = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motionDuringCalibration;
       }
 
       if (stableResult) {

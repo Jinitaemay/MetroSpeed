@@ -161,7 +161,7 @@ class SpeedEstimator:
         dt_clamp_hi: float = 0.08,
         # calibration
         calibration_duration_ms: int = 1500,
-        calibration_rms_threshold: float = 0.12,
+        calibration_rms_threshold: float = 0.25,
         calibration_gravity_error: float = 0.25,
         calibration_motion_gyro_mean: float = 0.08,
         calibration_motion_gyro_max: float = 0.25,
@@ -1527,7 +1527,7 @@ def main() -> int:
     parser.add_argument("--dt-clamp-hi", type=float, default=0.08)
     # calibration
     parser.add_argument("--calibration-duration-ms", type=int, default=1500)
-    parser.add_argument("--calibration-rms-threshold", type=float, default=0.12)
+    parser.add_argument("--calibration-rms-threshold", type=float, default=0.25)
     parser.add_argument("--calibration-gravity-error", type=float, default=0.25)
     parser.add_argument("--calibration-motion-gyro-mean", type=float, default=0.08)
     parser.add_argument("--calibration-motion-gyro-max", type=float, default=0.25)

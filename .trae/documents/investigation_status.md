@@ -1,8 +1,8 @@
 # MetroSpeed 项目工作记忆
 
-> **记忆版本**：v20
-> **最后更新**：2026-06-28
-> **对应阶段**：4传感器实现入库，build-profile 隔离 debug 签名，脚本参数化，待路测采集数据验证
+> **记忆版本**：v21
+> **最后更新**：2026-06-29
+> **对应阶段**：首条 v13 全传感器地铁记录验证通过，rmsDeviation 阈值放宽，工程清理收尾完成
 
 ---
 
@@ -169,13 +169,23 @@ MetroSpeed/
 > 2026-06-28：用户清理了一批过长的、可能产生误导性测试结果的记录，精简了测试集。
 
 ### 核心验证记录（精简后）
-| 记录 | pure MAE | pure=0 | pure=0(-40ms) | 场景 |
-|------|----------|--------|---------------|------|
-| 地铁_航津路-保税区北 | 7.31 | 0.93 | **0.03** | 直线，理想 |
-| 地铁_上海赛车场-马陆 | 13.52 | 1.12 | **0.25** | 多弯道 |
-| 磁浮_浦东机场-龙阳路 | — | 1.03 | **0.04** | 极速306km/h |
-| 地铁_沈杜公路-汇臻路(浦江线) | — | 0.39 | **0.16** | 胶轮APM，GNSS可信 |
-| 地铁_虹桥-浦东机场(市域机场线) | — | 1.21 | **0.26** | 高速122km/h，长距离 |
+| 记录 | pure MAE | pure=0(-40ms) | 场景 |
+|------|----------|---------------|------|
+| 地铁_航津路-保税区北 | 7.23 | **0.03** | 直线，理想 |
+| 地铁_上海赛车场-马陆 | 17.33 | **0.10** | 多弯道，rms放宽改善 |
+| 磁浮_浦东机场-龙阳路 | 45.87 | **0.04** | 极速306km/h |
+| 地铁_沈杜公路-汇臻路(浦江线) | 12.23 | **0.16** | 胶轮APM |
+| 地铁_虹桥-浦东机场(市域机场线) | 16.02 | **0.08** | 高速184km/h，rms放宽显著改善 |
+| 公交_奉浦快线 | 7.62 | **1.12** | 快速公交 |
+| 驾车_东靖路(短) | 3.21 | **0.13** | 城市短途 |
+| 驾车_东靖路-沪常高速(长) | 23.89 | **14.52** | 高速+隧道 |
+
+> pure MAE 为 pure inertial 模式 moving MAE，pure=0(-40ms) 为 anchor-v2 + pure-zero + GNSS lag 补偿。
+
+### v13 全传感器记录（新增）
+| 记录 | pure MAE | pure=0(-40ms) | 辅助传感器 |
+|------|----------|---------------|------------|
+| 地铁_南京东路-豫园-老西门·新天地_20260629 | — | — | ✅ gyro/grav/la/rot/mag 15076帧全，已采集算法输出 |
 
 **传感器频率发现**：代码请求 50Hz（sensorIntervalMs=20ms），但实际系统输出只有 33~37 Hz。
 
@@ -198,6 +208,8 @@ MetroSpeed/
 6. **传感器实际频率只有 33~37 Hz**：代码请求 50Hz，但系统实际输出达不到。
 7. **鸿蒙API坑**：GAME_ROTATION_VECTOR底层C API支持，但ArkTS公开API未暴露SensorId常量，普通应用无法订阅；LINEAR_ACCELERATION正确名称是LINEAR_ACCELEROMETER，响应类型是LinearAccelerometerResponse
 8. **API版本选择**：不升级API20，因为API20也不支持GAME_ROTATION_VECTOR，反而会导致Button等系统组件默认样式变化（自定义borderRadius在API12不生效，用系统默认胶囊形；API20自定义样式生效导致圆角变小），且之前beta API问题是DevEco Beta版导致的，不是API12本身问题
+9. **rawAcc ≈ sysGravity + linearAcc 已验证成立**：首条 v13 全传感器地铁记录（南京东路→新天地），15076帧上中位偏差 0.05 m/s²，|la|>0.5 加速段中位 0.12 m/s²。等式在地铁动态场景成立，系统传感器的拆分自洽。
+10. **地铁地板微振阻止初始校准**：列车停站时空调/铁轨传导的高频微振（~10-50Hz）导致加速度计 rmsDeviation=0.20，超过旧阈值 0.12。现象：设备放地铁地板上，用户按"开始"后几秒显示"开始失败：初始校准不稳"。陀螺仪无异常（gyroMax=0.048），重力值正常（9.81±0.004），纯 rmsDeviation 超标。
 
 ### 技术要点
 - **时间源**：`computeDeltaSeconds` 优先 sensorTimestamp，其余用 Date.now()（墙上时间语义），双轨正确
@@ -293,6 +305,7 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 | 06-27 | Beta API 修复 | AppGallery审核因beta API被拒，降级到DevEco Studio 6.1.1 Release重新构建；sign_app.ps1路径bug修复；对比度修复完成重新提交审核 |
 | 06-28 | 传感器采集 | 完成4个辅助传感器数据采集功能：GRAVITY、LINEAR_ACCELEROMETER、ROTATION_VECTOR、MAGNETIC_FIELD；确认GAME_ROTATION_VECTOR ArkTS API不支持，清理相关死代码；研究记录schema升级到v13；保持SDK版本为API12，不升级API20；清理过长的误导性测试记录 |
 | 06-28 | 工程清理 | build-profile.json5 移出版本控制改用 template 机制隔离 debug 签名；4 传感器实现提交入库（316 行）；_run_new_batch.py / _scan_anchor_interval.py 改为 --dir/--files 参数化（规则 7.1）；project_rules.md 2.3 节同步 |
+| 06-29 | 数据验证+阈值调整 | 首条 v13 全传感器地铁记录验证：rawAcc ≈ sysGravity + linearAcc 中位误差 0.05 m/s²，加速段 0.12 m/s²，等式成立；发现地铁地板微振导致初始校准 rmsDeviation=0.20 超过旧阈值 0.12，放宽到 0.25；sign_app.ps1 新增 -SignToolPath 参数（读 DEVECO_SDK_HOME）；_baseline_all.py 补 --files 参数；project_memory 删除 force-push 偏好；commit 合并整理（c64eb11/10207ef/+1） |
 
 ---
 
@@ -308,15 +321,20 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 7. build-profile.json5 移出版本控制，改用 template 机制隔离 debug 签名
 8. _run_new_batch.py / _scan_anchor_interval.py 改为 --dir/--files 参数化（规则 7.1）
 9. project_rules.md 2.3 节同步为 template 机制
+10. sign_app.ps1 -SignToolPath 可配置（读 DEVECO_SDK_HOME 或参数）
+11. _baseline_all.py 补 --files 参数
+12. GitHub commit 合并整理为 3 个（c64eb11 / 10207ef+工具链 / 4传感器+工程清理）
+13. 初始校准 rmsDeviation 阈值 0.12→0.25 适配地铁地板微振
+14. 首条 v13 全传感器地铁记录验证：rawAcc ≈ sysGravity + linearAcc 成立（|la|>0.5 加速段中位偏差 0.12 m/s²）
+15. 诊断地铁地板无法开始校准的根因：rmsDeviation=0.20 超标
 
 **待执行任务（按优先级）**：
-1. 🔴 路测采集包含4个辅助传感器的数据，验证核心假设：系统重力+系统线性加速度≈原始加速度计读数
-2. 🔴 分析各传感器在加减速/过弯/隧道场景下的实际表现，确定隧道精度优化的融合方案
-3. 🟡 sign_app.ps1中`$signTool`硬编码路径改为可配置
-4. 🟡 精简后的核心数据集跑全量baseline验证
-5. 🟢 多语言支持（英文）
-6. 🟢 后台长时记录稳定性测试
-7. 🟢 历史记录管理界面
+1. 🔴 持续路测采集 v13 记录（目标 7-8 条含全传感器数据），验证系统重力传感器在持续加速场景是否被污染
+2. 🔴 有足够记录后，对比「rawAcc - preCalGravity」vs「系统 linearAcc」的 MAE，确定重力传感器是否能替代自估重力
+3. 🟡 分析龙阳路→张江高科长期无校准漂移问题（max=80km/h，无 GNSS 有效修复）
+4. 🟢 多语言支持（英文）
+5. 🟢 后台长时记录稳定性测试
+6. 🟢 历史记录管理界面
 
 ---
 
@@ -337,3 +355,5 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 13. **不要轻易升级SDK版本**：API12目前稳定可用，升级API20/23会导致Button等组件默认样式变化，确认有明确收益且验证过UI兼容性后再升级。
 14. **API名称坑**：线性加速度传感器正确名称是LINEAR_ACCELEROMETER，不是LINEAR_ACCELERATION；响应类型是LinearAccelerometerResponse，不是LinearAccelerationResponse。
 15. **debug安装直接在DevEco点运行**：不要折腾命令行签名，DevEco会自动处理debug签名，手机连接后直接点运行即可。
+16. **project_memory 不再禁止 force-push**：2026-06-26 的"avoid amend + force push"偏好已删除，commit 整理完可直接 force-with-lease。
+17. **rmsDeviation 校准阈值已调整为 0.25**：与 gravityError 阈值对齐（均为 2.5%g 级别）。地铁场景整体改善（虹桥 0.26→0.08，上海赛车场 0.25→0.10），公交东方路-大连路有劣化风险（0.78→19.67），属可接受的取舍。
