@@ -14,11 +14,11 @@
     },
     {
       "name": "permission_location_reason",
-      "value": "用于研究记录模式中记录系统定位、速度和航向"
+      "value": "用于获取卫星定位速度作为测速基准并融合修正惯性测速结果"
     },
     {
       "name": "permission_background_running_reason",
-      "value": "用于研究记录模式在后台持续采集传感器和定位数据"
+      "value": "用于在后台持续采集传感器和定位数据以维持测速"
     }
   ]
 }

@@ -12,27 +12,22 @@ export class SensorController {
   private frameCallback?: SensorFrameCallback;
   private statusCallback?: SensorStatusCallback;
 
-  // 陀螺仪
   private latestGyroscope?: Vector3;
   private latestGyroscopeTimestamp: number | null = null;
   private gyroscopeAvailable: boolean = false;
 
-  // 系统重力
   private latestGravity?: Vector3;
   private latestGravityTimestamp: number | null = null;
   private gravityAvailable: boolean = false;
 
-  // 系统线性加速度
   private latestLinearAcceleration?: Vector3;
   private latestLinearAccelerationTimestamp: number | null = null;
   private linearAccelerationAvailable: boolean = false;
 
-  // 旋转矢量（9DOF含磁力计）
   private latestRotationVector?: Quaternion;
   private latestRotationVectorTimestamp: number | null = null;
   private rotationVectorAvailable: boolean = false;
 
-  // 磁场
   private latestMagneticField?: Vector3;
   private latestMagneticFieldTimestamp: number | null = null;
   private magneticFieldAvailable: boolean = false;
@@ -44,7 +39,6 @@ export class SensorController {
     this.frameCallback = frameCallback;
     this.statusCallback = statusCallback;
 
-    // 重置所有传感器缓存
     this.latestGyroscope = undefined;
     this.latestGyroscopeTimestamp = null;
     this.gyroscopeAvailable = false;
@@ -63,14 +57,8 @@ export class SensorController {
 
     this.running = true;
 
-    // 订阅所有辅助传感器
     this.subscribeGyroscope();
-    this.subscribeGravity();
-    this.subscribeLinearAcceleration();
-    this.subscribeRotationVector();
-    this.subscribeMagneticField();
 
-    // 加速度计是必须的
     const accelerationStarted = this.subscribeAcceleration();
     if (!accelerationStarted) {
       this.stop();
@@ -78,13 +66,36 @@ export class SensorController {
 
     const availableSensors: string[] = ['加速度计'];
     if (this.gyroscopeAvailable) availableSensors.push('陀螺仪');
-    if (this.gravityAvailable) availableSensors.push('系统重力');
-    if (this.linearAccelerationAvailable) availableSensors.push('线性加速度');
-    if (this.rotationVectorAvailable) availableSensors.push('旋转矢量');
-    if (this.magneticFieldAvailable) availableSensors.push('磁场');
     this.emitStatus(`已启动传感器：${availableSensors.join('、')}，请求 ${HIGH_RATE_HZ}Hz`);
 
     return accelerationStarted;
+  }
+
+  startAuxiliarySensors(): void {
+    this.subscribeGravity();
+    this.subscribeLinearAcceleration();
+    this.subscribeRotationVector();
+    this.subscribeMagneticField();
+  }
+
+  stopAuxiliarySensors(): void {
+    this.safeOffGravity();
+    this.safeOffLinearAcceleration();
+    this.safeOffRotationVector();
+    this.safeOffMagneticField();
+
+    this.latestGravity = undefined;
+    this.latestGravityTimestamp = null;
+    this.gravityAvailable = false;
+    this.latestLinearAcceleration = undefined;
+    this.latestLinearAccelerationTimestamp = null;
+    this.linearAccelerationAvailable = false;
+    this.latestRotationVector = undefined;
+    this.latestRotationVectorTimestamp = null;
+    this.rotationVectorAvailable = false;
+    this.latestMagneticField = undefined;
+    this.latestMagneticFieldTimestamp = null;
+    this.magneticFieldAvailable = false;
   }
 
   stop(): void {
@@ -207,7 +218,6 @@ export class SensorController {
       acceleration
     };
 
-    // 陀螺仪
     const gyroAgeNs = sensorTimestamp !== null && this.latestGyroscopeTimestamp !== null
       ? sensorTimestamp - this.latestGyroscopeTimestamp
       : null;
@@ -216,7 +226,6 @@ export class SensorController {
       frame.gyroscopeTimestamp = this.latestGyroscopeTimestamp;
     }
 
-    // 系统重力
     const gravityAgeNs = sensorTimestamp !== null && this.latestGravityTimestamp !== null
       ? sensorTimestamp - this.latestGravityTimestamp
       : null;
@@ -225,7 +234,6 @@ export class SensorController {
       frame.gravityTimestamp = this.latestGravityTimestamp;
     }
 
-    // 系统线性加速度
     const linearAccAgeNs = sensorTimestamp !== null && this.latestLinearAccelerationTimestamp !== null
       ? sensorTimestamp - this.latestLinearAccelerationTimestamp
       : null;
@@ -234,7 +242,6 @@ export class SensorController {
       frame.linearAccelerationTimestamp = this.latestLinearAccelerationTimestamp;
     }
 
-    // 旋转矢量
     const rotVecAgeNs = sensorTimestamp !== null && this.latestRotationVectorTimestamp !== null
       ? sensorTimestamp - this.latestRotationVectorTimestamp
       : null;
@@ -243,7 +250,6 @@ export class SensorController {
       frame.rotationVectorTimestamp = this.latestRotationVectorTimestamp;
     }
 
-    // 磁场
     const magAgeNs = sensorTimestamp !== null && this.latestMagneticFieldTimestamp !== null
       ? sensorTimestamp - this.latestMagneticFieldTimestamp
       : null;

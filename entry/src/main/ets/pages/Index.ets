@@ -84,6 +84,9 @@ struct Index {
       }, (message: string) => {
         this.sensorStatus = message;
       });
+      if (this.researchSensorActive) {
+        this.sensorController.startAuxiliarySensors();
+      }
       this.startLocationForAll();
     }
     this.wasMeasuringBeforeBackground = false;
@@ -365,7 +368,13 @@ struct Index {
   }
 
   private startResearchSensors(): void {
-    if (this.isRunning || this.researchSensorActive) {
+    if (this.researchSensorActive) {
+      return;
+    }
+
+    if (this.isRunning) {
+      this.sensorController.startAuxiliarySensors();
+      this.researchSensorActive = true;
       return;
     }
 
@@ -375,6 +384,9 @@ struct Index {
     }, (message: string) => {
       this.sensorStatus = message;
     });
+    if (started) {
+      this.sensorController.startAuxiliarySensors();
+    }
     this.researchSensorActive = started;
     if (!started) {
       this.sensorStatus = '研究记录传感器未启动';
@@ -382,7 +394,13 @@ struct Index {
   }
 
   private stopResearchSensorsIfIdle(): void {
-    if (!this.researchSensorActive || this.isRunning) {
+    if (!this.researchSensorActive) {
+      return;
+    }
+
+    if (this.isRunning) {
+      this.sensorController.stopAuxiliarySensors();
+      this.researchSensorActive = false;
       return;
     }
 

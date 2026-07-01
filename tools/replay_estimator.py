@@ -18,6 +18,7 @@ APP_PARITY_CONFIG = {
     "low_confidence_negative_scale": 0.55,
     "braking_negative_scale": 1.0,
     "use_gyro_gravity": False,
+    "use_sys_gravity": False,
     "gyro_gravity_sign": -1.0,
     "use_vibration_guard": True,
     "vibration_threshold": 0.85,
@@ -113,6 +114,7 @@ class SensorFrame:
     acceleration: Vector3
     gyroscope: Optional[Vector3]
     gyroscope_timestamp: Optional[float]
+    sys_gravity: Optional[Vector3] = None
 
 
 @dataclass
@@ -240,6 +242,7 @@ class SpeedEstimator:
         # experimental
         use_gyro_gravity: bool = False,
         gyro_gravity_sign: float = -1.0,
+        use_sys_gravity: bool = False,
     ) -> None:
         # effective acceleration scales
         self.curve_positive_scale = curve_positive_scale
@@ -337,6 +340,7 @@ class SpeedEstimator:
         # experimental
         self.use_gyro_gravity = use_gyro_gravity
         self.gyro_gravity_sign = gyro_gravity_sign
+        self.use_sys_gravity = use_sys_gravity
         self.running = False
         self.start_ms = 0
         self.last_timestamp_ms = 0
@@ -514,7 +518,11 @@ class SpeedEstimator:
 
         gyro_magnitude = v_mag(frame.gyroscope) if frame.gyroscope is not None else 0.0
         self.update_gravity_from_gyro(frame.gyroscope, dt, gyro_magnitude)
-        motion_acceleration = v_sub(raw_acceleration, self.gravity_estimate)
+        if self.use_sys_gravity and frame.sys_gravity is not None:
+            gravity_for_motion = frame.sys_gravity
+        else:
+            gravity_for_motion = self.gravity_estimate
+        motion_acceleration = v_sub(raw_acceleration, gravity_for_motion)
         clipped = clip_magnitude(motion_acceleration, self.accel_clip_ceiling)
         filtered = self.low_pass(clipped, self.low_pass_alpha)
         self.filtered_acceleration = filtered
@@ -655,7 +663,8 @@ class SpeedEstimator:
             )
 
         if stable_result:
-            self.gravity_estimate = gravity_candidate
+            if not self.use_sys_gravity:
+                self.gravity_estimate = gravity_candidate
             self.calibration_rejected_until_ms = 0
             if self.parking_calibration_pending:
                 self.apply_parking_zero(timestamp_ms, parking_window_end_velocity_mps)
@@ -693,6 +702,8 @@ class SpeedEstimator:
         gyro_magnitude: float,
     ) -> None:
         if not self.use_gyro_gravity:
+            return
+        if self.use_sys_gravity:
             return
         if gyroscope is not None and 0.0 < dt <= 0.08 and gyro_magnitude < 2.5:
             delta = v_scale(v_cross(gyroscope, self.gravity_estimate), self.gyro_gravity_sign * dt)
@@ -910,6 +921,11 @@ class SpeedEstimator:
         return clamp(value, self.confidence_clamp_lo, self.confidence_clamp_hi)
 
     def make_output(self, frame: SensorFrame, filtered: Optional[Vector3] = None) -> EstimatorOutput:
+        gravity_for_output = (
+            frame.sys_gravity
+            if (self.use_sys_gravity and frame.sys_gravity is not None)
+            else self.gravity_estimate
+        )
         return EstimatorOutput(
             timestamp_ms=frame.timestamp_ms,
             sensor_timestamp=frame.sensor_timestamp,
@@ -918,7 +934,7 @@ class SpeedEstimator:
             motion_state=self.motion_state,
             raw=frame.acceleration,
             filtered=filtered if filtered is not None else self.filtered_acceleration,
-            gravity=self.gravity_estimate,
+            gravity=gravity_for_output,
             main_axis=self.main_axis,
             calibration_count=self.calibration_count,
             calibration_rejected=(
@@ -992,12 +1008,14 @@ def make_sensor_frame(row: Dict[str, Any]) -> Optional[SensorFrame]:
     if acceleration is None:
         return None
     gyroscope = parse_vector(row, "gyroX", "gyroY", "gyroZ")
+    sys_gravity = parse_vector(row, "sysGravityX", "sysGravityY", "sysGravityZ")
     return SensorFrame(
         timestamp_ms=int(row["timestampMs"]),
         sensor_timestamp=parse_number(row, "sensorTimestamp"),
         acceleration=acceleration,
         gyroscope=gyroscope,
         gyroscope_timestamp=parse_number(row, "gyroscopeTimestamp"),
+        sys_gravity=sys_gravity,
     )
 
 
@@ -1515,6 +1533,7 @@ def main() -> int:
     parser.add_argument("--braking-negative-scale", type=float, default=1.0, help="Scale negative acceleration while in braking state.")
     parser.add_argument("--no-infer-start", action="store_true", help="Do not infer measurement start from estimator-bearing sensor rows.")
     parser.add_argument("--use-gyro-gravity", action="store_true", help="Experimental only: not implemented in the ArkTS app.")
+    parser.add_argument("--use-sys-gravity", action="store_true", help="Experimental only: use system gravity sensor instead of estimated gravity when available.")
     parser.add_argument("--gyro-gravity-sign", type=float, default=-1.0, help="Sign for gyro gravity propagation. Use -1 for body-frame inertial vector update.")
     parser.add_argument("--no-vibration-guard", action="store_true", help="Disable high acceleration-step vibration guarding.")
     parser.add_argument("--vibration-threshold", type=float, default=0.85, help="Mean acceleration-step threshold for vibration low-confidence handling.")
@@ -1628,6 +1647,7 @@ def main() -> int:
         "braking_negative_scale": args.braking_negative_scale,
         "infer_start_from_sensor": not args.no_infer_start,
         "use_gyro_gravity": args.use_gyro_gravity,
+        "use_sys_gravity": args.use_sys_gravity,
         "gyro_gravity_sign": args.gyro_gravity_sign,
         "use_vibration_guard": not args.no_vibration_guard,
         "vibration_threshold": args.vibration_threshold,
