@@ -1,6 +1,10 @@
 # MetroSpeed · 地铁测速
 
-> 基于惯性传感器的轨道交通测速工具。仅凭手机加速度计和陀螺仪，即可实时估算地铁、公交、列车的行驶速度，无需依赖 GNSS。
+> 基于惯性传感器的轨道交通测速工具。
+>
+> **项目目标**：
+> 1. **纯惯性测速** — 仅用手机加速度计和陀螺仪，不依赖 GNSS 或系统融合输出，实时估算行驶速度
+> 2. **复刻鸿蒙隧道定位机制** — GNSS 失效时用惯性推算维持速度输出，模拟系统从 GNSS 切换到 IMU dead reckoning 的行为
 >
 > **算法版本**：`anchor-delta-20260626-r1`
 
@@ -27,7 +31,7 @@ GNSS 信号良好时自动启用锚定模式，以 GNSS 速度为锚点叠加惯
 - 最高速度 / 平均速度 / 行驶时长 / 校准次数
 
 ### 6. 研究记录模式
-全量 50Hz 传感器数据 + GNSS 数据 JSONL 格式记录，支持导出离线分析，适合技术爱好者和研究使用。
+全量 50Hz 传感器数据 + GNSS 数据 JSONL 格式记录，支持导出离线分析，适合技术爱好者和研究使用。Schema v13 新增 4 个辅助传感器（系统重力、线性加速度、旋转矢量、磁场）采集，用于验证系统融合误差特性。
 
 ---
 
@@ -118,32 +122,32 @@ MetroSpeed/
 │       ├── pages/Index.ets              # 主界面 + 锚点逻辑
 │       └── model/
 │           ├── SpeedEstimator.ets       # 惯性速度估算核心
-│           ├── SensorController.ets     # 50Hz 加速度计+陀螺仪
+│           ├── SensorController.ets     # 50Hz 加速度计+陀螺仪+4个辅助传感器
 │           ├── LocationController.ets   # GNSS 定位 + 卫星状态
-│           ├── ResearchRecorder.ets     # JSONL 全量记录
+│           ├── ResearchRecorder.ets     # JSONL 全量记录（schema v13）
 │           ├── BackgroundState.ets      # 后台记录状态共享
 │           └── SpeedTypes.ets           # 类型定义、向量运算
 ├── tools/
-│   ├── replay_estimator.py             # 离线回放引擎 + 锚点v2 (--pure-zero 匹配手机)
-│   ├── _baseline_all.py                # 全量基线对比 (--dir --anchor-v2)
+│   ├── replay_estimator.py             # 离线回放引擎 + 锚点v2 + --use-sys-gravity 分析开关
+│   ├── _baseline_all.py                # 全量基线对比 (--dir --anchor-v2 --files)
 │   ├── _tunnel_diag.py                 # 隧道分段MAE + 纯速度曲线
 │   ├── _bias_diag.py                   # cal_0积分不对称 + 重力/主轴追踪
 │   ├── param_sensitivity.py            # 83参数 ±50% 敏感度扫描
 │   ├── sync_version.py                 # 版本号 ArkTS ↔ Python 同步
 │   ├── trim_cal_segment.py             # 裁剪校准段
 │   ├── _scan_anchor_interval.py        # 锚点间隔多进程并行扫描
+│   ├── _run_new_batch.py               # 批量多组参数对比 (--dir/--files)
 │   └── sign_app.ps1                    # 一键签名脚本
 ├── signing/                             # 签名文件（敏感，不提交）
 │   ├── release.p12                     # 密钥库（EC 256位）
 │   ├── release.cer                     # 发布证书
 │   └── releaseRelease.p7b              # Profile 文件
-├── hvigor/
-│   └── hvigor-config.json5            # 构建配置
 ├── .trae/                              # AI 项目配置
 │   ├── rules/project_rules.md          # 项目规则
+│   ├── specs/                          # spec 驱动开发
 │   └── documents/investigation_status.md  # 研究状态
 ├── hvigorfile.ts                       # 构建脚本（自动更新 versionCode）
-├── build-profile.json5                 # 构建配置
+├── build-profile.template.json5        # 构建配置模板（signingConfigs 为空）
 ├── oh-package.json5
 ├── LICENSE                              # MIT
 ├── .gitignore
@@ -214,18 +218,13 @@ python tools/sync_version.py --check
 
 | 日期 | 阶段 | 关键动作 |
 |------|------|----------|
-| 04月 | 弃案 | 网页应用 + 系统线性加速度传感器，被融合误差吞掉起步加速 → 搁置一个多月 |
-| 06-12~17 | 基建 | 先有测速再补记录；初始目标手持，妥协为稳定放置；传感器经历三代；SpeedEstimator 核心算法成；JSONL 全量记录和 Python 回放引擎同步搭建；v1→v13 快速迭代 |
-| 06-18 | 定标 | 固定记录命名格式；首批数据采集；确立双端验证链路 |
-| 06-19~21 | 采集 | 地铁4条 + 驾车3条 + 公交2条 + 纯隧道1条 |
-| 06-22 | 优化 | 转向已有记录算法优化；产出 v13→v18 四个活跃改动 |
-| 06-23 上午 | 突破 | 偏置根因，pure=0 锚定 MAE sub-2 km/h；信噪比切换；自适应停车校准；入隧重力刷新 |
-| 06-23 下午 | 验证 | 采集6号线/浦江线/市域机场线/磁浮线/北安跨线/奉浦快线6条新记录；发现GNSS固定-40ms延迟 |
-| 06-24 | 补偿 | 将 -40ms GNSS 延迟补偿同时部署到 ArkTS 和 Python；全量 17 条 baseline 重跑 |
-| 06-25 | 发布准备 | 算法版本重命名；磁浮线验证；定 MIT 许可证；上架应用介绍文案定稿；release 构建链验证；签名密钥生成；版本号改为 1.0.0；一键签名脚本；正式上架包；死文件清理；死代码排查；提交 AppGallery 审核 |
-| 06-26 | 审核修复 | 修复三个自检问题：退后台传感器占用（长时任务+emitter）、Scroll回弹动效（EdgeEffect.Spring）、深色文字对比度（#94A3B8）；停车校准速度补偿入包；全量代码核查+文档修复；死代码清理；构建签名完成 |
-| 06-26 | 开源准备 | 变量命名规范化（GPS→GNSS、Vector→Vector3、lag/delay统一）；sign_app.ps1 密码改为环境变量；三份文档交叉审计；git init + 本地提交 |
-| 06-26 | 开源上线 | push GitHub master 成功；仓库地址 https://github.com/Jinitaemay/MetroSpeed |
+| 04月 | 弃案 | 系统线性加速度传感器被融合误差吞掉起步加速 → 搁置 |
+| 06-12~22 | 基建+优化 | 核心算法成型；双端验证链路；偏置根因突破，pure=0 锚定 MAE sub-2 km/h |
+| 06-23~25 | 验证+发布 | 6 条新记录验证；-40ms 延迟补偿；MIT 许可证；提交 AppGallery 审核；开源上线 GitHub |
+| 06-26~27 | 审核修复 | 退后台占用/对比度/beta API 修复；重新提交审核 |
+| 06-28 | 传感器采集 | 4 个辅助传感器采集功能完成；schema v13；签名配置隔离 |
+| 06-29 | 上架通过 | AppGallery 审核通过，"地铁测速" 1.0.0 正式上架 |
+| 06-29~07-02 | 持续研究 | rmsDeviation 阈值调整 0.12→0.25；v13 记录分析；系统重力不可用结论；隧道定位机制确认 |
 
 ---
 
