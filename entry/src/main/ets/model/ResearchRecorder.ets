@@ -13,7 +13,7 @@ import {
 const SENSOR_RECORD_INTERVAL_MS = 20;
 const ESTIMATOR_RECORD_INTERVAL_MS = 500;
 const RECORD_SCHEMA_VERSION = 13;
-const APP_VERSION_CODE = 1782990858;
+const APP_VERSION_CODE = 1783057831;
 const ALGORITHM_VERSION = 'anchor-delta-20260626-r1';
 const TEMP_LOG_FILE_NAME = 'research-current.jsonl';
 const WRITE_BUFFER_LIMIT = 16;
@@ -653,34 +653,54 @@ export class ResearchRecorder {
     }
 
     try {
-      const text = fs.readTextSync(this.tempLogPath);
-      const lines = text.split('\n');
-      let count = 0;
-      let lastRecord: Record<string, Object> | null = null;
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (line.length < 1) {
-          continue;
-        }
-        count += 1;
-        try {
-          lastRecord = JSON.parse(line) as Record<string, Object>;
-        } catch (error) {
+      const stat = fs.statSync(this.tempLogPath);
+      const fileSize = stat.size;
+      if (fileSize <= 0) {
+        return;
+      }
+
+      const TAIL_SIZE = 65536;
+      let text: string;
+      if (fileSize <= TAIL_SIZE) {
+        text = fs.readTextSync(this.tempLogPath);
+      } else {
+        text = fs.readTextSync(this.tempLogPath, { offset: fileSize - TAIL_SIZE, length: TAIL_SIZE });
+        const firstNewline = text.indexOf('\n');
+        if (firstNewline >= 0) {
+          text = text.substring(firstNewline + 1);
         }
       }
 
-      this.recordCount = count;
-      if (!lastRecord) {
+      const lastNewline = text.lastIndexOf('\n');
+      let lastLine = '';
+      if (lastNewline < 0) {
+        lastLine = text.trim();
+      } else {
+        lastLine = text.substring(lastNewline + 1).trim();
+        if (lastLine.length === 0 && lastNewline > 0) {
+          const prevNewline = text.lastIndexOf('\n', lastNewline - 1);
+          lastLine = prevNewline < 0
+            ? text.substring(0, lastNewline).trim()
+            : text.substring(prevNewline + 1, lastNewline).trim();
+        }
+      }
+
+      if (lastLine.length === 0) {
         return;
       }
+
+      const lastRecord = JSON.parse(lastLine) as Record<string, Object>;
+      const restoredRecordSeq = lastRecord['recordSeq'];
+      if (typeof restoredRecordSeq === 'number') {
+        this.recordCount = restoredRecordSeq;
+        this.recordSeq = restoredRecordSeq;
+      }
+
       const restoredSessionId = lastRecord['sessionId'];
       if (typeof restoredSessionId === 'string' && restoredSessionId.length > 0) {
         this.sessionId = restoredSessionId;
       }
-      const restoredRecordSeq = lastRecord['recordSeq'];
-      if (typeof restoredRecordSeq === 'number') {
-        this.recordSeq = restoredRecordSeq;
-      }
+
       const restoredEvent = lastRecord['event'];
       const restoredType = lastRecord['recordType'];
       if (typeof restoredEvent === 'string' && restoredEvent.length > 0) {

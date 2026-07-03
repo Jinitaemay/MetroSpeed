@@ -1,4 +1,4 @@
-﻿# MetroSpeed 项目工作记忆
+# MetroSpeed 项目工作记忆
 
 > **记忆版本**：v29
 > **最后更新**：2026-07-02
@@ -340,7 +340,7 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 | 07-02 | 重力传感器分析 | 完成 `--use-sys-gravity` 分析工具（replay_estimator.py）；分场景对比：地铁 NO-GO（中位速度 40.9→0.6 km/h，吃加速度），驾车有效（moving MAE 14.14→1.86 km/h，87%↓）；修正早期"系统自比"错误论断（GRAVITY 传感器为 9DOF 融合，不融合 GNSS）；确认鸿蒙系统隧道定位机制为 IMU 惯性推算（satFix/satCount/accuracy 恒定特征），非真实 GNSS |
 | 07-02 | 文档同步 | 项目两个目标写回 investigation_status.md 和 README.md；AppGallery 上架通过状态更新（06-29 09:49, versionCode=1782556056）；README 时间线精简为 7 行阶段性里程碑 |
 | 07-02 | 隧道漂移根因验证 | 苏沪伪通勤 3 次入隧数据分析：修正早期"重力估计漂移"错误根因，确认实际根因为纯惯性积分误差累积（段3 高速入隧 206s 漂移到 831km/h，段2 静止入隧 513s 仅 71.6km/h）；重力/主轴在隧道内均稳定（gx/gy/gz 不变，偏移 0°），filtered fy 是真实前向加速度 |
-| 07-02 | 发布 1.0.1 | versionName 1.0.0→1.0.1；更新内容：①放宽校准阈值（rmsDeviation 0.12→0.25 适配地铁地板微振）、②传感器按需启动（纯测速仅加速度计+陀螺仪，录制时才启动 4 辅助传感器）、③研究记录 schema v13（新增 4 辅助传感器字段）、④LOCATION/BACKGROUND_RUNNING 权限说明文案修正；build/release signing + README 同步
+| 07-03 | 发布 1.0.1 | versionName 1.0.0→1.0.1；更新内容：①放宽校准阈值（rmsDeviation 0.12→0.25 适配地铁地板微振）、②传感器按需启动（纯测速仅加速度计+陀螺仪，录制时才启动 4 辅助传感器）、③研究记录 schema v13（新增 4 辅助传感器字段）、④LOCATION/BACKGROUND_RUNNING 权限说明文案修正、⑤提升长记录读取速度（大文件只读尾部 64KB + 只 parse 最后一行，避免 OOM 闪退）；build/release signing + README 同步 |
 ---
 
 ## 十、当前任务状态
@@ -367,13 +367,13 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 19. 确认鸿蒙系统隧道定位机制为 IMU 惯性推算，非真实 GNSS
 20. 修正重力传感器分析结论：早期"驾车改善实为系统自比"论断错误（GRAVITY 传感器为 9DOF 融合，不融合 GNSS）；当前状态为地铁 NO-GO / 驾车有效，待研究场景自适应切换方案
 21. 隧道漂移根因验证：修正早期"重力估计漂移"错误根因，确认实际根因为纯惯性积分误差累积（段3 高速入隧 206s 漂移到 831km/h，重力/主轴在隧道内均稳定）
+22. 提升长记录读取速度：restoreExportableLogSummary 大文件只读尾部 64KB + 只 parse 最后一行，避免 OOM 闪退
 
 **待执行任务（按优先级）**：
 1. 🟡 系统重力场景自适应切换方案研究（驾车有效 MAE 1.86，地铁无效，需判断逻辑）
-2. 🟡 优化长记录时的应用打开速度（长 jsonl 加载/解析卡顿）
-3. 🟢 多语言支持（英文）
-4. 🟢 后台长时记录稳定性测试（需补充 lifecycle background/foreground 事件记录）
-5. 🟢 历史记录管理界面
+2. 🟢 多语言支持（英文）
+3. 🟢 后台长时记录稳定性测试（需补充 lifecycle background/foreground 事件记录）
+4. 🟢 历史记录管理界面
 
 ---
 
