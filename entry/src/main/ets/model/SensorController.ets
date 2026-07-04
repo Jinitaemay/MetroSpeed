@@ -76,6 +76,15 @@ export class SensorController {
     this.subscribeLinearAcceleration();
     this.subscribeRotationVector();
     this.subscribeMagneticField();
+
+    const aux: string[] = [];
+    if (this.gravityAvailable) aux.push('重力');
+    if (this.linearAccelerationAvailable) aux.push('线性加速度');
+    if (this.rotationVectorAvailable) aux.push('旋转向量');
+    if (this.magneticFieldAvailable) aux.push('磁力计');
+    if (aux.length > 0) {
+      this.emitStatus(`已启动传感器：${aux.join('、')}`);
+    }
   }
 
   stopAuxiliarySensors(): void {

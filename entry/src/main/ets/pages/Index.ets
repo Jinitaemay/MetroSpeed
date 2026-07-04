@@ -142,6 +142,9 @@ struct Index {
       }
       return;
     }
+    if (this.researchStatus.running) {
+      this.startResearchSensors();
+    }
     await this.requestLocationPermission();
     this.startLocationForMeasurement();
   }
@@ -771,11 +774,11 @@ struct Index {
         .fontColor('#CBD5E1')
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis });
-      Text('设备应稳定放置；停车后点停车校准。弯道、滑动和长时间未校准会降低精度。')
+      Text('请稳定放置于硬质表面，停车后点停车校准。弯道、滑动和长时间未校准会降低精度。当前版本未适配上下坡，不支持手持或姿态变化。')
         .fontSize(12)
         .fontColor('#94A3B8')
         .lineHeight(18)
-        .maxLines(2)
+        .maxLines(3)
         .margin({ top: 6 });
     }
     .width('100%')

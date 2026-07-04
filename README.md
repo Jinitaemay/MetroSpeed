@@ -117,7 +117,7 @@ Code by GPT-5.5 (Codex harness) → DeepSeek-V4-Pro (Trae Code harness) → GLM-
 ```
 MetroSpeed/
 ├── AppScope/
-│   └── app.json5                       # 应用配置（versionName: 1.0.1, versionCode: 时间戳）
+│   └── app.json5                       # 应用配置（versionName: 1.0.2, versionCode: 时间戳）
 ├── entry/
 │   └── src/main/ets/
 │       ├── entryability/EntryAbility.ets
@@ -228,6 +228,7 @@ python tools/sync_version.py --check
 | 06-29 | 上架通过 | AppGallery 审核通过，"地铁测速" 1.0.0 正式上架 |
 | 06-29~07-02 | 持续研究 | rmsDeviation 阈值调整 0.12→0.25；v13 记录分析；系统重力分析（地铁 NO-GO / 驾车有效）；隧道定位机制确认；隧道漂移根因验证（纯惯性积分误差累积） |
 | 07-02 | 发布 1.0.1 | 放宽初始校准条件（适配地铁地板微振）；传感器按需启动（纯测速仅加速度计+陀螺仪）；schema v13（4 辅助传感器字段）；权限说明文案修正 |
+| 07-03 | 发布 1.0.2 | 修复研究记录启动后辅助传感器状态文本不更新（传感器实际已订阅，仅 UI 反馈缺失） |
 
 ---
 

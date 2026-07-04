@@ -1,8 +1,8 @@
 # MetroSpeed 项目工作记忆
 
-> **记忆版本**：v29
-> **最后更新**：2026-07-02
-> **对应阶段**：1.0.1 发布（放宽校准 + 传感器按需启动 + schema v13 + 权限文案修正）；重力传感器分析（地铁 NO-GO / 驾车有效）；隧道定位机制确认；隧道漂移根因验证
+> **记忆版本**：v32
+> **最后更新**：2026-07-04
+> **对应阶段**：1.0.2 发布准备（辅助传感器丢失修复 + UI 文案优化）；分析层 `--adaptive-gravity` 验证通过（地铁零劣化、苏沪高速 85%↓）
 
 ---
 
@@ -127,7 +127,7 @@
 ```
 MetroSpeed/
 ├── AppScope/
-│   └── app.json5                    # 应用配置（versionName: 1.0.0, versionCode: 时间戳）
+│   └── app.json5                    # 应用配置（versionName: 1.0.2, versionCode: 时间戳）
 ├── entry/
 │   └── src/main/ets/
 │       ├── entryability/EntryAbility.ets
@@ -238,6 +238,12 @@ MetroSpeed/
     - **驾车场景显著有效**：苏沪伪通勤记录（81min，含 3 次隧道段）anchor-v2+pure-zero 模式下，moving MAE 从 14.14 → 1.86 km/h（87%↓），bias 从 13.80 → 0.47 km/h，pure maxKmh 从 909 → 80 km/h
     - **修正早期错误论断**：之前文档写"驾车改善实为系统自比不可信，系统重力隐含 GNSS 推算"——**此论断错误**。鸿蒙 GRAVITY 传感器是 9DOF 融合（加速度计+陀螺仪+磁力计），**不融合 GNSS 速度**；数据反证：若依赖 GNSS，隧道段（GNSS 失效）应突然变差，但系统重力模式隧道段 maxAbsKmh 仅 58（vs 默认 231），磁力计提供绝对航向参考抑制了陀螺仪零偏漂移
     - **当前状态**：驾车有效但地铁无效，差异来自运动模式不同（地铁起步加速被系统融合误判为重力分量），待研究场景自适应切换方案
+14. **`--adaptive-gravity` 分析层验证通过**：磁力计场景检测器 + 场景切换重力源，在两条数据完整的 v13 记录上验证：
+    - **方案**：前 500 帧（~15s）采集磁力计 |mag| 滑窗 std 中位数，判定一次场景（阈值 2.5μT），之后不再切换。判定为驾车→全程启用系统重力，判定为地铁→全程自估重力
+    - **地铁记录**（南京东路→新天地）：medianStd=4.26→判地铁→全程自估→median=40.928（与默认完全一致，零劣化）
+    - **苏沪高速**（81min）：medianStd=2.01→判驾车→全程系统重力→anchored moving MAE=2.10（vs 默认 14.14，85%↓），接近 sys-gravity 的 1.86（差 0.24 来自前 15s 判定期用自估重力）
+    - **设计演进**：逐帧切换不可行——磁力计 std 在地铁运行中频繁波动（175 次切换），任何切到驾车的帧都会让系统重力吃掉加速度，积分特性导致速度塌掉无法恢复。一次判定避开了所有逐帧切换问题
+    - **市内驾车记录（07-03）数据缺失**：magX/sysGravityX 仅 0.0% 非空（15/109064 帧），原因是 c7ab07f 引入的辅助传感器丢失 bug，已修复，待重新采集验证
 
 ### 技术要点
 - **时间源**：`computeDeltaSeconds` 优先 sensorTimestamp，其余用 Date.now()（墙上时间语义），双轨正确
@@ -245,75 +251,30 @@ MetroSpeed/
 - **LocationSourceType**：1=GNSS, 4=RTK，`tunnelState !== 'inside'` 是防系统推算冒充的唯一防护
 - **传感器类功能开发流程**：必须遵循"先在研究记录中加字段采集数据→观察实际数据表现→再决定是否接入算法"，禁止在没有数据支撑的情况下直接修改算法
 - **UI兼容性**：API12下Button组件自定义borderRadius不生效，使用系统默认胶囊形，不要手动设置圆角数值，升级API版本后需要重新验证所有组件样式
-- **replay_estimator.py 分析层开关**：`--use-gyro-gravity`（陀螺仪重力追踪，已验证失败）、`--use-sys-gravity`（系统重力替代自估重力，地铁 NO-GO / 驾车有效，待场景判断方案）。这些是分析层参数，不改变 SpeedEstimator 默认行为
+- **replay_estimator.py 分析层开关**：`--use-gyro-gravity`（陀螺仪重力追踪，已验证失败）、`--use-sys-gravity`（系统重力替代自估重力，地铁 NO-GO / 驾车有效）、`--adaptive-gravity`（磁力计场景检测器 + 一次判定场景切换，地铁零劣化 / 驾车 85%↓，验证通过）。这些是分析层参数，不改变 SpeedEstimator 默认行为
 
 ---
 
 ## 七、签名与上架
 
-### 签名密钥信息
-**密钥库文件**：`signing/release.p12`
-**密钥库类型**：PKCS#12
-**密钥算法**：EC (secp256r1) 256位
-**签名算法**：SHA256withECDSA
-**有效期**：36500 天（约 100 年）
-**密码长度**：36 位（满足鸿蒙 32 位最低要求）
-**密码存储**：密钥库密码(storePassword)和密钥密码(keyPassword)为同一个，从环境变量`METROSPEED_KEYSTORE_PASSWORD`读取，无硬编码在代码或脚本中
+**签名文件**（`signing/` 目录，不提交 git）：`release.p12`（EC 256 位密钥库）、`release.cer`（发布证书）、`releaseRelease.p7b`（Profile）。密码从环境变量 `METROSPEED_KEYSTORE_PASSWORD` 读取，密钥库密码和密钥密码相同。
 
-**debug签名**：DevEco Studio已自动配置debug签名，存放在`C:\Users\18918\.ohos\config\`目录下，直接点击运行即可自动签名安装，无需手动处理。`build-profile.json5` 已从版本控制移除（含本地 debug 签名属敏感配置），仓库只保留 `build-profile.template.json5` 模板，由 `.gitignore` 排除实际文件。首次 clone 后需复制模板为 `build-profile.json5` 再让 DevEco 填充签名。
+**debug 签名**：DevEco Studio 自动配置，直接点运行即可。`build-profile.json5` 已移出版本控制，仓库只保留 `build-profile.template.json5` 模板。首次 clone 后需复制模板再让 DevEco 填充签名。
 
-**其他签名文件**：
-- 发布证书：`signing/release.cer`
-- Profile：`signing/releaseRelease.p7b`
+**构建与签名命令**见 `project_rules.md` 2.2 节。release 签名的包不能 hdc install 直接安装，只能通过应用市场分发。
 
-### signing/ 目录三个文件的作用
-1. **release.p12 — 密钥库（核心，最重要）**：装着私钥的保险箱，丢了就没法更新应用
-2. **release.cer — 发布证书**：从华为 AGC 下载的公钥证书，证明公钥已被华为认可
-3. **releaseRelease.p7b — Profile 配置文件**：鸿蒙系统安装应用时检查，证明应用经过华为认证
-
-### 构建与签名命令
-
-**环境变量设置（PowerShell）**：
-```powershell
-$env:NODE_HOME = "C:\Program Files\Huawei\DevEco Studio\tools\node"
-$env:DEVECO_SDK_HOME = "C:\Program Files\Huawei\DevEco Studio\sdk"
-$env:JAVA_HOME = "C:\Program Files\Huawei\DevEco Studio\jbr"
-$env:PATH = "$env:NODE_HOME;$env:JAVA_HOME\bin;" + $env:PATH
-```
-
-**构建命令**：
-```powershell
-# 构建 APP（上架用）
-& "C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat" assembleApp --mode project -p product=default -p buildMode=release --no-daemon
-```
-
-**一键签名脚本**：
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
-```
-
-**注意**：release 证书签名的包不能 hdc install 直接安装，只能通过应用市场分发；调试直接在DevEco Studio点击运行即可，自动使用debug签名。
-
-### 当前状态
-- ✅ AppGallery 审核已通过（2026-06-29 09:49，versionCode=1782556056，使用 DevEco Studio 6.1.1 Release 构建）
-- ✅ 一键签名脚本可用
-- ✅ 开源版本v1.0.0已发布到GitHub
-- ✅ debug签名自动配置完成，直接运行即可安装
+**当前状态**：AppGallery 1.0.0 已上架（2026-06-29）；1.0.2 release 包已构建签名完成，待上架。
 
 ---
 
-## 八、项目规则（project_rules.md 摘要）
+## 八、项目规则
 
-1. **Python-ArkTS 一致性**：`tools/replay_estimator.py` 中的 `SpeedEstimator` 类必须 bug-for-bug 复现 ArkTS 端逻辑。
-2. **构建时版本号**：`hvigorfile.ts` 自动更新 `versionCode`（Unix 时间戳）。`versionName` 手动管理（语义化版本）。
-3. **信任用户校准**：停车校准由用户手动触发，不引入额外速度阈值拦截。
-4. **数据文件路径**：所有 JSONL 数据存放在本地研究记录目录。
-5. **算法改动必须多记录验证**：任何算法层面的改动必须在所有可用 JSONL 记录上跑对比验证。
-6. **代码修改纪律**：任何代码修改（包括加功能、回滚、改配置、删文件）必须等用户明确指令后再执行，禁止自作主张修改代码，哪怕是"很小很安全"的改动。
-7. **传感器开发流程**：先采集数据观察实际表现，再决定是否接入算法，禁止无数据支撑直接改算法。
-8. **不要主观判断"多余"就删**：任何配置、文件、代码，没验证过不要删。
-9. **说明文件维护**：三个文件——`project_rules.md`（硬规则）、`investigation_status.md`（AI 上下文快照）、`README.md`（对外项目说明）。
-10. **不要轻易升级SDK版本**：升级SDK可能导致系统组件默认样式变化，且新API不一定能带来实际收益，确认有明确收益且验证过UI兼容性后再升级。
+完整规则见 `.trae/rules/project_rules.md`。关键约束：
+- **Python-ArkTS 一致性**：`SpeedEstimator` 类 bug-for-bug 复现，分析层可自由扩展
+- **算法改动必须全量验证**：所有 JSONL 记录跑 baseline 对比，不得仅凭单条记录
+- **传感器开发流程**：先采集数据观察，再决定是否接入算法
+- **代码修改纪律**：任何修改等用户明确指令后再执行
+- **不轻易升级 SDK**：API12 稳定，升级会导致组件样式变化
 
 ---
 
@@ -322,55 +283,42 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 | 日期 | 阶段 | 关键动作 |
 |------|------|----------|
 | 04月 | 弃案 | 网页应用 + 系统线性加速度传感器，被融合误差吞掉起步加速 → 搁置一个多月 |
-| 06-12~17 | 基建 | 先有测速再补记录；初始目标手持，妥协为稳定放置；传感器经历三代；SpeedEstimator 核心算法成；JSONL 全量记录和 Python 回放引擎同步搭建；v1→v13 快速迭代 |
-| 06-18 | 定标 | 固定记录命名格式；首批数据采集；确立双端验证链路 |
-| 06-19~21 | 采集 | 地铁4条 + 驾车3条 + 公交2条 + 纯隧道1条 |
-| 06-22 | 优化 | 转向已有记录算法优化；产出 v13→v18 四个活跃改动 |
-| 06-23 上午 | 突破 | 偏置根因，pure=0 锚定 MAE sub-2 km/h；信噪比切换；自适应停车校准；入隧重力刷新 |
-| 06-23 下午 | 验证 | 采集6号线/浦江线/市域机场线/磁浮线/北安跨线/奉浦快线6条新记录；发现GNSS固定-40ms延迟 |
-| 06-24 | 补偿 | 将 -40ms GNSS 延迟补偿同时部署到 ArkTS 和 Python；全量 baseline 重跑 |
-| 06-25 | 发布准备 | 算法版本重命名；磁浮线验证；定 MIT 许可证；上架应用介绍文案定稿；release 构建链验证；签名密钥生成；版本号改为 1.0.0；一键签名脚本；正式上架包；死文件清理；死代码排查；提交 AppGallery 审核；README 重写 |
-| 06-26 | 审核修复 | 修复三个自检问题：退后台传感器占用（长时任务+emitter）、Scroll回弹动效（EdgeEffect.Spring）、深色文字对比度（#94A3B8）；停车校准速度补偿入包；--anchor-interval-ms 诊断参数；多进程并行扫描；全量代码核查文档修复；死代码清理；开源上线GitHub |
-| 06-27 | Beta API 修复 | AppGallery审核因beta API被拒，降级到DevEco Studio 6.1.1 Release重新构建；sign_app.ps1路径bug修复；对比度修复完成重新提交审核 |
-| 06-28 | 传感器采集 | 完成4个辅助传感器数据采集功能：GRAVITY、LINEAR_ACCELEROMETER、ROTATION_VECTOR、MAGNETIC_FIELD；确认GAME_ROTATION_VECTOR ArkTS API不支持，清理相关死代码；研究记录schema升级到v13；保持SDK版本为API12，不升级API20；清理过长的误导性测试记录 |
-| 06-28 | 工程清理 | build-profile.json5 移出版本控制改用 template 机制隔离 debug 签名；4 传感器实现提交入库（316 行）；_run_new_batch.py / _scan_anchor_interval.py 改为 --dir/--files 参数化（规则 7.1）；project_rules.md 2.3 节同步 |
+| 06-12~25 | 基建→发布 | 核心算法成；JSONL 记录 + Python 回放引擎；9条验证记录；偏置根因 + pure=0 锚定 MAE sub-2 km/h；GNSS -40ms 延迟补偿；MIT 许可证；签名链路；提交 AppGallery 审核；README 重写；开源上线 GitHub |
+| 06-26~27 | 审核修复 | 退后台传感器占用、Scroll 回弹、对比度修复；beta API 被拒→降级 DevEco 6.1.1 Release 重新构建 |
+| 06-28 | 传感器采集+工程清理 | 4 辅助传感器（GRAVITY/LINEAR_ACCELEROMETER/ROTATION_VECTOR/MAGNETIC_FIELD）采集功能；schema v13；GAME_ROTATION_VECTOR 确认不支持，清理死代码；build-profile.json5 移出版本控制改用 template 机制 |
 | 06-29 09:49 | 上架通过 | AppGallery 审核通过（versionCode=1782556056），"地铁测速" 1.0.0 正式上架 |
-| 06-29 | 数据验证+阈值调整 | 首条 v13 全传感器地铁记录验证：rawAcc ≈ sysGravity + linearAcc 中位误差 0.05 m/s²，加速段 0.12 m/s²，等式成立；发现地铁地板微振导致初始校准 rmsDeviation=0.20 超过旧阈值 0.12，放宽到 0.25；sign_app.ps1 新增 -SignToolPath 参数（读 DEVECO_SDK_HOME）；_baseline_all.py 补 --files 参数；project_memory 删除 force-push 偏好；commit 合并整理（c64eb11/10207ef/+1） |
-| 06-30 | 长途驾车验证 | 第 2 条 v13 全传感器记录：驾车苏沪伪通勤 81min/162753帧/4706定位；延迟扫描 -40ms（与历史一致）；正常段锚点 v2 MAE=0.46 km/h；3 次入隧（最长 8.5min）期间隧道模式拒绝 GNSS 锚点导致惯性漂移至 831 km/h |
-| 07-02 | 重力传感器分析 | 完成 `--use-sys-gravity` 分析工具（replay_estimator.py）；分场景对比：地铁 NO-GO（中位速度 40.9→0.6 km/h，吃加速度），驾车有效（moving MAE 14.14→1.86 km/h，87%↓）；修正早期"系统自比"错误论断（GRAVITY 传感器为 9DOF 融合，不融合 GNSS）；确认鸿蒙系统隧道定位机制为 IMU 惯性推算（satFix/satCount/accuracy 恒定特征），非真实 GNSS |
-| 07-02 | 文档同步 | 项目两个目标写回 investigation_status.md 和 README.md；AppGallery 上架通过状态更新（06-29 09:49, versionCode=1782556056）；README 时间线精简为 7 行阶段性里程碑 |
-| 07-02 | 隧道漂移根因验证 | 苏沪伪通勤 3 次入隧数据分析：修正早期"重力估计漂移"错误根因，确认实际根因为纯惯性积分误差累积（段3 高速入隧 206s 漂移到 831km/h，段2 静止入隧 513s 仅 71.6km/h）；重力/主轴在隧道内均稳定（gx/gy/gz 不变，偏移 0°），filtered fy 是真实前向加速度 |
-| 07-03 | 发布 1.0.1 | versionName 1.0.0→1.0.1；更新内容：①放宽校准阈值（rmsDeviation 0.12→0.25 适配地铁地板微振）、②传感器按需启动（纯测速仅加速度计+陀螺仪，录制时才启动 4 辅助传感器）、③研究记录 schema v13（新增 4 辅助传感器字段）、④LOCATION/BACKGROUND_RUNNING 权限说明文案修正、⑤提升长记录读取速度（大文件只读尾部 64KB + 只 parse 最后一行，避免 OOM 闪退）；build/release signing + README 同步 |
+| 06-29 | 数据验证+阈值调整 | 首条 v13 地铁记录：rawAcc ≈ sysGravity + linearAcc 成立；地铁地板微振 rmsDeviation=0.20 超标，阈值 0.12→0.25 |
+| 06-30 | 长途驾车验证 | 第 2 条 v13 记录：苏沪伪通勤 81min/162753帧；正常段锚点 v2 MAE=0.46；3 次入隧惯性漂移至 831 km/h |
+| 07-02 | 重力传感器分析 | `--use-sys-gravity` 分析工具；分场景对比：地铁 NO-GO（中位 40.9→0.6），驾车有效（MAE 14.14→1.86，87%↓）；确认系统隧道定位为 IMU 惯性推算 |
+| 07-02 | 隧道漂移根因验证 | 修正早期"重力估计漂移"错误根因，确认实际为纯惯性积分误差累积（重力/主轴在隧道内均稳定） |
+| 07-03 | 发布 1.0.1→1.0.2 | ①校准阈值放宽 ②传感器按需启动 ③schema v13 ④权限文案 ⑤长记录读取优化；1.0.1 上架后发现状态文本 bug→1.0.2 修复 |
+| 07-03 | 坡道偏置根因分析 | 新驾车记录 baseline MAE=156 km/h 崩溃；根因：下坡入地时 gY 偏移 0.51 m/s²，互补滤波冻结错误重力 1200 秒；校准 #7 坡道偏置 Δ=-0.35 m/s²（≈2°）；算法盲区：只验证传感器静止，不验证路面水平 |
+| 07-03 | 磁力计场景检测器验证 | 坡道偏置与系统重力场景自适应是同一任务；磁力计 std 可分离地铁（4.38μT）与驾车（1.55μT）/公交（0.52μT），阈值 2.5μT |
+| 07-04 | `--adaptive-gravity` 验证 | 分析层实现磁力计场景检测器 + 一次判定切换；地铁零劣化，苏沪高速 85%↓；逐帧切换不可行，一次判定解决 |
+| 07-04 | 辅助传感器丢失 bug 修复 | c7ab07f 引入回归：`start()` 内部 `stop()` 停掉辅助传感器后 `startMeasurement()` 漏恢复；修复：成功后若研究记录在运行则调 `startResearchSensors()` |
+| 07-04 | UI 文案优化 + 1.0.2 构建 | 状态文本去"研究"二字；灰色提示补充上下坡/姿态限制说明；构建签名 1.0.2 release 包 |
 ---
 
 ## 十、当前任务状态
 
-**最近完成的任务**：
-1. v1.0.0版本开源发布到GitHub
-2. AppGallery审核提交（beta API+对比度问题已修复）
-3. 4个辅助传感器数据采集功能完成，schema升级到v13（4传感器实现已提交入库）
-4. 清理GAME_ROTATION_VECTOR相关死代码，确认API不支持
-5. 保持SDK版本为API12，解决UI样式兼容问题
-6. 精简测试数据集，清理过长的误导性记录
-7. build-profile.json5 移出版本控制，改用 template 机制隔离 debug 签名
-8. _run_new_batch.py / _scan_anchor_interval.py 改为 --dir/--files 参数化（规则 7.1）
-9. project_rules.md 2.3 节同步为 template 机制
-10. sign_app.ps1 -SignToolPath 可配置（读 DEVECO_SDK_HOME 或参数）
-11. _baseline_all.py 补 --files 参数
-12. GitHub commit 合并整理为 3 个（c64eb11 / 10207ef+工具链 / 4传感器+工程清理）
-13. 初始校准 rmsDeviation 阈值 0.12→0.25 适配地铁地板微振
-14. 首条 v13 全传感器地铁记录验证：rawAcc ≈ sysGravity + linearAcc 成立（|la|>0.5 加速段中位偏差 0.12 m/s²）
-15. 诊断地铁地板无法开始校准的根因：rmsDeviation=0.20 超标
-16. 第 2 条 v13 全传感器记录分析（驾车苏沪伪通勤 81min）：延迟 -40ms，正常段 MAE=0.46，隧道段惯性漂移确认
-17. 完成 `--use-sys-gravity` 分析工具：SensorFrame 新增 sys_gravity 字段，SpeedEstimator 新增 use_sys_gravity 开关，CLI 参数 --use-sys-gravity
-18. 分场景对比完成：系统重力地铁场景吃加速度（NO-GO，中位速度 40.9→0.6 km/h），驾车场景显著有效（moving MAE 14.14→1.86 km/h，87%↓）
-19. 确认鸿蒙系统隧道定位机制为 IMU 惯性推算，非真实 GNSS
-20. 修正重力传感器分析结论：早期"驾车改善实为系统自比"论断错误（GRAVITY 传感器为 9DOF 融合，不融合 GNSS）；当前状态为地铁 NO-GO / 驾车有效，待研究场景自适应切换方案
-21. 隧道漂移根因验证：修正早期"重力估计漂移"错误根因，确认实际根因为纯惯性积分误差累积（段3 高速入隧 206s 漂移到 831km/h，重力/主轴在隧道内均稳定）
-22. 提升长记录读取速度：restoreExportableLogSummary 大文件只读尾部 64KB + 只 parse 最后一行，避免 OOM 闪退
+**最近完成的任务**（早期基建工作见时间线 06-12~25）：
+1. 初始校准 rmsDeviation 阈值 0.12→0.25 适配地铁地板微振
+2. v13 数据验证：rawAcc ≈ sysGravity + linearAcc 成立；苏沪伪通勤 81min 正常段 MAE=0.46，隧道段惯性漂移确认
+3. `--use-sys-gravity` 分析工具 + 分场景对比：地铁 NO-GO（中位 40.9→0.6），驾车有效（MAE 14.14→1.86，87%↓）
+4. 确认鸿蒙系统隧道定位为 IMU 惯性推算；修正早期"系统自比"错误论断
+5. 隧道漂移根因验证：实际为纯惯性积分误差累积（非重力/主轴漂移）
+6. `--adaptive-gravity` 分析层验证通过（地铁零劣化、苏沪高速 85%↓）
+7. 修复 c7ab07f 引入的辅助传感器丢失回归 bug
+8. UI 文案优化 + 1.0.2 构建
 
 **待执行任务（按优先级）**：
-1. 🟡 系统重力场景自适应切换方案研究（驾车有效 MAE 1.86，地铁无效，需判断逻辑）
+1. 🟡 重力估计可靠性修复（坡道偏置 + 场景自适应切换，同一任务的两个切面）
+   - 共同根因：重力估计在特定场景下不可靠（驾车坡道冻结 / 地铁磁干扰污染）
+   - 方案：磁力计场景检测器（已验证）→ 驾车启用系统重力（9DOF 融合含磁力计，行驶中持续修正不冻结），地铁回退自估重力（避开磁干扰）
+   - ✅ 分析层 `--adaptive-gravity` 验证通过（地铁零劣化、苏沪高速 85%↓）
+   - ✅ 修复 c7ab07f 引入的辅助传感器丢失回归 bug（待重新采集市内驾车记录验证）
+   - 待解决子问题：停车校准时车在坡道上的偏置，是否也由系统重力消化（系统重力静止时也读带倾角的重力，但开起来后会逐渐修正，不会冻结 1200 秒）
+   - 下一步：部署修复后采集市内驾车记录 → 验证 adaptive 在市内驾车场景的行为 → 通过后进入 ArkTS 实现（双端一致 + 全量验证）
 2. 🟢 多语言支持（英文）
 3. 🟢 后台长时记录稳定性测试（需补充 lifecycle background/foreground 事件记录）
 4. 🟢 历史记录管理界面
@@ -379,23 +327,19 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 
 ## 十一、重要提醒与注意事项
 
-1. **绝对不要自作主张改代码**：任何修改，哪怕你觉得100%是bug、是多余的，也必须先问用户，用户说改你再改。
-2. **不要替用户做技术决策**：传感器方案、算法路线、功能优先级、SDK版本选择，全部听用户的，你只负责客观分析利弊和执行。
-3. **不要相信文档里写的"已完成"**：一定要看实际代码验证，历史上出现过文档虚报进度的情况。
-4. **隧道模式是手动切换的**：不是自动检测的。
-5. **refreshGravityAtEntrance() 只刷新重力估计**：不重置速度、不重置主轴、不重置锚点。
-6. **build-profile.json5 已移出版本控制**：仓库只有 `build-profile.template.json5` 模板（signingConfigs 为空）。本地 `build-profile.json5` 由 DevEco 自动填充 debug 签名，已加进 `.gitignore`。首次 clone 后需 `Copy-Item build-profile.template.json5 build-profile.json5` 再用 DevEco 打开。
-7. **.trae/目录要保留**：属于AI工作记忆，不加入.gitignore，随仓库提交。
-8. **signing目录绝对不能提交git**：里面是签名私钥。
-9. **改算法必须双端一致**：ArkTS改了什么，Python replay_estimator.py必须一模一样改，然后跑sync_version.py --check。
-10. **改算法必须全量验证**：所有JSONL记录都要跑baseline对比，不能只看单条记录。
-11. **这次加的4个传感器只做数据采集**：SpeedEstimator.ets一行都不要改，只是把传感器数据记到研究记录里。
-12. **GAME_ROTATION_VECTOR暂时不要碰**：ArkTS公开API不支持，不要为了这个写Native C API，成本太高，等后续API开放再说。
-13. **不要轻易升级SDK版本**：API12目前稳定可用，升级API20/23会导致Button等组件默认样式变化，确认有明确收益且验证过UI兼容性后再升级。
-14. **API名称坑**：线性加速度传感器正确名称是LINEAR_ACCELEROMETER，不是LINEAR_ACCELERATION；响应类型是LinearAccelerometerResponse，不是LinearAccelerationResponse。
-15. **debug安装直接在DevEco点运行**：不要折腾命令行签名，DevEco会自动处理debug签名，手机连接后直接点运行即可。
-16. **project_memory 不再禁止 force-push**：2026-06-26 的"avoid amend + force push"偏好已删除，commit 整理完可直接 force-with-lease。
-17. **rmsDeviation 校准阈值已调整为 0.25**：与 gravityError 阈值对齐（均为 2.5%g 级别）。地铁场景整体改善（虹桥 0.26→0.08，上海赛车场 0.25→0.10），公交东方路-大连路有劣化风险（0.78→19.67），属可接受的取舍。
-18. **隧道模式拒绝 GNSS 锚点是刻意设计**：复刻鸿蒙系统在隧道内的定位行为，不是 bug。隧道内惯性漂移是纯惯性测速的固有限制，长隧道（>5min 无锚点）漂移尤其严重。
-19. **系统隧道定位 = IMU 惯性推算**：鸿蒙系统在 GNSS 降级时切换到 IMU dead reckoning，不是接收真实 GNSS 信号。推算约 7 分钟后置信度耗尽降级到基站定位。偏离路网是陀螺仪零偏导致航向积分累积。
-20. **系统重力传感器分场景有效**：地铁场景吃加速度（NO-GO，中位速度 40.9→0.6 km/h），驾车场景显著有效（moving MAE 14.14→1.86 km/h，87%↓）。早期"系统自比/隐含 GNSS 推算"论断已修正——GRAVITY 传感器为 9DOF 融合（加速度计+陀螺仪+磁力计），不融合 GNSS 速度；隧道段（GNSS 失效）系统重力仍有效（maxAbsKmh 231→58），证明不依赖 GNSS。当前状态：地铁 NO-GO / 驾车有效，待研究场景自适应切换方案。
+**行为规范**：
+1. **不自作主张改代码**：任何修改必须先问用户。不替用户做技术决策。
+2. **不看文档信"已完成"**：看实际代码验证。
+3. **signing/ 绝对不能提交 git**；`.trae/` 要保留，随仓库提交。
+
+**功能澄清**：
+4. **隧道模式手动切换**，不是自动检测。拒绝 GNSS 锚点是刻意设计（复刻鸿蒙系统隧道定位行为）。
+5. **refreshGravityAtEntrance() 只刷新重力估计**，不重置速度/主轴/锚点。
+6. **4 个辅助传感器只做数据采集**，SpeedEstimator.ets 一行都不要改。
+
+**技术坑**：
+7. **GAME_ROTATION_VECTOR**：ArkTS 公开 API 不支持，不要为此写 Native C API。
+8. **API 名称坑**：线性加速度传感器是 LINEAR_ACCELEROMETER（不是 LINEAR_ACCELERATION），响应类型 LinearAccelerometerResponse。
+9. **c7ab07f 回归教训**：拆分启动逻辑时必须检查所有调用方，特别是 `start()` 内部会 `stop()` 这个隐式副作用。
+
+> 核心发现第 11-14 条已包含隧道定位机制、系统重力分场景、adaptive-gravity 验证等结论，此处不再重复。

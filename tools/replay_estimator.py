@@ -115,6 +115,7 @@ class SensorFrame:
     gyroscope: Optional[Vector3]
     gyroscope_timestamp: Optional[float]
     sys_gravity: Optional[Vector3] = None
+    mag: Optional[Vector3] = None
 
 
 @dataclass
@@ -1009,6 +1010,7 @@ def make_sensor_frame(row: Dict[str, Any]) -> Optional[SensorFrame]:
         return None
     gyroscope = parse_vector(row, "gyroX", "gyroY", "gyroZ")
     sys_gravity = parse_vector(row, "sysGravityX", "sysGravityY", "sysGravityZ")
+    mag = parse_vector(row, "magX", "magY", "magZ")
     return SensorFrame(
         timestamp_ms=int(row["timestampMs"]),
         sensor_timestamp=parse_number(row, "sensorTimestamp"),
@@ -1016,6 +1018,7 @@ def make_sensor_frame(row: Dict[str, Any]) -> Optional[SensorFrame]:
         gyroscope=gyroscope,
         gyroscope_timestamp=parse_number(row, "gyroscopeTimestamp"),
         sys_gravity=sys_gravity,
+        mag=mag,
     )
 
 
@@ -1045,6 +1048,7 @@ def replay(
     rows: List[Dict[str, Any]],
     strict_start: bool,
     infer_start_from_sensor: bool,
+    adaptive_gravity: bool = False,
     **estimator_kwargs: Any,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     start_event = "\u5f00\u59cb\u6d4b\u901f"
@@ -1057,6 +1061,15 @@ def replay(
     replay_events: List[Dict[str, Any]] = []
     running = False
     first_timestamp = int(rows[0]["timestampMs"]) if rows else 0
+
+    # 磁力计场景检测器状态（分析层，不修改 SpeedEstimator 行为）
+    # 前 500 帧采集磁力计 std 中位数判定一次场景，之后不再切换
+    mag_window: List[float] = []
+    mag_std_samples: List[float] = []
+    scenario_decided = False
+    scenario_is_subway = True  # 安全默认：判定前用自估重力
+    if adaptive_gravity:
+        estimator.use_sys_gravity = False  # 判定为驾车后才启用系统重力
 
     for row in rows:
         timestamp_ms = int(row.get("timestampMs", 0))
@@ -1109,6 +1122,32 @@ def replay(
         frame = make_sensor_frame(row)
         if frame is None:
             continue
+
+        # 磁力计场景检测器：前 500 帧采集 std 中位数，判定一次场景（分析层）
+        if adaptive_gravity and frame.mag is not None and not scenario_decided:
+            mag_val = v_mag(frame.mag)
+            mag_window.append(mag_val)
+            if len(mag_window) > 50:
+                mag_window.pop(0)
+            if len(mag_window) >= 50:
+                mean_mag = sum(mag_window) / len(mag_window)
+                var_mag = sum((x - mean_mag) ** 2 for x in mag_window) / len(mag_window)
+                std_mag = var_mag ** 0.5
+                mag_std_samples.append(std_mag)
+            if len(mag_std_samples) >= 450:
+                # 450 个 std 样本（≈500 帧滑动窗），取中位数判定
+                median_std = sorted(mag_std_samples)[len(mag_std_samples) // 2]
+                scenario_is_subway = median_std >= 2.5
+                scenario_decided = True
+                estimator.use_sys_gravity = (not scenario_is_subway) and (frame.sys_gravity is not None)
+                replay_events.append({
+                    "t": timestamp_ms,
+                    "event": "adaptive_gravity_decided",
+                    "medianStd": median_std,
+                    "scenario": "subway" if scenario_is_subway else "driving",
+                    "useSysGravity": estimator.use_sys_gravity,
+                })
+
         output = estimator.ingest(frame)
         if strict_start and output.calibration_count == 1 and output.calibration_rejected:
             replay_events.append({
@@ -1534,6 +1573,7 @@ def main() -> int:
     parser.add_argument("--no-infer-start", action="store_true", help="Do not infer measurement start from estimator-bearing sensor rows.")
     parser.add_argument("--use-gyro-gravity", action="store_true", help="Experimental only: not implemented in the ArkTS app.")
     parser.add_argument("--use-sys-gravity", action="store_true", help="Experimental only: use system gravity sensor instead of estimated gravity when available.")
+    parser.add_argument("--adaptive-gravity", action="store_true", help="Analysis only: magnetometer scenario detector switches gravity source per-frame (driving=system gravity, subway=self-estimated).")
     parser.add_argument("--gyro-gravity-sign", type=float, default=-1.0, help="Sign for gyro gravity propagation. Use -1 for body-frame inertial vector update.")
     parser.add_argument("--no-vibration-guard", action="store_true", help="Disable high acceleration-step vibration guarding.")
     parser.add_argument("--vibration-threshold", type=float, default=0.85, help="Mean acceleration-step threshold for vibration low-confidence handling.")
@@ -1648,6 +1688,7 @@ def main() -> int:
         "infer_start_from_sensor": not args.no_infer_start,
         "use_gyro_gravity": args.use_gyro_gravity,
         "use_sys_gravity": args.use_sys_gravity,
+        "adaptive_gravity": args.adaptive_gravity,
         "gyro_gravity_sign": args.gyro_gravity_sign,
         "use_vibration_guard": not args.no_vibration_guard,
         "vibration_threshold": args.vibration_threshold,
@@ -1658,6 +1699,7 @@ def main() -> int:
         rows,
         strict_start=not args.no_strict_start,
         infer_start_from_sensor=not args.no_infer_start,
+        adaptive_gravity=args.adaptive_gravity,
         **estimator_kwargs,
     )
     summary = summarize(rows, outputs, events, replay_config, use_anchor_v2=getattr(args, "anchor_v2", False), anchor_power=args.anchor_power, pure_zero=args.pure_zero, gnss_lag_ms=args.gnss_lag_ms, anchor_interval_ms=args.anchor_interval_ms)
