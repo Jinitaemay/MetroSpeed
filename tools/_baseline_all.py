@@ -27,6 +27,8 @@ for i, arg in enumerate(sys.argv):
             extra_args.append(arg)
         elif i + 1 < len(sys.argv) and not sys.argv[i+1].startswith("--"):
             extra_args.extend([arg, sys.argv[i+1]])
+        else:
+            extra_args.append(arg)
 
 ANCHOR_V2 = "--anchor-v2" in sys.argv
 PURE_ZERO = "--pure-zero" in sys.argv

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-ALGORITHM_VERSION = "anchor-delta-20260626-r1"
+ALGORITHM_VERSION = "adaptive-gravity-20260705-v1"
 APP_PARITY_CONFIG = {
     "curve_positive_scale": 0.35,
     "curve_negative_scale": 0.35,
@@ -228,17 +228,11 @@ class SpeedEstimator:
         dead_zone: float = 0.025,
         conduction_scale: float = 0.45,
         # confidence
-        confidence_base: float = 0.86,
-        confidence_decay_divisor: float = 240000.0,
-        confidence_decay_max: float = 0.35,
+        confidence_base: float = 1.0,
+        confidence_decay_rate: float = (0.85 / 180000),
         confidence_gyro_divisor: float = 3.0,
         confidence_gyro_max: float = 0.2,
-        confidence_penalty_curve: float = 0.28,
-        confidence_penalty_low: float = 0.35,
-        confidence_penalty_strong: float = 0.48,
-        confidence_penalty_conduction: float = 0.20,
-        confidence_calibrating: float = 0.35,
-        confidence_clamp_lo: float = 0.08,
+        confidence_clamp_lo: float = 0.05,
         confidence_clamp_hi: float = 0.95,
         # experimental
         use_gyro_gravity: bool = False,
@@ -327,15 +321,9 @@ class SpeedEstimator:
         self.conduction_scale = conduction_scale
         # confidence
         self.confidence_base = confidence_base
-        self.confidence_decay_divisor = confidence_decay_divisor
-        self.confidence_decay_max = confidence_decay_max
+        self.confidence_decay_rate = confidence_decay_rate
         self.confidence_gyro_divisor = confidence_gyro_divisor
         self.confidence_gyro_max = confidence_gyro_max
-        self.confidence_penalty_curve = confidence_penalty_curve
-        self.confidence_penalty_low = confidence_penalty_low
-        self.confidence_penalty_strong = confidence_penalty_strong
-        self.confidence_penalty_conduction = confidence_penalty_conduction
-        self.confidence_calibrating = confidence_calibrating
         self.confidence_clamp_lo = confidence_clamp_lo
         self.confidence_clamp_hi = confidence_clamp_hi
         # experimental
@@ -487,7 +475,8 @@ class SpeedEstimator:
         )
 
         if stable:
-            self.gravity_estimate = candidate
+            if not self.use_sys_gravity:
+                self.gravity_estimate = candidate
             return True
         return False
 
@@ -907,18 +896,19 @@ class SpeedEstimator:
     def compute_confidence(self, state: MotionState, gyro_magnitude: float, timestamp_ms: int) -> float:
         value = self.confidence_base
         since_calibration = timestamp_ms - self.last_calibration_ms
-        value -= clamp(since_calibration / self.confidence_decay_divisor, 0.0, self.confidence_decay_max)
-        value -= clamp(gyro_magnitude / self.confidence_gyro_divisor, 0.0, self.confidence_gyro_max)
+        decay_rate = self.confidence_decay_rate
+        if state == MotionState.STRAIGHT_ACCELERATION:
+            decay_rate *= 2.0
         if state == MotionState.CURVE:
-            value -= self.confidence_penalty_curve
+            decay_rate *= 3.0
         if state == MotionState.LOW_CONFIDENCE:
-            value -= self.confidence_penalty_low
+            decay_rate *= 2.5
         if state == MotionState.STRONG_VIBRATION:
-            value -= self.confidence_penalty_strong
+            decay_rate *= 4.0
         if state == MotionState.CONDUCTION_VIBRATION:
-            value -= self.confidence_penalty_conduction
-        if state == MotionState.CALIBRATING:
-            value = self.confidence_calibrating
+            decay_rate *= 1.5
+        value -= clamp(since_calibration * decay_rate, 0.0, 0.85)
+        value -= clamp(gyro_magnitude / self.confidence_gyro_divisor, 0.0, self.confidence_gyro_max)
         return clamp(value, self.confidence_clamp_lo, self.confidence_clamp_hi)
 
     def make_output(self, frame: SensorFrame, filtered: Optional[Vector3] = None) -> EstimatorOutput:
@@ -1650,17 +1640,11 @@ def main() -> int:
     parser.add_argument("--dead-zone", type=float, default=0.025)
     parser.add_argument("--conduction-scale", type=float, default=0.45)
     # confidence
-    parser.add_argument("--confidence-base", type=float, default=0.86)
-    parser.add_argument("--confidence-decay-divisor", type=float, default=240000.0)
-    parser.add_argument("--confidence-decay-max", type=float, default=0.35)
+    parser.add_argument("--confidence-base", type=float, default=1.0)
+    parser.add_argument("--confidence-decay-rate", type=float, default=(0.85 / 180000))
     parser.add_argument("--confidence-gyro-divisor", type=float, default=3.0)
     parser.add_argument("--confidence-gyro-max", type=float, default=0.2)
-    parser.add_argument("--confidence-penalty-curve", type=float, default=0.28)
-    parser.add_argument("--confidence-penalty-low", type=float, default=0.35)
-    parser.add_argument("--confidence-penalty-strong", type=float, default=0.48)
-    parser.add_argument("--confidence-penalty-conduction", type=float, default=0.20)
-    parser.add_argument("--confidence-calibrating", type=float, default=0.35)
-    parser.add_argument("--confidence-clamp-lo", type=float, default=0.08)
+    parser.add_argument("--confidence-clamp-lo", type=float, default=0.05)
     parser.add_argument("--confidence-clamp-hi", type=float, default=0.95)
     parser.add_argument("--anchor-v2", action="store_true", help="Anchor v2: vibration freeze + tunnel lockout + confidence blend (matches ArkTS Index.ets).")
     parser.add_argument("--anchor-power", type=float, default=1.0, help="Confidence exponent for anchor v2 blend. >1.0 skews toward anchor.")

@@ -74,7 +74,7 @@ def quantile(values: list[float], q: float) -> float:
 
 
 def main():
-    data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"C:\Users\18918\Documents\研究记录\旧记录")
+    data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(os.environ.get("METROSPEED_DATA_DIR", "."))
     files = sorted(data_dir.glob("*.jsonl"))
     files = [f for f in files if "_replay_" not in f.name]
     if not files:

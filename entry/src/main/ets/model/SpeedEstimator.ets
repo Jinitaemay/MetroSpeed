@@ -54,6 +54,7 @@ export class SpeedEstimator {
   private lastCalibrationMs: number = 0;
   private motionState: MotionState = MotionState.Idle;
   private confidence: number = 0;
+  private pureMode: number = 0;
   private windowFrames: AccelWindowFrame[] = [];
   private preCalBuffer: PreCalFrame[] = [];
   private parkingCalibrationPending: boolean = false;
@@ -61,12 +62,24 @@ export class SpeedEstimator {
   private parkingCalibrationSuccessUntilMs: number = 0;
   private lastRawAcceleration?: Vector3;
 
+  private useSysGravity: boolean = false;
+  private scenarioDecided: boolean = false;
+  private magWindow: number[] = [];
+  private magStdSamples: number[] = [];
+  private readonly MAG_WINDOW: number = 50;
+  private readonly MAG_STD_SAMPLES: number = 450;
+  private readonly MAG_THRESHOLD: number = 2.5;
+
   getVelocityMps(): number {
     return this.velocityMps;
   }
 
   getMotionState(): MotionState {
     return this.motionState;
+  }
+
+  setPureMode(pure: number): void {
+    this.pureMode = pure;
   }
 
   start(timestampMs: number): RunStats {
@@ -94,6 +107,10 @@ export class SpeedEstimator {
     this.parkingCalibrationRejectedUntilMs = 0;
     this.parkingCalibrationSuccessUntilMs = 0;
     this.lastRawAcceleration = undefined;
+    this.useSysGravity = false;
+    this.scenarioDecided = false;
+    this.magWindow = [];
+    this.magStdSamples = [];
     this.beginCalibration(timestampMs);
     return this.currentStats(timestampMs, '校准中，请保持设备静止');
   }
@@ -157,6 +174,10 @@ export class SpeedEstimator {
     this.parkingCalibrationSuccessUntilMs = 0;
     this.lastRawAcceleration = undefined;
     this.preCalBuffer = [];
+    this.useSysGravity = false;
+    this.scenarioDecided = false;
+    this.magWindow = [];
+    this.magStdSamples = [];
     return this.currentStats(timestampMs, '等待开始');
   }
 
@@ -225,7 +246,9 @@ export class SpeedEstimator {
     const stable = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motion;
 
     if (stable) {
-      this.gravityEstimate = candidate;
+      if (!this.useSysGravity) {
+        this.gravityEstimate = candidate;
+      }
       return true;
     }
     return false;
@@ -260,7 +283,38 @@ export class SpeedEstimator {
 
     this.finishCalibrationIfNeeded(frame.timestampMs);
 
-    const motionAcceleration = subtract(rawAcceleration, this.gravityEstimate);
+    if (!this.scenarioDecided && frame.magneticField) {
+      const mx = frame.magneticField.x;
+      const my = frame.magneticField.y;
+      const mz = frame.magneticField.z;
+      const magVal = Math.sqrt(mx * mx + my * my + mz * mz);
+      this.magWindow.push(magVal);
+      if (this.magWindow.length > this.MAG_WINDOW) {
+        this.magWindow.shift();
+      }
+      if (this.magWindow.length >= this.MAG_WINDOW) {
+        let sum = 0;
+        for (let i = 0; i < this.magWindow.length; i++) {
+          sum += this.magWindow[i];
+        }
+        const mean = sum / this.magWindow.length;
+        let varSum = 0;
+        for (let i = 0; i < this.magWindow.length; i++) {
+          const d = this.magWindow[i] - mean;
+          varSum += d * d;
+        }
+        this.magStdSamples.push(Math.sqrt(varSum / this.magWindow.length));
+      }
+      if (this.magStdSamples.length >= this.MAG_STD_SAMPLES) {
+        const sorted = [...this.magStdSamples].sort((a: number, b: number) => a - b);
+        const medianStd = sorted[Math.floor(sorted.length / 2)];
+        this.scenarioDecided = true;
+        this.useSysGravity = medianStd < this.MAG_THRESHOLD;
+      }
+    }
+
+    const gravityForMotion = (this.useSysGravity && frame.gravity) ? frame.gravity : this.gravityEstimate;
+    const motionAcceleration = subtract(rawAcceleration, gravityForMotion);
     const clipped = clipMagnitude(motionAcceleration, 3.5);
     const filtered = this.lowPass(clipped, 0.22);
     this.filteredAcceleration = filtered;
@@ -315,7 +369,6 @@ export class SpeedEstimator {
     this.calibrationSamples = 0;
     this.calibrationCount += 1;
     this.lastCalibrationMs = timestampMs;
-    this.confidence = 0.35;
     this.motionState = MotionState.Calibrating;
   }
 
@@ -400,7 +453,9 @@ export class SpeedEstimator {
       }
 
       if (stableResult) {
-        this.gravityEstimate = gravityCandidate;
+        if (!this.useSysGravity) {
+          this.gravityEstimate = gravityCandidate;
+        }
         this.calibrationRejectedUntilMs = 0;
         if (this.parkingCalibrationPending) {
           this.applyParkingZero(timestampMs, parkingWindowEndVelocityMps);
@@ -660,26 +715,28 @@ export class SpeedEstimator {
   }
 
   private computeConfidence(state: MotionState, gyroMagnitude: number, timestampMs: number): number {
-    let value = 0.86;
+    let value = 1.0;
     const sinceCalibration = timestampMs - this.lastCalibrationMs;
-    value -= clamp(sinceCalibration / 240000, 0, 0.35);
-    value -= clamp(gyroMagnitude / 3, 0, 0.2);
+
+    let decayRate = this.pureMode > 0 ? (0.85 / 120000) : (0.85 / 180000);
     if (state === MotionState.Curve) {
-      value -= 0.28;
+      decayRate *= 3.0;
+    }
+    if (state === MotionState.StraightAcceleration) {
+      decayRate *= 2.0;
     }
     if (state === MotionState.LowConfidence) {
-      value -= 0.35;
+      decayRate *= 2.5;
     }
     if (state === MotionState.StrongVibration) {
-      value -= 0.48;
+      decayRate *= 4.0;
     }
     if (state === MotionState.ConductionVibration) {
-      value -= 0.20;
+      decayRate *= 1.5;
     }
-    if (state === MotionState.Calibrating) {
-      value = 0.35;
-    }
-    return clamp(value, 0.08, 0.95);
+    value -= clamp(sinceCalibration * decayRate, 0, 0.85);
+    value -= clamp(gyroMagnitude / 3, 0, 0.2);
+    return clamp(value, 0.05, 0.95);
   }
 
   private makeSample(

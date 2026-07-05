@@ -58,53 +58,56 @@ export class SensorController {
     this.running = true;
 
     this.subscribeGyroscope();
+    this.subscribeGravity();
+    this.subscribeMagneticField();
 
     const accelerationStarted = this.subscribeAcceleration();
     if (!accelerationStarted) {
       this.stop();
     }
 
-    const availableSensors: string[] = ['加速度计'];
+    const availableSensors: string[] = ['加速度'];
     if (this.gyroscopeAvailable) availableSensors.push('陀螺仪');
+    if (this.gravityAvailable) availableSensors.push('重力');
+    if (this.magneticFieldAvailable) availableSensors.push('磁场');
     this.emitStatus(`已启动传感器：${availableSensors.join('、')}，请求 ${HIGH_RATE_HZ}Hz`);
 
     return accelerationStarted;
   }
 
   startAuxiliarySensors(): void {
-    this.subscribeGravity();
     this.subscribeLinearAcceleration();
     this.subscribeRotationVector();
-    this.subscribeMagneticField();
 
-    const aux: string[] = [];
-    if (this.gravityAvailable) aux.push('重力');
-    if (this.linearAccelerationAvailable) aux.push('线性加速度');
-    if (this.rotationVectorAvailable) aux.push('旋转向量');
-    if (this.magneticFieldAvailable) aux.push('磁力计');
-    if (aux.length > 0) {
-      this.emitStatus(`已启动传感器：${aux.join('、')}`);
+    const all: string[] = ['加速度'];
+    if (this.gyroscopeAvailable) all.push('陀螺仪');
+    if (this.gravityAvailable) all.push('重力');
+    if (this.linearAccelerationAvailable) all.push('线性加速度');
+    if (this.rotationVectorAvailable) all.push('旋转矢量');
+    if (this.magneticFieldAvailable) all.push('磁场');
+    if (all.length > 0) {
+      this.emitStatus(`已启动传感器：${all.join('、')}，请求 ${HIGH_RATE_HZ}Hz`);
     }
   }
 
   stopAuxiliarySensors(): void {
-    this.safeOffGravity();
     this.safeOffLinearAcceleration();
     this.safeOffRotationVector();
-    this.safeOffMagneticField();
 
-    this.latestGravity = undefined;
-    this.latestGravityTimestamp = null;
-    this.gravityAvailable = false;
     this.latestLinearAcceleration = undefined;
     this.latestLinearAccelerationTimestamp = null;
     this.linearAccelerationAvailable = false;
     this.latestRotationVector = undefined;
     this.latestRotationVectorTimestamp = null;
     this.rotationVectorAvailable = false;
-    this.latestMagneticField = undefined;
-    this.latestMagneticFieldTimestamp = null;
-    this.magneticFieldAvailable = false;
+
+    if (this.running) {
+      const core: string[] = ['加速度'];
+      if (this.gyroscopeAvailable) core.push('陀螺仪');
+      if (this.gravityAvailable) core.push('重力');
+      if (this.magneticFieldAvailable) core.push('磁场');
+      this.emitStatus(`已启动传感器：${core.join('、')}，请求 ${HIGH_RATE_HZ}Hz`);
+    }
   }
 
   stop(): void {

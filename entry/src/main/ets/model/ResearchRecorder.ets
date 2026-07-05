@@ -13,8 +13,8 @@ import {
 const SENSOR_RECORD_INTERVAL_MS = 20;
 const ESTIMATOR_RECORD_INTERVAL_MS = 500;
 const RECORD_SCHEMA_VERSION = 13;
-const APP_VERSION_CODE = 1783142752;
-const ALGORITHM_VERSION = 'anchor-delta-20260626-r1';
+const APP_VERSION_CODE = 1783266238;
+const ALGORITHM_VERSION = 'adaptive-gravity-20260705-v1';
 const TEMP_LOG_FILE_NAME = 'research-current.jsonl';
 const WRITE_BUFFER_LIMIT = 16;
 const EXPORT_COPY_BUFFER_BYTES = 64 * 1024;
@@ -713,6 +713,9 @@ export class ResearchRecorder {
   }
 
   private updateSensorInterval(frame: SensorFrame): void {
+    if (!this.running) {
+      return;
+    }
     const timestampMs = frame.timestampMs;
     if (frame.sensorTimestamp !== null && frame.sensorTimestamp !== undefined &&
       this.previousSensorTimestampNs !== null && frame.sensorTimestamp > this.previousSensorTimestampNs) {
