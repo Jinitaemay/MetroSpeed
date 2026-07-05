@@ -15,6 +15,13 @@ import {
   motionStateText
 } from '../model/SpeedTypes';
 
+interface GyroSample {
+  gx: number;
+  gy: number;
+  gz: number;
+  ts: number;
+}
+
 function emptyStats(): RunStats {
   return {
     currentSpeedKmh: 0,
@@ -58,6 +65,8 @@ struct Index {
   @State private tunnelSwitchOn: boolean = false;
   @State private pureInertialSpeedKmh: number = 0;
   @State private gnssSpeedKmh: number = 0;
+  @State private isHandheld: boolean = false;
+  @State private speedStatsHeight: number = 0;
   private wasMeasuringBeforeBackground: boolean = false;
   private backgroundHandlerRegistered: boolean = false;
   private tunnelState: 'unknown' | 'outside' | 'inside' = 'unknown';
@@ -70,6 +79,13 @@ struct Index {
   private inertialSpeedHistory: SpeedHistoryEntry[] = [];
   private readonly INERTIAL_HISTORY_SIZE: number = 5;
   private readonly GNSS_LAG_MS: number = 40;
+
+  private gyroBuf: GyroSample[] = [];
+  private readonly GYRO_WINDOW: number = 40;
+  private readonly GYRO_RMS_THRESHOLD: number = 0.3;
+  private readonly ZCR_THRESHOLD: number = 5.0;
+  private readonly HANDHELD_ACTIVATE: number = 40;
+  private handheldSuspectStreak: number = 0;
 
   private onBgStopSensors(): void {
     this.wasMeasuringBeforeBackground = this.isRunning;
@@ -125,6 +141,9 @@ struct Index {
     this.stats = this.estimator.start(now);
     this.isRunning = true;
     this.hasGnssAnchor = false;
+    this.isHandheld = false;
+    this.gyroBuf = [];
+    this.handheldSuspectStreak = 0;
     this.sensorStatus = '正在启动传感器';
     this.researchStatus = this.researchRecorder.beginMeasurement(now, 'measurement started');
     this.researchSensorActive = false;
@@ -135,6 +154,7 @@ struct Index {
     });
     if (!sensorsStarted) {
       this.isRunning = false;
+      this.sensorStatus = '传感器未启动';
       this.stats = this.estimator.reset(now);
       this.researchStatus = this.researchRecorder.cancelMeasurement(now, 'sensor start failed');
       if (this.researchStatus.running) {
@@ -157,7 +177,7 @@ struct Index {
     this.startLocationForAll();
   }
 
-  private startLocationForAll(): void {
+  private startLocationForAll(forRecording?: boolean): void {
     this.locationController.start(
       (location: LocationSnapshot) => {
         if (this.researchStatus.running) {
@@ -189,7 +209,8 @@ struct Index {
       },
       (message: string) => {
         this.locationStatus = message;
-      }
+      },
+      forRecording
     );
   }
 
@@ -209,11 +230,13 @@ struct Index {
 
     const now = Date.now();
     this.sensorController.stop();
+    this.sensorStatus = '传感器已停止';
     this.researchStatus = this.researchRecorder.endMeasurement(now, `speed=${this.stats.currentSpeedKmh.toFixed(2)}km/h`);
     this.stats = this.estimator.stop(now);
     this.isRunning = false;
     this.hasGnssAnchor = false;
-    this.sensorStatus = '测速已停止';
+    this.isHandheld = false;
+    this.researchSensorActive = false;
     this.stopLocationIfUnused();
     if (this.researchStatus.running) {
       this.startResearchSensors();
@@ -261,8 +284,23 @@ struct Index {
       return;
     }
 
+    if (frame.gyroscope) {
+      this.gyroBuf.push({ gx: frame.gyroscope.x, gy: frame.gyroscope.y, gz: frame.gyroscope.z, ts: frame.timestampMs });
+      while (this.gyroBuf.length > this.GYRO_WINDOW * 2) {
+        this.gyroBuf.shift();
+      }
+      this.checkHandheld();
+      if (this.isHandheld) {
+        return;
+      }
+    }
+
     this.stats = nextFrame.stats;
     this.pureInertialSpeedKmh = this.stats.currentSpeedKmh;
+
+    const pure = (!this.hasGnssAnchor || this.gnssSpeedKmh < this.gnssSpeedAccuracyMps * 3.6) ? 1 : 0;
+    this.estimator.setPureMode(pure);
+
     if (this.hasGnssAnchor) {
       const pureSpeedKmh = this.stats.currentSpeedKmh;
       const currentInertial = this.estimator.getVelocityMps();
@@ -299,6 +337,55 @@ struct Index {
     return best;
   }
 
+  private checkHandheld(): void {
+    if (this.gyroBuf.length < this.GYRO_WINDOW) {
+      return;
+    }
+
+    let ss = 0;
+    for (let i = 0; i < this.GYRO_WINDOW; i++) {
+      const v = this.gyroBuf[this.gyroBuf.length - this.GYRO_WINDOW + i];
+      ss += v.gx * v.gx + v.gy * v.gy + v.gz * v.gz;
+    }
+    const rms = Math.sqrt(ss / this.GYRO_WINDOW);
+
+    let zc = 0;
+    const base = this.gyroBuf.length - this.GYRO_WINDOW;
+    let pgx = this.gyroBuf[base].gx;
+    let pgy = this.gyroBuf[base].gy;
+    let pgz = this.gyroBuf[base].gz;
+    for (let i = base + 1; i < this.gyroBuf.length; i++) {
+      const v = this.gyroBuf[i];
+      if (v.gx * pgx <= 0 && v.gx !== pgx) {
+        zc++;
+      }
+      if (v.gy * pgy <= 0 && v.gy !== pgy) {
+        zc++;
+      }
+      if (v.gz * pgz <= 0 && v.gz !== pgz) {
+        zc++;
+      }
+      pgx = v.gx;
+      pgy = v.gy;
+      pgz = v.gz;
+    }
+    const windowDurationMs = this.gyroBuf[this.gyroBuf.length - 1].ts
+      - this.gyroBuf[this.gyroBuf.length - this.GYRO_WINDOW].ts;
+    const zcr = zc / (Math.max(windowDurationMs, 1) / 1000);
+
+    if (rms > this.GYRO_RMS_THRESHOLD && zcr > this.ZCR_THRESHOLD) {
+      this.handheldSuspectStreak++;
+    } else {
+      this.handheldSuspectStreak = 0;
+    }
+
+    if (this.handheldSuspectStreak >= this.HANDHELD_ACTIVATE && !this.isHandheld) {
+      this.stopMeasurement();
+      this.isHandheld = true;
+      this.handheldSuspectStreak = 0;
+    }
+  }
+
   private isInitialCalibrationRejected(stats: RunStats): boolean {
     return stats.calibrationCount === 1 && stats.calibrationRejected;
   }
@@ -306,6 +393,7 @@ struct Index {
   private abortStartCalibration(): void {
     const now = Date.now();
     this.sensorController.stop();
+    this.researchSensorActive = false;
     const resetStats = this.estimator.reset(now);
     this.stats = {
       currentSpeedKmh: 0,
@@ -319,6 +407,7 @@ struct Index {
       calibrationRejected: false
     };
     this.isRunning = false;
+    this.isHandheld = false;
     this.sensorStatus = '开始失败：初始校准不稳';
     this.researchStatus = this.researchRecorder.cancelMeasurement(now, resetStats.statusText);
     if (this.researchStatus.running) {
@@ -330,6 +419,9 @@ struct Index {
     const now = Date.now();
     if (this.researchStatus.running) {
       this.stopResearchSensorsIfIdle();
+      if (!this.isRunning) {
+        this.sensorStatus = '传感器未启动';
+      }
       this.researchStatus = this.researchRecorder.stop(now);
       this.stopLocationIfUnused();
       BackgroundState.recordingActive = false;
@@ -356,7 +448,7 @@ struct Index {
       permissionGranted ? '定位权限可用' : '定位权限不可用',
       this.locationStatus
     );
-    this.startLocationForAll();
+    this.startLocationForAll(true);
     const locationStarted = this.locationController.isRunning;
 
     if (!locationStarted) {
@@ -772,9 +864,9 @@ struct Index {
         .fontSize(13)
         .fontWeight(FontWeight.Medium)
         .fontColor('#CBD5E1')
-        .maxLines(1)
+        .maxLines(2)
         .textOverflow({ overflow: TextOverflow.Ellipsis });
-      Text('请稳定放置于硬质表面，停车后点停车校准。弯道、滑动和长时间未校准会降低精度。当前版本未适配上下坡，不支持手持或姿态变化。')
+      Text('此应用不支持手持使用，弯道、滑动和长时间未校准会降低精度，停车时点停车校准。')
         .fontSize(12)
         .fontColor('#94A3B8')
         .lineHeight(18)
@@ -879,10 +971,38 @@ struct Index {
       Scroll() {
         Column({ space: 12 }) {
           this.Header();
-          this.SpeedPanel();
+          Stack() {
+            Column({ space: 12 }) {
+              this.SpeedPanel();
+              this.StatsGrid();
+            }
+            .width('100%')
+            .onAreaChange((_: Area, newArea: Area) => {
+              this.speedStatsHeight = newArea.height as number;
+            });
+              if (this.isHandheld) {
+              Column() {
+                Text('请稳定放置')
+                  .fontSize(24)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor('#FFFFFF')
+                  .letterSpacing(3);
+                Text('请将设备稳定放置，\n停车时重新开始测速，\n设备移动会中止测速。')
+                  .fontSize(14)
+                  .fontColor('#FECACA')
+                  .lineHeight(22)
+                  .margin({ top: 10 });
+              }
+              .width('100%')
+              .height(this.speedStatsHeight)
+              .justifyContent(FlexAlign.Center)
+              .backgroundColor('#DC2626')
+              .borderRadius(8)
+            }
+          }
+          .width('100%');
           this.ControlPanel();
           this.ResearchPanel();
-          this.StatsGrid();
           this.SensorNotice();
         }
         .width('100%')

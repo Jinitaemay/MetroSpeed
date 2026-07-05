@@ -4,14 +4,14 @@
 >
 > 无需依赖 GPS，仅凭手机加速度计和陀螺仪，就能实时估算地铁列车的行驶速度。隧道段，GPS 没信号也能测。
 >
-> **算法版本**：`anchor-delta-20260626-r1` · 源码：`https://github.com/Jinitaemay/MetroSpeed`
+> **算法版本**：`anchor-delta-20260626-r1`
 
 ---
 
 ## ✨ 核心特性
 
 ### 1. 纯惯性测速
-自研 9 状态检测算法 + 主轴学习 + 重力补偿，从原始传感器数据中提取真实运动加速度，积分得到实时速度。需稳定放置。
+自研 9 状态检测算法 + 主轴学习 + 重力补偿，从原始传感器数据中提取真实运动加速度，积分得到实时速度。需稳定放置，不支持手持使用。
 
 ### 2. GNSS 锚点融合
 GPS 信号良好时自动启用锚定模式，以 GNSS 速度为锚点叠加惯性增量，精度更高、漂移更小。
@@ -117,9 +117,8 @@ Code by GPT-5.5 (Codex harness) → DeepSeek-V4-Pro (Trae Code harness) → GLM-
 ```
 MetroSpeed/
 ├── AppScope/
-│   └── app.json5                       # 应用配置（versionName: 1.0.2, versionCode: 时间戳）
+│   └── app.json5                       # 应用配置（versionName: 1.1.0, versionCode: 时间戳）
 ├── entry/
-│   └── src/main/ets/
 │       ├── entryability/EntryAbility.ets
 │       ├── pages/Index.ets              # 主界面 + 锚点逻辑
 │       └── model/
@@ -139,6 +138,9 @@ MetroSpeed/
 │   ├── trim_cal_segment.py             # 裁剪校准段
 │   ├── _scan_anchor_interval.py        # 锚点间隔多进程并行扫描
 │   ├── _run_new_batch.py               # 批量多组参数对比 (--dir/--files)
+│   ├── _handheld_detector.py           # 手持检测离线验证（gyroRms + zeroCrossingRate）
+│   ├── _confidence_analysis.py          # 置信度延迟扫描 + 状态误差分析
+│   ├── _confidence_calibrate.py         # 置信度全量标定（多进程）
 │   └── sign_app.ps1                    # 一键签名脚本
 ├── signing/                             # 签名文件（敏感，不提交）
 │   ├── release.p12                     # 密钥库（EC 256位）
@@ -211,7 +213,7 @@ python tools/sync_version.py --check
 - 纯惯性模式（GNSS 不可信时）存在累积漂移，站间距越长漂移越大；GNSS 可用时 pure=0 锚定+增量可抑制漂移
 - 只有停车校准能归零，途中无外部速度参考
 - 锚点 v2 依赖 GNSS 位置回调（type 1/4, accuracy>0），隧道内冻结
-- 设备放置需尽量稳定，剧烈晃动会破坏估算
+- 设备放置需稳定——手持姿态会被陀螺仪自动检测并中止测速
 - 弯道、道岔场景下误差可能增大
 
 ---
@@ -228,10 +230,12 @@ python tools/sync_version.py --check
 | 06-29 | 上架通过 | AppGallery 审核通过，"地铁测速" 1.0.0 正式上架 |
 | 06-29~07-02 | 持续研究 | rmsDeviation 阈值调整 0.12→0.25；v13 记录分析；系统重力分析（地铁 NO-GO / 驾车有效）；隧道定位机制确认；隧道漂移根因验证（纯惯性积分误差累积） |
 | 07-02 | 发布 1.0.1 | 放宽初始校准条件（适配地铁地板微振）；传感器按需启动（纯测速仅加速度计+陀螺仪）；schema v13（4 辅助传感器字段）；权限说明文案修正 |
-| 07-03 | 发布 1.0.2 | 修复研究记录启动后辅助传感器状态文本不更新（传感器实际已订阅，仅 UI 反馈缺失） |
+| 07-03~05 | 发布 1.1.0 | **传感器状态文本修复**（停止测速后记录传感器不重启 bug、辅助传感器状态文本不更新）；**置信度公式重写**（基线 1.0、倍率衰减模型：弯道×3/加速×2/振动×4、pureMode 锚点感知双速率、3min 锚点巡航触底、校准不重置）；**手持检测系统**（陀螺仪 RMS + zeroCrossingRate 双指标滑窗检测，40 帧确认，14 条记录零误触发，触发时终止测速 + 红色不透明覆盖）；**ZCR 计算矫正**（硬编码 40Hz 改为实际时间戳差值）；**CLI 默认值同步**（replay_estimator.py 与 ArkTS 参数对齐）；**传感器状态汇总**（startAuxiliarySensors 列出全部可用传感器）；**文案优化**（手持覆盖三行引导、底部说明精简）；**置信度标定**（22.9万帧 14 条记录验证单调性） |
 
 ---
 
 ## 📜 许可证
 
 MIT License · Copyright (c) 2026 Jinitaemay
+
+源码：`https://github.com/Jinitaemay/MetroSpeed`

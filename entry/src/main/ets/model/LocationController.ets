@@ -52,7 +52,7 @@ export class LocationController {
     return this.running;
   }
 
-  start(callback: LocationCallback, satelliteCallback: SatelliteCallback, statusCallback: LocationStatusCallback): boolean {
+  start(callback: LocationCallback, satelliteCallback: SatelliteCallback, statusCallback: LocationStatusCallback, forRecording?: boolean): boolean {
     this.stop();
     this.callback = callback;
     this.satelliteCallback = satelliteCallback;
@@ -101,8 +101,8 @@ export class LocationController {
           this.callback(snapshot);
         }
       });
-      const satelliteStarted = this.subscribeSatelliteStatus();
-      this.emitStatus(satelliteStarted ? '定位/卫星记录已启动' : '定位记录已启动，卫星状态不可用');
+      this.subscribeSatelliteStatus();
+      this.emitStatus(forRecording ? '卫星记录已启动' : '定位已启动');
       return true;
     } catch (error) {
       const err = error as BusinessError;
