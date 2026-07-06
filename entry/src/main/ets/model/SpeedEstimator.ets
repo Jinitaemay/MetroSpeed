@@ -62,6 +62,8 @@ export class SpeedEstimator {
   private parkingCalibrationSuccessUntilMs: number = 0;
   private lastRawAcceleration?: Vector3;
 
+  private initialCalibrationDone: boolean = false;
+
   private useSysGravity: boolean = false;
   private scenarioDecided: boolean = false;
   private magWindow: number[] = [];
@@ -107,6 +109,7 @@ export class SpeedEstimator {
     this.parkingCalibrationRejectedUntilMs = 0;
     this.parkingCalibrationSuccessUntilMs = 0;
     this.lastRawAcceleration = undefined;
+    this.initialCalibrationDone = false;
     this.useSysGravity = false;
     this.scenarioDecided = false;
     this.magWindow = [];
@@ -174,6 +177,7 @@ export class SpeedEstimator {
     this.parkingCalibrationSuccessUntilMs = 0;
     this.lastRawAcceleration = undefined;
     this.preCalBuffer = [];
+    this.initialCalibrationDone = false;
     this.useSysGravity = false;
     this.scenarioDecided = false;
     this.magWindow = [];
@@ -182,6 +186,9 @@ export class SpeedEstimator {
   }
 
   calibrateAtStop(timestampMs: number): RunStats {
+    if (!this.initialCalibrationDone) {
+      return this.currentStats(timestampMs, '请等待初始校准完成');
+    }
     this.lastTimestampMs = timestampMs;
     this.lastSensorTimestampNs = null;
     this.parkingCalibrationPending = true;
@@ -468,6 +475,7 @@ export class SpeedEstimator {
         }
       }
       this.parkingCalibrationPending = false;
+      this.initialCalibrationDone = true;
       this.filteredAcceleration = emptyVector();
       this.calibrationSamples = 0;
       this.calibrationSum = emptyVector();

@@ -364,6 +364,7 @@ class SpeedEstimator:
         self.parking_calibration_rejected_until_ms = 0
         self.parking_calibration_success_until_ms = 0
         self.last_raw_acceleration: Optional[Vector3] = None
+        self.initial_calibration_done = False
 
     def start(self, timestamp_ms: int) -> None:
         self.running = True
@@ -390,6 +391,7 @@ class SpeedEstimator:
         self.parking_calibration_rejected_until_ms = 0
         self.parking_calibration_success_until_ms = 0
         self.last_raw_acceleration = None
+        self.initial_calibration_done = False
         self.begin_calibration(timestamp_ms)
 
     def stop(self, timestamp_ms: int) -> None:
@@ -410,6 +412,8 @@ class SpeedEstimator:
         self.last_timestamp_ms = timestamp_ms
 
     def calibrate_at_stop(self, timestamp_ms: int) -> bool:
+        if not self.initial_calibration_done:
+            return False
         self.last_timestamp_ms = timestamp_ms
         self.last_sensor_timestamp_ns = None
         self.parking_calibration_pending = True
@@ -664,6 +668,7 @@ class SpeedEstimator:
             if self.parking_calibration_pending:
                 self.parking_calibration_rejected_until_ms = timestamp_ms + self.calibration_parking_reject_ms
         self.parking_calibration_pending = False
+        self.initial_calibration_done = True
 
         self.filtered_acceleration = v_empty()
         self.calibration_samples = 0
