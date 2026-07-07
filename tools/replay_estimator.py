@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-ALGORITHM_VERSION = "adaptive-gravity-20260705-v1"
+ALGORITHM_VERSION = "anchor-delta-20260707-r2"
 APP_PARITY_CONFIG = {
     "curve_positive_scale": 0.35,
     "curve_negative_scale": 0.35,
@@ -1103,8 +1103,10 @@ def replay(
             replay_events.append({"t": timestamp_ms, "event": "parking_calibration_after"})
             continue
         if running and event_matches(event, "\u5165\u96a7"):
-            estimator.refresh_gravity_at_entrance(timestamp_ms)
-            replay_events.append({"t": timestamp_ms, "event": "tunnel_gravity_refresh"})
+            replay_events.append({"t": timestamp_ms, "event": "tunnel_enter"})
+            continue
+        if running and event_matches(event, "\u51fa\u96a7"):
+            replay_events.append({"t": timestamp_ms, "event": "tunnel_exit"})
             continue
         if running and event_matches(event, stop_event):
             replay_events.append({"t": timestamp_ms, "event": "stop", "speedKmh": estimator.velocity_mps * 3.6})

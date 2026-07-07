@@ -64,14 +64,6 @@ export class SpeedEstimator {
 
   private initialCalibrationDone: boolean = false;
 
-  private useSysGravity: boolean = false;
-  private scenarioDecided: boolean = false;
-  private magWindow: number[] = [];
-  private magStdSamples: number[] = [];
-  private readonly MAG_WINDOW: number = 50;
-  private readonly MAG_STD_SAMPLES: number = 450;
-  private readonly MAG_THRESHOLD: number = 2.5;
-
   getVelocityMps(): number {
     return this.velocityMps;
   }
@@ -110,10 +102,6 @@ export class SpeedEstimator {
     this.parkingCalibrationSuccessUntilMs = 0;
     this.lastRawAcceleration = undefined;
     this.initialCalibrationDone = false;
-    this.useSysGravity = false;
-    this.scenarioDecided = false;
-    this.magWindow = [];
-    this.magStdSamples = [];
     this.beginCalibration(timestampMs);
     return this.currentStats(timestampMs, '校准中，请保持设备静止');
   }
@@ -178,10 +166,6 @@ export class SpeedEstimator {
     this.lastRawAcceleration = undefined;
     this.preCalBuffer = [];
     this.initialCalibrationDone = false;
-    this.useSysGravity = false;
-    this.scenarioDecided = false;
-    this.magWindow = [];
-    this.magStdSamples = [];
     return this.currentStats(timestampMs, '等待开始');
   }
 
@@ -253,9 +237,7 @@ export class SpeedEstimator {
     const stable = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motion;
 
     if (stable) {
-      if (!this.useSysGravity) {
-        this.gravityEstimate = candidate;
-      }
+      this.gravityEstimate = candidate;
       return true;
     }
     return false;
@@ -290,38 +272,7 @@ export class SpeedEstimator {
 
     this.finishCalibrationIfNeeded(frame.timestampMs);
 
-    if (!this.scenarioDecided && frame.magneticField) {
-      const mx = frame.magneticField.x;
-      const my = frame.magneticField.y;
-      const mz = frame.magneticField.z;
-      const magVal = Math.sqrt(mx * mx + my * my + mz * mz);
-      this.magWindow.push(magVal);
-      if (this.magWindow.length > this.MAG_WINDOW) {
-        this.magWindow.shift();
-      }
-      if (this.magWindow.length >= this.MAG_WINDOW) {
-        let sum = 0;
-        for (let i = 0; i < this.magWindow.length; i++) {
-          sum += this.magWindow[i];
-        }
-        const mean = sum / this.magWindow.length;
-        let varSum = 0;
-        for (let i = 0; i < this.magWindow.length; i++) {
-          const d = this.magWindow[i] - mean;
-          varSum += d * d;
-        }
-        this.magStdSamples.push(Math.sqrt(varSum / this.magWindow.length));
-      }
-      if (this.magStdSamples.length >= this.MAG_STD_SAMPLES) {
-        const sorted = [...this.magStdSamples].sort((a: number, b: number) => a - b);
-        const medianStd = sorted[Math.floor(sorted.length / 2)];
-        this.scenarioDecided = true;
-        this.useSysGravity = medianStd < this.MAG_THRESHOLD;
-      }
-    }
-
-    const gravityForMotion = (this.useSysGravity && frame.gravity) ? frame.gravity : this.gravityEstimate;
-    const motionAcceleration = subtract(rawAcceleration, gravityForMotion);
+    const motionAcceleration = subtract(rawAcceleration, this.gravityEstimate);
     const clipped = clipMagnitude(motionAcceleration, 3.5);
     const filtered = this.lowPass(clipped, 0.22);
     this.filteredAcceleration = filtered;
@@ -460,9 +411,7 @@ export class SpeedEstimator {
       }
 
       if (stableResult) {
-        if (!this.useSysGravity) {
-          this.gravityEstimate = gravityCandidate;
-        }
+        this.gravityEstimate = gravityCandidate;
         this.calibrationRejectedUntilMs = 0;
         if (this.parkingCalibrationPending) {
           this.applyParkingZero(timestampMs, parkingWindowEndVelocityMps);

@@ -59,7 +59,6 @@ export class SensorController {
 
     this.subscribeGyroscope();
     this.subscribeGravity();
-    this.subscribeMagneticField();
 
     const accelerationStarted = this.subscribeAcceleration();
     if (!accelerationStarted) {
@@ -69,7 +68,6 @@ export class SensorController {
     const availableSensors: string[] = ['加速度'];
     if (this.gyroscopeAvailable) availableSensors.push('陀螺仪');
     if (this.gravityAvailable) availableSensors.push('重力');
-    if (this.magneticFieldAvailable) availableSensors.push('磁场');
     this.emitStatus(`已启动传感器：${availableSensors.join('、')}，请求 ${HIGH_RATE_HZ}Hz`);
 
     return accelerationStarted;
@@ -78,6 +76,7 @@ export class SensorController {
   startAuxiliarySensors(): void {
     this.subscribeLinearAcceleration();
     this.subscribeRotationVector();
+    this.subscribeMagneticField();
 
     const all: string[] = ['加速度'];
     if (this.gyroscopeAvailable) all.push('陀螺仪');
@@ -93,6 +92,7 @@ export class SensorController {
   stopAuxiliarySensors(): void {
     this.safeOffLinearAcceleration();
     this.safeOffRotationVector();
+    this.safeOffMagneticField();
 
     this.latestLinearAcceleration = undefined;
     this.latestLinearAccelerationTimestamp = null;
@@ -100,12 +100,14 @@ export class SensorController {
     this.latestRotationVector = undefined;
     this.latestRotationVectorTimestamp = null;
     this.rotationVectorAvailable = false;
+    this.latestMagneticField = undefined;
+    this.latestMagneticFieldTimestamp = null;
+    this.magneticFieldAvailable = false;
 
     if (this.running) {
       const core: string[] = ['加速度'];
       if (this.gyroscopeAvailable) core.push('陀螺仪');
       if (this.gravityAvailable) core.push('重力');
-      if (this.magneticFieldAvailable) core.push('磁场');
       this.emitStatus(`已启动传感器：${core.join('、')}，请求 ${HIGH_RATE_HZ}Hz`);
     }
   }
@@ -117,7 +119,6 @@ export class SensorController {
     this.safeOffGravity();
     this.safeOffLinearAcceleration();
     this.safeOffRotationVector();
-    this.safeOffMagneticField();
 
     this.latestGyroscope = undefined;
     this.latestGyroscopeTimestamp = null;
@@ -131,9 +132,6 @@ export class SensorController {
     this.latestRotationVector = undefined;
     this.latestRotationVectorTimestamp = null;
     this.rotationVectorAvailable = false;
-    this.latestMagneticField = undefined;
-    this.latestMagneticFieldTimestamp = null;
-    this.magneticFieldAvailable = false;
   }
 
   private subscribeAcceleration(): boolean {

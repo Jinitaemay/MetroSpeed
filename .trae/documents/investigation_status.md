@@ -1,8 +1,8 @@
 # MetroSpeed 项目工作记忆
 
-> **记忆版本**：v37
-> **最后更新**：2026-07-05
-> **对应阶段**：1.1.0 手持检测/置信度重写/传感器状态逻辑修复完成；文档同步
+> **记忆版本**：v41
+> **最后更新**：2026-07-07
+> **对应阶段**：v1.1.1 收尾 — 移除入隧重力刷新、手持停止标记、版本号更新
 
 ---
 
@@ -11,8 +11,8 @@
 **项目名称**：MetroSpeed · 地铁测速
 **平台**：鸿蒙 HarmonyOS (ArkTS)
 **项目路径**：`<项目根目录>`
-**算法版本**：`anchor-delta-20260626-r1`
-**当前阶段**：v1.0.0 已上架 AppGallery，v1.1.0 release 已构建签名，重力传感器场景自适应方案分析层验证通过
+**算法版本**：`adaptive-gravity-20260705-v1`
+**当前阶段**：v1.0.0 已上架 AppGallery，v1.1.0 手持检测/置信度重写已构建签名，adaptive-gravity 双端落地 + 停车校准修复已完成
 **许可证**：MIT
 **包名**：`com.codex.metrospeed`
 **应用名称**：地铁测速
@@ -43,7 +43,7 @@
 - **核心原则**：算法仅使用原始加速度计（含重力）+ 陀螺仪，自算重力+统计主轴学习，不依赖系统融合输出
 
 ### 关键特性
-1. **隧道模式**：用户手动拨动开关切换，入隧时冻结 GNSS 锚点，防止系统推算污染速度；同时调用 `refreshGravityAtEntrance()` 尝试刷新重力估计（扫描 preCalBuffer 最优 75 帧，五道稳定性检查，只更新 gravityEstimate，不动速度/主轴/锚点）
+1. **隧道模式**：用户手动拨动开关切换，入隧时冻结 GNSS 锚点，防止系统推算污染速度。已移除 `refreshGravityAtEntrance()` 调用（行驶中 preCalBuffer 无静止段，会把加速度当重力）
 2. **自适应停车校准**：停车时点击校准按钮，自动扫描 preCalBuffer（180 帧环形缓冲区，约 3.6 秒）内最优 75 帧（1.5 秒）静止段，速度补偿 + 重力重估
 3. **GNSS -40ms 固定延迟补偿**：所有记录一致显示 locationTimeMs 比传感器时间晚约 40ms，ArkTS 端在锚点采集时用速度历史缓冲区查找 40ms 前的惯性速度，Python 端通过 `--gnss-lag-ms=-40` 补偿
 4. **研究记录模式**：全量 50Hz 传感器数据 + GNSS 数据 JSONL 格式记录，支持导出离线分析
@@ -70,8 +70,9 @@
 - 启动后状态文字显示所有可用传感器列表
 - DevEco已自动配置debug签名，直接点击运行即可自动签名安装到手机
 
-### refreshGravityAtEntrance() 详细逻辑
-**功能定位**：只刷新重力估计向量，不重置速度、不重置主轴、不重置锚点。
+### refreshGravityAtEntrance() — 已停用
+**状态**：方法保留但入隧时不再调用（07-07 移除）。
+**停用原因**：行驶中 preCalBuffer（3.6s）无静止段，扫描出的"最优窗口"会把行驶加速度当重力。驾车浦东大道实测 gY 从 4.29→3.73，10 分钟飙至 991 km/h。
 
 **执行流程**：
 1. 从 `preCalBuffer`（180帧环形缓冲区 ≈ 3.6秒）中扫描
@@ -105,6 +106,10 @@
 3. 清空窗口帧：windowFrames = []
 4. 重置主轴：mainAxisInitialized = false，主轴重新学习
 5. 重置原始加速度：lastRawAcceleration = undefined
+
+**初始校准保护**（07-06 新增）：
+- 初始校准完成前（preCalBuffer 不足 75 帧），`calibrateAtStop()` 直接返回 false，ArkTS 端显示"请等待初始校准完成"状态文本
+- `initialCalibrationDone` 标志位在第一次停车校准成功（applyParkingZero）后置 true，之后正常接受停车校准
 
 **和普通校准的区别**：
 | 方面 | 普通校准 | 停车校准 |
@@ -256,6 +261,12 @@ MetroSpeed/
 16. **置信度公式重写**（07-05）：基线 1.0、倍率衰减模型：时间衰减×状态倍率（弯道×3/加速×2/振动×4/传导振动×1.5）+ 陀螺噪声项。pureMode 双速率（锚点 3min 触底 / 纯惯性 2min 触底）。停车校准不动置信度。22.9万帧 14 条记录标定验证单调性成立（10%→56.7 vs 90%→9.2 km/h P90）。双端同步
 17. **传感器状态汇总**：`startAuxiliarySensors()` 由仅列出辅助传感器改为列出全部可用传感器（加速度计、陀螺仪、重力、线性加速度、旋转向量、磁力计），避免覆盖测速启动时显示的核心传感器信息
 18. **停止测速后记录传感器不重启 bug**：`sensorController.stop()` 关闭全部传感器后 `researchSensorActive` 未重置，导致 `startResearchSensors()` 的 `if (researchSensorActive) return` 短路。修复：`stopMeasurement()` 中加 `this.researchSensorActive = false`
+19. **adaptive-gravity ArkTS 双端落地→已移除**（07-06）：磁力计场景检测器从 Python 分析层落地 ArkTS SpeedEstimator——前 500 帧滑动 std 中位数判定场景，驾车启用系统重力 (useSysGravity=true)，地铁用自估重力。后经 4 条新记录验证被移除：公交浦东100路 medianStd=0.19→错判驾车→系统重力吃加速→速度崩坏（MAE 1.73→6.92↓300%）；驾车苏沪新记录 medianStd=2.82→错判地铁→漏掉增益。且系统重力在新版偏置已修复的驾车记录上增益微弱（0.72→0.66）
+20. **初始校准期间禁止停车校准**（07-06）：新增 `initialCalibrationDone` 标志位——初始校准（beginCalibration→preCalBuffer 75 帧完成）之前 caribrateAtStop 被拒止（ArkTS 返回"请等待初始校准完成"状态文本，Python 返回 False）。根因：初始校准期间点停车校准会覆盖 `calibrationUntilMs`，而 preCalBuffer 不足 75 帧导致后续所有校准失败
+21. **手持检测 RMS+ZCR 算法失效**（07-06 确认）：公交浦东100路硬质表面上 10 次 stop 中大部分由手持误触发。根因：底盘高频振动在三个轴上同时过零——所有记录 ZCR P50=20-35，ZCR>5 阈值形同虚设；gyro RMS 均值法用 8s 窗仍压不掉公交底盘的 gyro_mean_mag（P99=0.109 vs 车窗 P99=0.054，区间重叠）。真手持数据缺乏。v1.1.1 将 GYRO_RMS 临时上调至 0.5（max_streak=36<40）。
+22. **版本号纪律**（07-06 沉淀）：只有 SpeedEstimator 内部逻辑变更才改 ALGORITHM_VERSION。v1.1.1 仅改 UX 层（手持阈值、移除 adaptive-gravity），ALGORITHM_VERSION 保持 anchor-delta-20260626-r1
+23. **入隧重力刷新必须移除**（07-07 确认）：`refreshGravityAtEntrance` 用 3.6s 滑动窗口从行驶数据中扫"最像静止的 1.5s"，任意时刻调用都会把行驶加速度当重力。驾车浦东大道记录 gY 从 4.29→3.73 导致 10 分钟飙到 991 km/h。地铁同理——入隧时车在高速行驶，buffer 里没有静止段。入隧只需冻结 GNSS 锚点
+24. **手持停止需标记来源**（07-07）：`stopMeasurement` 增加 `reason` 参数，JSONL 中区分 `handheld` vs `manual` 停止
 
 ### 技术要点
 - **时间源**：`computeDeltaSeconds` 优先 sensorTimestamp，其余用 Date.now()（墙上时间语义），双轨正确
@@ -263,7 +274,7 @@ MetroSpeed/
 - **LocationSourceType**：1=GNSS, 4=RTK，`tunnelState !== 'inside'` 是防系统推算冒充的唯一防护
 - **传感器类功能开发流程**：必须遵循"先在研究记录中加字段采集数据→观察实际数据表现→再决定是否接入算法"，禁止在没有数据支撑的情况下直接修改算法
 - **UI兼容性**：API12下Button组件自定义borderRadius不生效，使用系统默认胶囊形，不要手动设置圆角数值，升级API版本后需要重新验证所有组件样式
-- **replay_estimator.py 分析层开关**：`--use-gyro-gravity`（陀螺仪重力追踪，已验证失败）、`--use-sys-gravity`（系统重力替代自估重力，地铁 NO-GO / 驾车有效）、`--adaptive-gravity`（磁力计场景检测器 + 一次判定场景切换，地铁零劣化 / 驾车 85%↓，验证通过）。这些是分析层参数，不改变 SpeedEstimator 默认行为
+- **replay_estimator.py 分析层开关**：`--use-gyro-gravity`（陀螺仪重力追踪，已验证失败）、`--use-sys-gravity`（系统重力替代自估重力，地铁 NO-GO / 驾车在偏置未修复时有效，偏置修复后增益微弱 0.72→0.66）、`--adaptive-gravity`（磁力计场景检测器，4 条新记录验证失败，已从 ArkTS 移除但分析层开关保留）
 
 ---
 
@@ -311,6 +322,13 @@ MetroSpeed/
 | 07-04 | UI 文案优化 + 1.1.0 构建 | 状态文本去"研究"二字；灰色提示补充上下坡/姿态限制说明；构建签名 1.1.0 release 包 |
 | 07-05 | 手持检测系统 | 陀螺仪 RMS + zeroCrossingRate 双指标滑窗检测，40 帧确认触发，14 条记录零误触发。触发 stopMeasurement() + 红色不透明覆盖 SpeedPanel/StatsGrid，永不自恢复 |
 | 07-05 | 置信度重写/传感器/文案 | ①置信度倍率衰减模型（基线 1.0、弯道×3/加速×2/振动×4、pureMode 双速率、3min 触底、校准不重置）；②传感器状态汇总、停止后重启 bug 修复、启动失败后 researchSensorActive 复位；③文案优化（三行引导、底部精简）；④22.9万帧标定验证 |
+| 07-06 | adaptive-gravity ArkTS 落地 | 磁力计场景检测器从 Python 分析层 → SpeedEstimator.ets；前 500 帧 mag std 中位数判定场景（阈值 2.5μT）；驾车启用 `useSysGravity=true`（系统重力不冻结、持续修正），地铁保持自估重力；`calibrateAtStop`/`refreshGravityAtEntrance` 增加 `useSysGravity` guard；SensorController 将磁力计+重力提升为核心传感器 |
+| 07-06 | 初始校准停车校准保护 | 新增 `initialCalibrationDone` 标志位；preCalBuffer 不足 75 帧时 `caribrateAtStop()` 被拒止，ArkTS 显示"请等待初始校准完成"；`applyParkingZero()` 成功后置 `initialCalibrationDone=true` |
+| 07-06 | v1.1.1 止血发布 | ①移除 adaptive-gravity（4条新记录验证磁力计 std 无法可靠分离公交/驾车：浦东100路公交 medianStd=0.19→错判驾车→MAE 1.73→6.92↓300%；苏沪高速新_0705 medianStd=2.82→错判地铁→漏掉系统重力增益；系统重力在偏置已修复的新版驾车记录上增益仅 0.72→0.66，不构成保留理由）；②手持阈值 GYRO_RMS 0.3→0.5（浦东100路 max_streak=36<40 不再误触；靠在车窗记录 rms>0.5 仅 70 窗=0.5%，也不触发）；③磁力计回归辅助传感器；④ALGORITHM_VERSION 回退 anchor-delta-20260626-r1（算法内核未变） |
+| 07-06 | 手持检测算法失效分析 | RMS+ZCR 双指标本质区分不了底盘振动和手持晃动——所有记录 ZCR P50 为 20-35（底盘高频振动导致三轴频繁过零），当前 ZCR>5 阈值形同虚设；gyro_mean_mag 用 8s 长窗仍无法分离（浦东100 P99=0.109 vs 车窗 P99=0.054，区间重叠）。缺乏真手持记录，新算法需重新设计 |
+| 07-07 | 移除入隧重力刷新 | `refreshGravityAtEntrance` 在入隧时从 preCalBuffer（3.6s）扫最优窗口重算重力，但行驶中 buffer 全是加速度数据。驾车浦东大道-延安东路记录因此从正确重力 [−0.16,4.29,8.87] 被拉到错误 [−0.02,3.73,9.16]，10 分钟积分飙至 991 km/h。入隧/出隧现在只切换 tunnelState 冻结 GNSS 锚点，不再调用 refreshGravityAtEntrance |
+| 07-07 | 手持停止标记 | `stopMeasurement(reason)` 增加参数区分 `'handheld'` vs `'manual'` 停止，JSONL 中停止事件的 notes 字段标记 `reason=handheld\|manual` |
+| 07-07 | 惠南东-新场速度跳变调查 | 手机 v1.1.0（adaptive-gravity）记录出现 13→71、27→90→0 等速度跳变。经回放验证：当前 v1.1.1 revert 后完全无法复现——确认是 adaptive-gravity 在低置信度 + 系统重力下的产物，已随 revert 消除 |
 ---
 
 ## 十、当前任务状态
@@ -319,16 +337,17 @@ MetroSpeed/
 见时间线 2026-07-01 之后条目及核心发现第 15-18 条，此处不重复。以下仅列出本节独有的待执行任务备忘。
 
 **待执行任务（按优先级）**：
-1. 🟡 重力估计可靠性修复（坡道偏置 + 场景自适应切换，同一任务的两个切面）
-   - 共同根因：重力估计在特定场景下不可靠（驾车坡道冻结 / 地铁磁干扰污染）
-   - 方案：磁力计场景检测器（已验证）→ 驾车启用系统重力（9DOF 融合含磁力计，行驶中持续修正不冻结），地铁回退自估重力（避开磁干扰）
-   - ✅ 分析层 `--adaptive-gravity` 验证通过（地铁零劣化、苏沪高速 85%↓）
-   - ✅ 修复 c7ab07f 引入的辅助传感器丢失回归 bug（待重新采集市内驾车记录验证）
-   - 待解决子问题：停车校准时车在坡道上的偏置，是否也由系统重力消化（系统重力静止时也读带倾角的重力，但开起来后会逐渐修正，不会冻结 1200 秒）
-   - 下一步：部署修复后采集市内驾车记录 → 验证 adaptive 在市内驾车场景的行为 → 通过后进入 ArkTS 实现（双端一致 + 全量验证）
-2. 🟢 多语言支持（英文）
-3. 🟢 后台长时记录稳定性测试（需补充 lifecycle background/foreground 事件记录）
-4. 🟢 历史记录管理界面
+1. 🟡 重力估计可靠性修复（坡道偏置用系统重力消化，场景自适应方案待重新设计）
+   - ✅ 磁力计场景检测已移除 — 4 条新记录验证无法靠磁力计 std 可靠分离公交/驾车
+   - ✅ 停车校准保护（`initialCalibrationDone`）保留
+   - 坡道偏置子问题仍待解决；system gravity 在偏置已修复的新版驾车记录上增益微弱（0.72→0.66），需要找真正有效的分离信号
+2. 🟡 手持检测算法重新设计
+   - ✅ 阈值临时上调至 0.5（止血），暂不误触
+   - 当前 RMS+ZCR 方案在有振动传导的硬质表面上无法区分底盘振动 vs 手持摇晃
+   - 下一步：需采集真手持记录 → 分析可行指标（加速度姿态变化、ROTATION_VECTOR 角速度等）
+3. 🟢 多语言支持（英文）
+4. 🟢 后台长时记录稳定性测试（需补充 lifecycle background/foreground 事件记录）
+5. 🟢 历史记录管理界面
 
 ---
 

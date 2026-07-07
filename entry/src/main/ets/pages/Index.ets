@@ -82,7 +82,7 @@ struct Index {
 
   private gyroBuf: GyroSample[] = [];
   private readonly GYRO_WINDOW: number = 40;
-  private readonly GYRO_RMS_THRESHOLD: number = 0.3;
+  private readonly GYRO_RMS_THRESHOLD: number = 0.5;
   private readonly ZCR_THRESHOLD: number = 5.0;
   private readonly HANDHELD_ACTIVATE: number = 40;
   private handheldSuspectStreak: number = 0;
@@ -223,7 +223,7 @@ struct Index {
     this.locationStatus = '定位已停止';
   }
 
-  private stopMeasurement(): void {
+  private stopMeasurement(reason: string = 'manual'): void {
     if (!this.isRunning) {
       return;
     }
@@ -231,7 +231,8 @@ struct Index {
     const now = Date.now();
     this.sensorController.stop();
     this.sensorStatus = '传感器已停止';
-    this.researchStatus = this.researchRecorder.endMeasurement(now, `speed=${this.stats.currentSpeedKmh.toFixed(2)}km/h`);
+    this.researchStatus = this.researchRecorder.endMeasurement(now,
+      `reason=${reason} speed=${this.stats.currentSpeedKmh.toFixed(2)}km/h`);
     this.stats = this.estimator.stop(now);
     this.isRunning = false;
     this.hasGnssAnchor = false;
@@ -380,7 +381,7 @@ struct Index {
     }
 
     if (this.handheldSuspectStreak >= this.HANDHELD_ACTIVATE && !this.isHandheld) {
-      this.stopMeasurement();
+      this.stopMeasurement('handheld');
       this.isHandheld = true;
       this.handheldSuspectStreak = 0;
     }
@@ -562,9 +563,6 @@ struct Index {
     const event = isInside ? '入隧' : '出隧';
     this.tunnelState = isInside ? 'inside' : 'outside';
     this.tunnelSwitchOn = isInside;
-    if (isInside && this.isRunning) {
-      this.estimator.refreshGravityAtEntrance(Date.now());
-    }
     if (this.researchStatus.running) {
       this.markResearchEventWithNotes(event, 'manual_switch');
     }
