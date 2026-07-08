@@ -1,8 +1,8 @@
 # MetroSpeed 项目工作记忆
 
-> **记忆版本**：v41
-> **最后更新**：2026-07-07
-> **对应阶段**：v1.1.1 收尾 — 移除入隧重力刷新、手持停止标记、版本号更新
+> **记忆版本**：v42
+> **最后更新**：2026-07-08
+> **对应阶段**：v1.1.1 发布 — 移除 adaptive-gravity、移除入隧重力刷新、手持阈值止血、算法版本 anchor-delta-20260707-r2
 
 ---
 
@@ -324,11 +324,13 @@ MetroSpeed/
 | 07-05 | 置信度重写/传感器/文案 | ①置信度倍率衰减模型（基线 1.0、弯道×3/加速×2/振动×4、pureMode 双速率、3min 触底、校准不重置）；②传感器状态汇总、停止后重启 bug 修复、启动失败后 researchSensorActive 复位；③文案优化（三行引导、底部精简）；④22.9万帧标定验证 |
 | 07-06 | adaptive-gravity ArkTS 落地 | 磁力计场景检测器从 Python 分析层 → SpeedEstimator.ets；前 500 帧 mag std 中位数判定场景（阈值 2.5μT）；驾车启用 `useSysGravity=true`（系统重力不冻结、持续修正），地铁保持自估重力；`calibrateAtStop`/`refreshGravityAtEntrance` 增加 `useSysGravity` guard；SensorController 将磁力计+重力提升为核心传感器 |
 | 07-06 | 初始校准停车校准保护 | 新增 `initialCalibrationDone` 标志位；preCalBuffer 不足 75 帧时 `caribrateAtStop()` 被拒止，ArkTS 显示"请等待初始校准完成"；`applyParkingZero()` 成功后置 `initialCalibrationDone=true` |
-| 07-06 | v1.1.1 止血发布 | ①移除 adaptive-gravity（4条新记录验证磁力计 std 无法可靠分离公交/驾车：浦东100路公交 medianStd=0.19→错判驾车→MAE 1.73→6.92↓300%；苏沪高速新_0705 medianStd=2.82→错判地铁→漏掉系统重力增益；系统重力在偏置已修复的新版驾车记录上增益仅 0.72→0.66，不构成保留理由）；②手持阈值 GYRO_RMS 0.3→0.5（浦东100路 max_streak=36<40 不再误触；靠在车窗记录 rms>0.5 仅 70 窗=0.5%，也不触发）；③磁力计回归辅助传感器；④ALGORITHM_VERSION 回退 anchor-delta-20260626-r1（算法内核未变） |
+| 07-06 | v1.1.1 止血发布 | ①移除 adaptive-gravity（4条新记录验证磁力计 std 无法可靠分离公交/驾车：浦东100路公交 medianStd=0.19→错判驾车→MAE 1.73→6.92↓300%；苏沪高速新_0705 medianStd=2.82→错判地铁→漏掉系统重力增益；系统重力在偏置已修复的新版驾车记录上增益仅 0.72→0.66，不构成保留理由）；②手持阈值 GYRO_RMS 0.3→0.5（浦东100路 max_streak=36<40 不再误触；靠在车窗记录 rms>0.5 仅 70 窗=0.5%，也不触发）；③磁力计回归辅助传感器；④ALGORITHM_VERSION → anchor-delta-20260707-r2 |
 | 07-06 | 手持检测算法失效分析 | RMS+ZCR 双指标本质区分不了底盘振动和手持晃动——所有记录 ZCR P50 为 20-35（底盘高频振动导致三轴频繁过零），当前 ZCR>5 阈值形同虚设；gyro_mean_mag 用 8s 长窗仍无法分离（浦东100 P99=0.109 vs 车窗 P99=0.054，区间重叠）。缺乏真手持记录，新算法需重新设计 |
 | 07-07 | 移除入隧重力刷新 | `refreshGravityAtEntrance` 在入隧时从 preCalBuffer（3.6s）扫最优窗口重算重力，但行驶中 buffer 全是加速度数据。驾车浦东大道-延安东路记录因此从正确重力 [−0.16,4.29,8.87] 被拉到错误 [−0.02,3.73,9.16]，10 分钟积分飙至 991 km/h。入隧/出隧现在只切换 tunnelState 冻结 GNSS 锚点，不再调用 refreshGravityAtEntrance |
 | 07-07 | 手持停止标记 | `stopMeasurement(reason)` 增加参数区分 `'handheld'` vs `'manual'` 停止，JSONL 中停止事件的 notes 字段标记 `reason=handheld\|manual` |
 | 07-07 | 惠南东-新场速度跳变调查 | 手机 v1.1.0（adaptive-gravity）记录出现 13→71、27→90→0 等速度跳变。经回放验证：当前 v1.1.1 revert 后完全无法复现——确认是 adaptive-gravity 在低置信度 + 系统重力下的产物，已随 revert 消除 |
+| 07-07 | 公交 71 路区间 / 地铁大连路-世纪大道 记录 | 公交 71 路纯惯性 MAE 8.89→锚点 3.83，手机侧躺轮壳重力正常；地铁全地下无 GNSS，积分 3.15km/4 站，6 次手动校准正常 |
+| 07-08 | 发布 1.1.1 最终包 | 签名、同步 README 应用介绍、commit 规范写入项目规则、移除过时计划文档 |
 ---
 
 ## 十、当前任务状态
