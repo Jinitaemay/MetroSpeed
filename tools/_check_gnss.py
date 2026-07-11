@@ -8,7 +8,7 @@ data_dir = Path(os.environ.get("METROSPEED_DATA_DIR", "."))
 f = data_dir / fname
 
 locations = []
-with open(f) as fh:
+with open(f, encoding="utf-8") as fh:
     for line in fh:
         d = json.loads(line)
         if d.get("recordType") == "location":
@@ -18,7 +18,13 @@ print(f"File: {fname}")
 print(f"Location records: {len(locations)}")
 if locations:
     for loc in locations:
-        speed = loc.get("speedKmh", 0)
-        acc = loc.get("accuracy", 0)
+        speed = (loc.get("locationSpeedMps") or 0) * 3.6
+        speed_acc = loc.get("locationSpeedAccuracyMps")
+        location_acc = loc.get("locationAccuracy")
         ts = loc["timestampMs"]
-        print(f"  speed={speed:.1f} km/h  acc={acc}  ts={ts}")
+        speed_acc_text = f"{speed_acc:.2f}" if speed_acc is not None else "N/A"
+        location_acc_text = f"{location_acc:.1f}" if location_acc is not None else "N/A"
+        print(
+            f"  speed={speed:.1f} km/h  speedAcc={speed_acc_text} m/s "
+            f"locationAcc={location_acc_text} m  ts={ts}"
+        )

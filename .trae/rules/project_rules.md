@@ -10,7 +10,7 @@
 
 - 一致性作用域：`SpeedEstimator` 类内部的所有方法（状态检测、主轴追踪、有效加速度、积分、校准等）。给定相同的传感器帧序列，两端必须产出相同速度序列。
 - **不得**在算法层擅自增加 ArkTS 端没有的检查、闸门或分支
-- 改完算法逻辑后跑 `python tools/sync_version.py --check` 确认 `ALGORITHM_VERSION` 两端同步
+- 改完算法逻辑后跑 `python tools/sync_version.py --check` 确认 ArkTS、Python 与 README 的 `ALGORITHM_VERSION` 同步
 
 一致性规则**不约束** `replay_estimator.py` 中的分析层函数。以下属于分析层，可自由扩展：
 - `compare_with_location`、`scan_location_lag`、`compare_bucketed` — GNSS 对比与统计
@@ -33,10 +33,11 @@
 
 每次构建（`hvigorw assembleHap` / `assembleApp` 或 DevEco Studio build）时，`hvigorfile.ts` 会自动更新 `AppScope/app.json5` 中的 `versionCode`。
 
-- `versionCode` = Unix 时间戳（秒），自动递增
+- `versionCode` = `max(Unix 时间戳秒, 当前两处版本号 + 1)`，同秒构建或时钟回拨时仍自动递增
 - `versionName` = 语义化版本号（如 `1.0.0`），**手动管理**，发版时修改 `app.json5`
 - 不要在构建前手动编辑 `versionCode`，但可以手动修改 `versionName`
-- `sync_version.py --code <timestamp>` 用于手动同步（无需每次构建执行）
+- `sync_version.py --code <timestamp>` 用于手动同步（无需每次构建执行）；默认拒绝低于当前值的显式版本号，只有本地有意回滚时才可加 `--allow-downgrade`
+- 构建入口与 `sync_version.py` 共用 `.sync-version.lock`，并采用保留原换行的原子替换/失败回滚；不要绕过两者直接并发改写版本字段
 
 ### 2.2 构建命令
 
@@ -62,13 +63,13 @@ $env:PATH = "$env:NODE_HOME;$env:JAVA_HOME\bin;" + $env:PATH
 1. 复制模板：`Copy-Item build-profile.template.json5 build-profile.json5`
 2. 用 DevEco Studio 打开工程，让其自动填充 debug 签名；或手动配置签名
 
-release 签名使用 `tools/sign_app.ps1` 脚本手动签名。签名前需设置环境变量：
+release 签名使用 `tools/sign_app.ps1` 脚本手动签名。脚本默认交互读取密码；仅自动化环境显式使用 `-NonInteractivePassword`，并在签名前设置：
 ```powershell
 $env:METROSPEED_KEYSTORE_PASSWORD = "<密钥库密码>"
 ```
 
 ```powershell
-# 默认输入输出
+# 默认输入输出（交互输入密码）
 powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 
 # 指定输入输出
@@ -76,6 +77,15 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -AppPath "输入.app
 
 # 指定签名工具路径（默认自动从 DEVECO_SDK_HOME 或默认安装路径推断）
 powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -SignToolPath "D:\sdk\...\hap-sign-tool.jar"
+
+# 共享机器推荐交互输入密码，避免密码出现在 Java 进程参数中
+powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -InteractivePassword
+
+# 仅自动化环境：显式启用非交互模式（密码会进入 Java 进程参数）
+powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -NonInteractivePassword
+
+# 必要时显式指定 Java；默认依次检查 JAVA_HOME、DevEco JBR 和 PATH
+powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -JavaPath "D:\Java\bin\java.exe"
 ```
 
 签名流程：解压 .app → 签内部 HAP → 重新打包 → 签 .app 本身。
@@ -94,7 +104,10 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -SignToolPath "D:\sd
 
 停车校准由用户手动触发，`calibrate_at_stop` 不引入额外速度阈值拦截。
 
-- 校准从 `preCalBuffer`（180 帧环形缓冲区，3.6s）中扫描 rmsDeviation 最低的 75 帧（1.5s）滑动窗口做重力估计，通过陀螺仪均值/最大值/加速度跳动三道传感器检查即完成
+- 点击时先冻结 `preCalBuffer` 中按钮前的数据，再从快照里取 rmsDeviation 最低的 75 帧（请求频率 50Hz 时约 1.5s）静止窗；等待结果期间的高频新帧不得挤掉校准证据；候选窗末帧距按钮时刻不得超过 300ms，避免复用过旧静止段；历史不足、窗口过旧或稳定性检查失败时明确拒绝且不改速度
+- 成功后以静止窗为零速锚，用校准后的重力重放窗口之后的原始帧并保留已学习主轴；因此停稳时严格归零，按钮后立即起步的真实增量也必须保留
+- GNSS/惯性锚点只能在停车校准确认成功后归零，点击请求或拒绝不能改变锚点
+- 停车校准请求或拒绝不得刷新最近成功校准时间；仅成功结果可以重置置信度的校准时龄
 - **不得**用估算器自身的速度输出去质疑用户操作
 
 ---
@@ -102,6 +115,8 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -SignToolPath "D:\sd
 ## 4. 数据文件路径
 
 所有 JSONL 数据存放在本地方研究记录目录，设置环境变量 `METROSPEED_DATA_DIR` 指向该目录。
+
+schema v14 起，所有实际传感器回调都必须逐帧落盘并携带 `sessionId`、`measurementRunId` 和版本字段；估算器行必须同时保留纯惯性 `pureInertialSpeedKmh` 与界面显示 `displaySpeedKmh`。离线对比必须按 `measurementRunId` 隔离，纯惯性回归只允许与同一 `recordSeq` 邻接的精确传感器帧配对，禁止跨测速段或跨缺失帧插值；schema v13 的 `estimatedSpeedKmh` 是锚定后的显示速度，不能当作纯惯性回归基准。
 
 回放分析使用：
 ```
@@ -125,7 +140,7 @@ python tools/replay_estimator.py "<数据目录>\<文件名>.jsonl"
 
 参数扫描分两阶段，不得跳过第一阶段的筛选：
 
-1. **灵敏度筛选** — 至少两条互补记录（如制动占比高的 + 制动占比低的，或地铁 + 驾车），每个参数 ±50% 各跑一次。MAE 变化 ≤ 0.5 km/h 的归档为"不敏感"，仅敏感参数进入下一阶段。
+1. **灵敏度筛选** — 至少两条互补记录（如制动占比高的 + 制动占比低的，或地铁 + 驾车），默认每个参数 ±20% 各跑一次；必要时扩大到 ±50%。MAE 变化 ≤ 0.5 km/h 的归档为"不敏感"，仅敏感参数进入下一阶段。
 2. **全量验证** — 敏感参数跑全 8 条有效记录，按规则 5 检查改善/恶化比例。如果最优点在不同记录间冲突，可尝试密集网格（如 0.0/0.5/0.75/0.85/0.9/0.95/1.0/1.1/1.2/1.5/2.0）寻找公共可行区间。
 
 以下类型的参数**不进入扫描范围**：

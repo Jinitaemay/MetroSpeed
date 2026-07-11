@@ -20,9 +20,13 @@ interface AccelWindowFrame {
 }
 
 interface PreCalFrame {
+  timestampMs: number;
   acceleration: Vector3;
   gyroMagnitude: number;
-  velocityMps: number;
+  accStep: number;
+  deltaSeconds: number;
+  distanceBeforeM: number;
+  integrated: boolean;
 }
 
 export class SpeedEstimator {
@@ -50,6 +54,8 @@ export class SpeedEstimator {
   private calibrationMaxStep: number = 0;
   private calibrationLastAcceleration?: Vector3;
   private calibrationSamples: number = 0;
+  private calibrationFirstSampleMs: number = 0;
+  private calibrationLastSampleMs: number = 0;
   private calibrationRejectedUntilMs: number = 0;
   private lastCalibrationMs: number = 0;
   private motionState: MotionState = MotionState.Idle;
@@ -60,6 +66,11 @@ export class SpeedEstimator {
   private parkingCalibrationPending: boolean = false;
   private parkingCalibrationRejectedUntilMs: number = 0;
   private parkingCalibrationSuccessUntilMs: number = 0;
+  private parkingCalibrationResult: number = 0;
+  private parkingCalibrationRequestMs: number = 0;
+  private parkingCalibrationPreviousMs: number = 0;
+  private parkingCalibrationSnapshot: PreCalFrame[] = [];
+  private parkingPostRequestFrames: PreCalFrame[] = [];
   private lastRawAcceleration?: Vector3;
 
   private initialCalibrationDone: boolean = false;
@@ -74,6 +85,12 @@ export class SpeedEstimator {
 
   setPureMode(pure: number): void {
     this.pureMode = pure;
+  }
+
+  consumeParkingCalibrationResult(): number {
+    const result = this.parkingCalibrationResult;
+    this.parkingCalibrationResult = 0;
+    return result;
   }
 
   start(timestampMs: number): RunStats {
@@ -100,6 +117,11 @@ export class SpeedEstimator {
     this.parkingCalibrationPending = false;
     this.parkingCalibrationRejectedUntilMs = 0;
     this.parkingCalibrationSuccessUntilMs = 0;
+    this.parkingCalibrationResult = 0;
+    this.parkingCalibrationRequestMs = 0;
+    this.parkingCalibrationPreviousMs = 0;
+    this.parkingCalibrationSnapshot = [];
+    this.parkingPostRequestFrames = [];
     this.lastRawAcceleration = undefined;
     this.initialCalibrationDone = false;
     this.beginCalibration(timestampMs);
@@ -116,6 +138,11 @@ export class SpeedEstimator {
     this.parkingCalibrationPending = false;
     this.parkingCalibrationRejectedUntilMs = 0;
     this.parkingCalibrationSuccessUntilMs = 0;
+    this.parkingCalibrationResult = 0;
+    this.parkingCalibrationRequestMs = 0;
+    this.parkingCalibrationPreviousMs = 0;
+    this.parkingCalibrationSnapshot = [];
+    this.parkingPostRequestFrames = [];
     this.lastRawAcceleration = undefined;
     this.preCalBuffer = [];
     return {
@@ -159,10 +186,17 @@ export class SpeedEstimator {
     this.calibrationGyroMax = 0;
     this.calibrationMaxStep = 0;
     this.calibrationLastAcceleration = undefined;
+    this.calibrationFirstSampleMs = 0;
+    this.calibrationLastSampleMs = 0;
     this.calibrationRejectedUntilMs = 0;
     this.parkingCalibrationPending = false;
     this.parkingCalibrationRejectedUntilMs = 0;
     this.parkingCalibrationSuccessUntilMs = 0;
+    this.parkingCalibrationResult = 0;
+    this.parkingCalibrationRequestMs = 0;
+    this.parkingCalibrationPreviousMs = 0;
+    this.parkingCalibrationSnapshot = [];
+    this.parkingPostRequestFrames = [];
     this.lastRawAcceleration = undefined;
     this.preCalBuffer = [];
     this.initialCalibrationDone = false;
@@ -173,74 +207,24 @@ export class SpeedEstimator {
     if (!this.initialCalibrationDone) {
       return this.currentStats(timestampMs, '请等待初始校准完成');
     }
-    this.lastTimestampMs = timestampMs;
-    this.lastSensorTimestampNs = null;
+    if (this.parkingCalibrationPending) {
+      return this.currentStats(timestampMs, '停车校准中，请保持停稳');
+    }
     this.parkingCalibrationPending = true;
     this.parkingCalibrationRejectedUntilMs = 0;
     this.parkingCalibrationSuccessUntilMs = 0;
+    this.parkingCalibrationResult = 0;
+    this.parkingCalibrationRequestMs = timestampMs;
+    this.parkingCalibrationPreviousMs = this.lastCalibrationMs;
+    // Freeze the evidence available at click time. Waiting for the 1.5s result must
+    // not let high-rate post-click callbacks evict the stationary window.
+    this.parkingCalibrationSnapshot = this.preCalBuffer.slice();
+    this.parkingPostRequestFrames = [];
     this.beginCalibration(timestampMs);
+    // A request is not a successful calibration. Keep confidence decay anchored to
+    // the previous success until this attempt is actually accepted.
+    this.lastCalibrationMs = this.parkingCalibrationPreviousMs;
     return this.currentStats(timestampMs, '停车校准中，请保持停稳');
-  }
-
-  refreshGravityAtEntrance(timestampMs: number): boolean {
-    const windowFrames = 75;
-    if (this.preCalBuffer.length < windowFrames) {
-      return false;
-    }
-
-    let bestStart = 0;
-    let bestRms = Infinity;
-    for (let i = 0; i <= this.preCalBuffer.length - windowFrames; i++) {
-      let s = emptyVector();
-      let sq = 0;
-      for (let j = i; j < i + windowFrames; j++) {
-        const f = this.preCalBuffer[j];
-        s = add(s, f.acceleration);
-        sq += dot(f.acceleration, f.acceleration);
-      }
-      const mean = scale(s, 1 / windowFrames);
-      const meanSq = sq / windowFrames;
-      const meanDot = dot(mean, mean);
-      const rms = Math.sqrt(Math.max(0, meanSq - meanDot));
-      if (rms < bestRms) {
-        bestRms = rms;
-        bestStart = i;
-      }
-    }
-
-    let calSum = emptyVector();
-    let calSqSum = 0;
-    let calGyroSum = 0;
-    let calGyroMax = 0;
-    let calMaxStep = 0;
-    let lastAcc: Vector3 | undefined = undefined;
-    for (let j = bestStart; j < bestStart + windowFrames; j++) {
-      const f = this.preCalBuffer[j];
-      calSum = add(calSum, f.acceleration);
-      calSqSum += dot(f.acceleration, f.acceleration);
-      calGyroSum += f.gyroMagnitude;
-      calGyroMax = Math.max(calGyroMax, f.gyroMagnitude);
-      if (lastAcc) {
-        calMaxStep = Math.max(calMaxStep, magnitude(subtract(f.acceleration, lastAcc)));
-      }
-      lastAcc = f.acceleration;
-    }
-
-    const candidate = scale(calSum, 1 / windowFrames);
-    const meanSquare = calSqSum / windowFrames;
-    const candidateDot = dot(candidate, candidate);
-    const rmsDeviation = Math.sqrt(Math.max(0, meanSquare - candidateDot));
-    const gravMag = magnitude(candidate);
-    const rawGravityError = Math.abs(gravMag - 9.80665);
-    const gyroAverage = calGyroSum / windowFrames;
-    const motion = gyroAverage > 0.08 || calGyroMax > 0.25 || calMaxStep > 0.65;
-    const stable = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motion;
-
-    if (stable) {
-      this.gravityEstimate = candidate;
-      return true;
-    }
-    return false;
   }
 
   ingest(frame: SensorFrame): EstimatorFrame {
@@ -252,15 +236,34 @@ export class SpeedEstimator {
     const rawAcceleration = frame.acceleration;
     const accStep = this.computeAccStep(rawAcceleration);
 
+    // Initial calibration duration is measured from the first real sensor sample.
+    // This keeps calibrationCount at one and also handles a delayed first callback.
+    if (!this.initialCalibrationDone && !this.parkingCalibrationPending && this.calibrationSamples === 0) {
+      this.calibrationUntilMs = frame.timestampMs + 1500;
+      this.lastCalibrationMs = frame.timestampMs;
+    }
+
     const preCalGyro = frame.gyroscope ? magnitude(frame.gyroscope) : 0;
     if (this.preCalBuffer.length >= 180) {
       this.preCalBuffer.shift();
     }
-    this.preCalBuffer.push({ acceleration: rawAcceleration, gyroMagnitude: preCalGyro, velocityMps: this.velocityMps });
+    const preCalFrame: PreCalFrame = {
+      timestampMs: frame.timestampMs,
+      acceleration: rawAcceleration,
+      gyroMagnitude: preCalGyro,
+      accStep,
+      deltaSeconds: dt,
+      distanceBeforeM: this.distanceM,
+      integrated: false
+    };
+    this.preCalBuffer.push(preCalFrame);
+    if (this.parkingCalibrationPending) {
+      this.parkingPostRequestFrames.push(preCalFrame);
+    }
 
     if (frame.timestampMs <= this.calibrationUntilMs) {
       const calibrationGyroMagnitude = frame.gyroscope ? magnitude(frame.gyroscope) : 0;
-      this.collectCalibration(rawAcceleration, calibrationGyroMagnitude);
+      this.collectCalibration(frame.timestampMs, rawAcceleration, calibrationGyroMagnitude);
       if (!this.parkingCalibrationPending) {
         return {
           sample: this.makeSample(frame.timestampMs, rawAcceleration, emptyVector(), MotionState.Calibrating, 0.35),
@@ -306,6 +309,7 @@ export class SpeedEstimator {
     this.maxSpeedKmh = Math.max(this.maxSpeedKmh, speedKmh);
     this.confidence = this.computeConfidence(state, gyroMagnitude, frame.timestampMs);
     this.motionState = state;
+    preCalFrame.integrated = true;
 
     const sample = this.makeSample(frame.timestampMs, rawAcceleration, filtered, state, this.confidence);
 
@@ -325,12 +329,18 @@ export class SpeedEstimator {
     this.calibrationMaxStep = 0;
     this.calibrationLastAcceleration = undefined;
     this.calibrationSamples = 0;
+    this.calibrationFirstSampleMs = 0;
+    this.calibrationLastSampleMs = 0;
     this.calibrationCount += 1;
     this.lastCalibrationMs = timestampMs;
     this.motionState = MotionState.Calibrating;
   }
 
-  private collectCalibration(acceleration: Vector3, gyroMagnitude: number): void {
+  private collectCalibration(timestampMs: number, acceleration: Vector3, gyroMagnitude: number): void {
+    if (this.calibrationSamples === 0) {
+      this.calibrationFirstSampleMs = timestampMs;
+    }
+    this.calibrationLastSampleMs = timestampMs;
     if (this.calibrationLastAcceleration) {
       this.calibrationMaxStep = Math.max(this.calibrationMaxStep, magnitude(subtract(acceleration, this.calibrationLastAcceleration)));
     }
@@ -343,20 +353,41 @@ export class SpeedEstimator {
   }
 
   private finishCalibrationIfNeeded(timestampMs: number): void {
-    if (this.calibrationSamples > 0 && timestampMs > this.calibrationUntilMs) {
+    if ((this.parkingCalibrationPending || this.calibrationSamples > 0) && timestampMs > this.calibrationUntilMs) {
+      const wasParkingCalibration = this.parkingCalibrationPending;
       let stableResult = false;
       let gravityCandidate: Vector3 = emptyVector();
-      let parkingWindowEndVelocityMps: number = 0;
+      let parkingWindowStart = -1;
+      let parkingWindowEnd = -1;
 
-      if (this.parkingCalibrationPending && this.preCalBuffer.length >= 75) {
+      const parkingFrames = wasParkingCalibration
+        ? this.parkingCalibrationSnapshot.concat(this.parkingPostRequestFrames)
+        : this.preCalBuffer;
+      const historicalFrameCount = wasParkingCalibration
+        ? this.parkingCalibrationSnapshot.length
+        : Math.max(0, this.preCalBuffer.length - 1);
+      let eligibleParkingFrameCount = 0;
+      for (let n = 0; n < historicalFrameCount; n++) {
+        if (parkingFrames[n].timestampMs <= this.parkingCalibrationRequestMs) {
+          eligibleParkingFrameCount = n + 1;
+        } else {
+          break;
+        }
+      }
+      if (wasParkingCalibration && eligibleParkingFrameCount >= 75) {
         const windowFrames = 75;
-        let bestStart = 0;
+        let bestStart = -1;
         let bestRms = Infinity;
-        for (let i = 0; i <= this.preCalBuffer.length - windowFrames; i++) {
+        for (let i = 0; i <= eligibleParkingFrameCount - windowFrames; i++) {
+          const windowEndTimestampMs = parkingFrames[i + windowFrames - 1].timestampMs;
+          const windowAgeMs = this.parkingCalibrationRequestMs - windowEndTimestampMs;
+          if (windowAgeMs < 0 || windowAgeMs > 300) {
+            continue;
+          }
           let sum = emptyVector();
           let sqSum = 0;
           for (let j = i; j < i + windowFrames; j++) {
-            const f = this.preCalBuffer[j];
+            const f = parkingFrames[j];
             sum = add(sum, f.acceleration);
             sqSum += dot(f.acceleration, f.acceleration);
           }
@@ -370,62 +401,79 @@ export class SpeedEstimator {
           }
         }
 
-        let calSum = emptyVector();
-        let calSqSum = 0;
-        let calGyroSum = 0;
-        let calGyroMax = 0;
-        let calMaxStep = 0;
-        let lastAcc: Vector3 | undefined = undefined;
-        for (let j = bestStart; j < bestStart + windowFrames; j++) {
-          const f = this.preCalBuffer[j];
-          calSum = add(calSum, f.acceleration);
-          calSqSum += dot(f.acceleration, f.acceleration);
-          calGyroSum += f.gyroMagnitude;
-          calGyroMax = Math.max(calGyroMax, f.gyroMagnitude);
-          if (lastAcc) {
-            calMaxStep = Math.max(calMaxStep, magnitude(subtract(f.acceleration, lastAcc)));
+        if (bestStart >= 0) {
+          let calSum = emptyVector();
+          let calSqSum = 0;
+          let calGyroSum = 0;
+          let calGyroMax = 0;
+          let calMaxStep = 0;
+          let lastAcc: Vector3 | undefined = undefined;
+          for (let j = bestStart; j < bestStart + windowFrames; j++) {
+            const f = parkingFrames[j];
+            calSum = add(calSum, f.acceleration);
+            calSqSum += dot(f.acceleration, f.acceleration);
+            calGyroSum += f.gyroMagnitude;
+            calGyroMax = Math.max(calGyroMax, f.gyroMagnitude);
+            if (lastAcc) {
+              calMaxStep = Math.max(calMaxStep, magnitude(subtract(f.acceleration, lastAcc)));
+            }
+            lastAcc = f.acceleration;
           }
-          lastAcc = f.acceleration;
-        }
 
-        gravityCandidate = scale(calSum, 1 / windowFrames);
-        const meanSquare = calSqSum / windowFrames;
-        const gravitySquare = dot(gravityCandidate, gravityCandidate);
-        const rmsDeviation = Math.sqrt(Math.max(0, meanSquare - gravitySquare));
-        const gravityMagnitude = magnitude(gravityCandidate);
-        const rawGravityError = Math.abs(gravityMagnitude - 9.80665);
-        const gyroAverage = calGyroSum / windowFrames;
-        const motionDuringCalibration = gyroAverage > 0.08 || calGyroMax > 0.25 || calMaxStep > 0.65;
-        stableResult = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motionDuringCalibration;
-        parkingWindowEndVelocityMps = this.preCalBuffer[bestStart + windowFrames - 1].velocityMps;
-      } else {
-        gravityCandidate = scale(this.calibrationSum, 1 / this.calibrationSamples);
-        const meanSquare = this.calibrationSquareSum / this.calibrationSamples;
-        const gravitySquare = dot(gravityCandidate, gravityCandidate);
-        const rmsDeviation = Math.sqrt(Math.max(0, meanSquare - gravitySquare));
-        const gravityMagnitude = magnitude(gravityCandidate);
-        const rawGravityError = Math.abs(gravityMagnitude - 9.80665);
-        const gyroAverage = this.calibrationGyroSum / this.calibrationSamples;
-        const motionDuringCalibration = gyroAverage > 0.08 || this.calibrationGyroMax > 0.25 || this.calibrationMaxStep > 0.65;
-        stableResult = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motionDuringCalibration;
+          gravityCandidate = scale(calSum, 1 / windowFrames);
+          const meanSquare = calSqSum / windowFrames;
+          const gravitySquare = dot(gravityCandidate, gravityCandidate);
+          const rmsDeviation = Math.sqrt(Math.max(0, meanSquare - gravitySquare));
+          const gravityMagnitude = magnitude(gravityCandidate);
+          const rawGravityError = Math.abs(gravityMagnitude - 9.80665);
+          const gyroAverage = calGyroSum / windowFrames;
+          const motionDuringCalibration = gyroAverage > 0.08 || calGyroMax > 0.25 || calMaxStep > 0.65;
+          stableResult = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motionDuringCalibration;
+          parkingWindowStart = bestStart;
+          parkingWindowEnd = bestStart + windowFrames - 1;
+        }
+      } else if (!wasParkingCalibration) {
+        const sampleCoverageMs = this.calibrationLastSampleMs - this.calibrationFirstSampleMs;
+        const hasEnoughSamples = this.calibrationSamples >= 30 && sampleCoverageMs >= 1000;
+        if (hasEnoughSamples) {
+          gravityCandidate = scale(this.calibrationSum, 1 / this.calibrationSamples);
+          const meanSquare = this.calibrationSquareSum / this.calibrationSamples;
+          const gravitySquare = dot(gravityCandidate, gravityCandidate);
+          const rmsDeviation = Math.sqrt(Math.max(0, meanSquare - gravitySquare));
+          const gravityMagnitude = magnitude(gravityCandidate);
+          const rawGravityError = Math.abs(gravityMagnitude - 9.80665);
+          const gyroAverage = this.calibrationGyroSum / this.calibrationSamples;
+          const motionDuringCalibration = gyroAverage > 0.08 || this.calibrationGyroMax > 0.25 || this.calibrationMaxStep > 0.65;
+          stableResult = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motionDuringCalibration;
+        }
       }
 
       if (stableResult) {
         this.gravityEstimate = gravityCandidate;
         this.calibrationRejectedUntilMs = 0;
-        if (this.parkingCalibrationPending) {
-          this.applyParkingZero(timestampMs, parkingWindowEndVelocityMps);
+        if (wasParkingCalibration) {
+          this.lastCalibrationMs = this.parkingCalibrationRequestMs;
+          this.applyParkingReplay(parkingFrames, parkingWindowStart, parkingWindowEnd);
           this.parkingCalibrationSuccessUntilMs = timestampMs + 5000;
+          this.parkingCalibrationResult = 1;
+        } else {
+          this.filteredAcceleration = emptyVector();
         }
       } else {
         this.calibrationRejectedUntilMs = timestampMs + 10000;
-        if (this.parkingCalibrationPending) {
+        if (wasParkingCalibration) {
           this.parkingCalibrationRejectedUntilMs = timestampMs + 5000;
+          this.parkingCalibrationResult = -1;
+        } else {
+          this.filteredAcceleration = emptyVector();
         }
       }
       this.parkingCalibrationPending = false;
+      this.parkingCalibrationRequestMs = 0;
+      this.parkingCalibrationPreviousMs = 0;
+      this.parkingCalibrationSnapshot = [];
+      this.parkingPostRequestFrames = [];
       this.initialCalibrationDone = true;
-      this.filteredAcceleration = emptyVector();
       this.calibrationSamples = 0;
       this.calibrationSum = emptyVector();
       this.calibrationSquareSum = 0;
@@ -433,6 +481,8 @@ export class SpeedEstimator {
       this.calibrationGyroMax = 0;
       this.calibrationMaxStep = 0;
       this.calibrationLastAcceleration = undefined;
+      this.calibrationFirstSampleMs = 0;
+      this.calibrationLastSampleMs = 0;
     }
   }
 
@@ -658,17 +708,99 @@ export class SpeedEstimator {
     return forward;
   }
 
-  private applyParkingZero(timestampMs: number, offsetVelocityMps: number): void {
-    this.velocityMps = Math.max(0, this.velocityMps - offsetVelocityMps);
-    this.lastTimestampMs = timestampMs;
+  private applyParkingReplay(frames: PreCalFrame[], windowStart: number, windowEnd: number): void {
+    const anchorDistanceM = frames[windowStart].distanceBeforeM;
+    this.velocityMps = 0;
+    this.distanceM = anchorDistanceM;
     this.filteredAcceleration = emptyVector();
     this.windowFrames = [];
-    this.mainAxisInitialized = false;
-    this.mainAxisLocked = false;
-    this.mainAxisSeedMagnitude = 0;
-    this.mainAxisUpdateCount = 0;
-    this.mainAxisLastUpdateMs = 0;
-    this.lastRawAcceleration = undefined;
+    this.motionState = MotionState.Idle;
+
+    // Keep the learned vehicle axis. Only make it tangent to the newly calibrated
+    // gravity vector; clearing the axis here would discard an immediate departure.
+    if (this.mainAxisInitialized) {
+      this.orthogonalizeAxis();
+    }
+
+    // Warm the low-pass filter and short motion window from the stationary anchor.
+    // The anchor itself is known to be at zero speed and therefore is not integrated.
+    for (let i = windowStart; i <= windowEnd; i++) {
+      const frame = frames[i];
+      frame.distanceBeforeM = anchorDistanceM;
+      const motionAcceleration = subtract(frame.acceleration, this.gravityEstimate);
+      const clipped = clipMagnitude(motionAcceleration, 3.5);
+      const filtered = this.lowPass(clipped, 0.22);
+      this.filteredAcceleration = filtered;
+      const forward = dot(filtered, this.mainAxis);
+      const lateralVector = subtract(filtered, scale(this.mainAxis, forward));
+      this.pushWindowFrame(
+        frame.timestampMs,
+        forward,
+        magnitude(lateralVector),
+        frame.gyroMagnitude,
+        frame.accStep,
+        Math.abs(magnitude(frame.acceleration) - 9.80665)
+      );
+    }
+
+    let positiveAccelerationFrames = 0;
+    let departureDetected = false;
+    // The final buffer element is the current, not-yet-integrated sensor frame.
+    // Leave it to the normal ingest path so every frame contributes exactly once.
+    const replayFrameLimit = Math.max(windowEnd + 1, frames.length - 1);
+    for (let j = windowEnd + 1; j < replayFrameLimit; j++) {
+      const frame = frames[j];
+      frame.distanceBeforeM = this.distanceM;
+      const motionAcceleration = subtract(frame.acceleration, this.gravityEstimate);
+      const clipped = clipMagnitude(motionAcceleration, 3.5);
+      const filtered = this.lowPass(clipped, 0.22);
+      this.filteredAcceleration = filtered;
+      const forward = dot(filtered, this.mainAxis);
+      const lateralVector = subtract(filtered, scale(this.mainAxis, forward));
+      const lateral = magnitude(lateralVector);
+      this.pushWindowFrame(
+        frame.timestampMs,
+        forward,
+        lateral,
+        frame.gyroMagnitude,
+        frame.accStep,
+        Math.abs(magnitude(frame.acceleration) - 9.80665)
+      );
+      const state = this.detectMotionState(forward, lateral, frame.gyroMagnitude, frame.timestampMs);
+      this.motionState = state;
+
+      if (!frame.integrated) {
+        continue;
+      }
+
+      const effectiveAcceleration = this.effectiveForwardAcceleration(forward, state);
+      const previousVelocityMps = this.velocityMps;
+      this.velocityMps = Math.max(0, this.velocityMps + effectiveAcceleration * frame.deltaSeconds);
+      this.distanceM += ((previousVelocityMps + this.velocityMps) / 2) * frame.deltaSeconds;
+
+      if (forward > 0.055 && frame.gyroMagnitude < 0.25) {
+        positiveAccelerationFrames += 1;
+      } else {
+        positiveAccelerationFrames = 0;
+      }
+      if (positiveAccelerationFrames >= 3) {
+        departureDetected = true;
+      }
+    }
+
+    // Non-negative live integration rectifies stationary noise into a small positive
+    // drift. A replay with no sustained departure evidence is the calibrated stop.
+    if (!departureDetected) {
+      this.velocityMps = 0;
+      this.distanceM = anchorDistanceM;
+      this.motionState = MotionState.Idle;
+      for (let k = windowEnd + 1; k < replayFrameLimit; k++) {
+        frames[k].distanceBeforeM = anchorDistanceM;
+      }
+    }
+    if (frames.length > 0) {
+      frames[frames.length - 1].distanceBeforeM = this.distanceM;
+    }
   }
 
   private computeConfidence(state: MotionState, gyroMagnitude: number, timestampMs: number): number {
@@ -761,7 +893,7 @@ export class SpeedEstimator {
       return '校准中，请保持设备静止';
     }
     if (timestampMs < this.parkingCalibrationSuccessUntilMs) {
-      return '停车校准成功，速度已归零';
+      return '停车校准成功，速度已校正';
     }
     if (timestampMs < this.parkingCalibrationRejectedUntilMs) {
       return '未停稳，未归零';

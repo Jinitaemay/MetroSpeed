@@ -103,32 +103,48 @@ def main() -> int:
     print("-" * (45 + 13 * len(config_labels)))
 
     results = {}
+    successful_runs = 0
+    metric_runs = 0
+    failed_runs = 0
+    missing_metric_runs = 0
 
     for filepath in files:
+        result_key = str(filepath.resolve())
         if not filepath.exists():
             print(f"{filepath.name[:43]:<45}  FILE NOT FOUND")
+            failed_runs += 1
             continue
 
         print(f"{filepath.name[:43]:<45}", end="", flush=True)
 
-        results[filepath.name] = {}
+        results[result_key] = {}
 
         for label, extra_args in CONFIGS:
             is_anchor = "anchor" in label
             d, err = run_replay(filepath, extra_args)
             if d is None:
                 print(f" {'ERR':>12}", end="", flush=True)
-                results[filepath.name][label] = None
+                results[result_key][label] = None
+                failed_runs += 1
                 continue
 
             metrics = extract_metrics(d, is_anchor)
+            if metrics["samples"] <= 0:
+                print(f" {'EMPTY':>12}", end="", flush=True)
+                results[result_key][label] = None
+                failed_runs += 1
+                continue
             mae = metrics["moving_mae"]
             if mae is not None:
+                successful_runs += 1
+                metric_runs += 1
                 print(f" {mae:>11.2f}", end="", flush=True)
             else:
                 print(f" {'N/A':>12}", end="", flush=True)
+                failed_runs += 1
+                missing_metric_runs += 1
 
-            results[filepath.name][label] = metrics
+            results[result_key][label] = metrics
 
         print()
 
@@ -140,22 +156,30 @@ def main() -> int:
     print(f"{'文件':<45} {'模式':<15} {'MAE':>8} {'count':>6} {'max':>6} {'samples':>8}")
     print("-" * 90)
 
-    for fname in [f.name for f in files]:
-        if fname not in results:
+    for filepath in files:
+        result_key = str(filepath.resolve())
+        fname = filepath.name
+        if result_key not in results:
             continue
         first = True
         for label, _ in CONFIGS:
-            m = results[fname].get(label)
+            m = results[result_key].get(label)
             if m is None:
                 continue
+            mae = m["moving_mae"]
+            mae_text = f"{mae:.2f}" if mae is not None else "N/A"
             if first:
-                print(f"{fname[:43]:<45} {label:<15} {m['moving_mae']:>8.2f} {m['moving_count']:>6} {m['max_kmh']:>6.0f} {m['samples']:>8}")
+                print(f"{fname[:43]:<45} {label:<15} {mae_text:>8} {m['moving_count']:>6} {m['max_kmh']:>6.0f} {m['samples']:>8}")
                 first = False
             else:
-                print(f"{'':<45} {label:<15} {m['moving_mae']:>8.2f} {m['moving_count']:>6}")
+                print(f"{'':<45} {label:<15} {mae_text:>8} {m['moving_count']:>6}")
         print()
 
-    return 0
+    print(
+        f"summary: success={successful_runs} failed={failed_runs} "
+        f"with_moving_mae={metric_runs} missing_moving_mae={missing_metric_runs}"
+    )
+    return 0 if successful_runs > 0 and metric_runs > 0 and failed_runs == 0 else 1
 
 
 if __name__ == "__main__":

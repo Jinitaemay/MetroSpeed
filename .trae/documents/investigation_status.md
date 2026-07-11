@@ -1,8 +1,8 @@
 # MetroSpeed 项目工作记忆
 
-> **记忆版本**：v42
-> **最后更新**：2026-07-08
-> **对应阶段**：v1.1.1 发布 — 移除 adaptive-gravity、移除入隧重力刷新、手持阈值止血、算法版本 anchor-delta-20260707-r2
+> **记忆版本**：v43
+> **最后更新**：2026-07-10
+> **对应阶段**：全量可靠性修复 — 停车后段重放、后台连续采集、回放/工具一致性、签名配置隔离；算法版本 anchor-delta-20260710-r3
 
 ---
 
@@ -11,12 +11,12 @@
 **项目名称**：MetroSpeed · 地铁测速
 **平台**：鸿蒙 HarmonyOS (ArkTS)
 **项目路径**：`<项目根目录>`
-**算法版本**：`adaptive-gravity-20260705-v1`
-**当前阶段**：v1.0.0 已上架 AppGallery，v1.1.0 手持检测/置信度重写已构建签名，adaptive-gravity 双端落地 + 停车校准修复已完成
+**算法版本**：`anchor-delta-20260710-r3`
+**当前阶段**：v1.1.2 发布候选；停车校准、后台连续采集、研究日志完整性、双端回放和工程工具可靠性修复已完成
 **许可证**：MIT
 **包名**：`com.codex.metrospeed`
 **应用名称**：地铁测速
-**版本号**：versionName = "1.1.0"，versionCode = Unix 时间戳（自动生成）
+**版本号**：versionName = "1.1.2"，versionCode = Unix 时间戳（自动生成）
 **SDK版本**：compatibleSdkVersion/targetSdkVersion = 5.0.0(12)（保持 API12，不升级 API20）
 
 ---
@@ -44,7 +44,7 @@
 
 ### 关键特性
 1. **隧道模式**：用户手动拨动开关切换，入隧时冻结 GNSS 锚点，防止系统推算污染速度。已移除 `refreshGravityAtEntrance()` 调用（行驶中 preCalBuffer 无静止段，会把加速度当重力）
-2. **自适应停车校准**：停车时点击校准按钮，自动扫描 preCalBuffer（180 帧环形缓冲区，约 3.6 秒）内最优 75 帧（1.5 秒）静止段，速度补偿 + 重力重估
+2. **自适应停车校准**：只扫描按钮前 preCalBuffer（180 帧）内最优 75 帧静止段，重估重力后从零速锚重放后续帧；静止严格归零，按钮后立即起步仍保留增量
 3. **GNSS -40ms 固定延迟补偿**：所有记录一致显示 locationTimeMs 比传感器时间晚约 40ms，ArkTS 端在锚点采集时用速度历史缓冲区查找 40ms 前的惯性速度，Python 端通过 `--gnss-lag-ms=-40` 补偿
 4. **研究记录模式**：全量 50Hz 传感器数据 + GNSS 数据 JSONL 格式记录，支持导出离线分析
    - **Schema v13**：sensor记录新增4个辅助传感器共17个字段，全部用于数据采集验证，**暂未接入算法**
@@ -70,53 +70,31 @@
 - 启动后状态文字显示所有可用传感器列表
 - DevEco已自动配置debug签名，直接点击运行即可自动签名安装到手机
 
-### refreshGravityAtEntrance() — 已停用
-**状态**：方法保留但入隧时不再调用（07-07 移除）。
+### refreshGravityAtEntrance() — 已删除
+**状态**：调用和 ArkTS/Python 死方法均已删除；入隧只冻结 GNSS 锚点。
 **停用原因**：行驶中 preCalBuffer（3.6s）无静止段，扫描出的"最优窗口"会把行驶加速度当重力。驾车浦东大道实测 gY 从 4.29→3.73，10 分钟飙至 991 km/h。
-
-**执行流程**：
-1. 从 `preCalBuffer`（180帧环形缓冲区 ≈ 3.6秒）中扫描
-2. 找出 rmsDeviation 最低的 75 帧（1.5秒）滑动窗口
-3. 五道传感器稳定性检查：
-   - 陀螺仪均值 < 0.08 rad/s
-   - 陀螺仪最大值 < 0.25 rad/s
-   - 加速度跳动 < 0.65 m/s²
-   - rmsDeviation < 0.25 m/s²
-   - 重力模长误差 < 0.25 m/s²
-4. 通过检查 → 更新 `gravityEstimate`
-5. 失败 → 返回 false，什么都不改
 
 ### 停车校准（calibrateAtStop）完整逻辑
 **触发方式**：用户点击"停车校准"按钮 → 调用 `SpeedEstimator.calibrateAtStop()`
 
 **详细步骤**：
-1. 标记待校准状态：`parkingCalibrationPending = true`，同时启动一段 1.5 秒的普通校准（作为兜底）
-2. 持续记录原始数据：preCalBuffer（180 帧环形缓冲区，约 3.6 秒）一直在记录
-3. 1.5 秒后判定（finishCalibrationIfNeeded）：
-   - 如果 parkingCalibrationPending 且缓冲区够 75 帧：
-     - 扫描最优窗口：在 preCalBuffer 里滑动 75 帧窗口，找 rmsDeviation 最低的那一段
-     - 五道稳定性检查（陀螺仪均值/最大值、加速度跳动、rmsDeviation、重力模长误差）
-     - 通过检查 → 更新 gravityEstimate + 调用 applyParkingZero()
-     - 没通过 → 校准拒绝，10 秒内不再自动校准
-   - 否则（普通模式）：用校准期间采集的 1.5 秒数据算平均重力
-
-**applyParkingZero() 做了什么**：
-1. 速度补偿：velocityMps = max(0, velocityMps - parkingWindowEndVelocityMps)，用校准窗口末端速度作偏移量归零
-2. 清空滤波状态：filteredAcceleration 重置
-3. 清空窗口帧：windowFrames = []
-4. 重置主轴：mainAxisInitialized = false，主轴重新学习
-5. 重置原始加速度：lastRawAcceleration = undefined
+1. 标记 `parkingCalibrationPending` 并记录按钮时间；重复点击幂等，不重启窗口或增加计数
+2. 约 1.5 秒后只在按钮时间之前的缓冲帧中扫描最优 75 帧静止窗；短历史直接拒绝，不再用“当前时点强制归零”兜底
+3. 通过陀螺仪均值/最大值、加速度跳动、rmsDeviation、重力模长五道检查后更新 `gravityEstimate`
+4. 把静止窗作为零速锚，清空并预热低通/判态短窗，再以新重力逐帧重放静止窗之后的数据；保留主轴初始化、锁定和计数状态
+5. 若没有持续起步证据则速度严格置 0；若按钮后已起步则保留重放得到的真实增量
+6. 一次性结果 `consumeParkingCalibrationResult()` 返回 1/−1/0；应用只在结果为 1 时重置 GNSS/惯性锚点，并分别记录请求、成功、拒绝事件
 
 **初始校准保护**（07-06 新增）：
-- 初始校准完成前（preCalBuffer 不足 75 帧），`calibrateAtStop()` 直接返回 false，ArkTS 端显示"请等待初始校准完成"状态文本
-- `initialCalibrationDone` 标志位在第一次停车校准成功（applyParkingZero）后置 true，之后正常接受停车校准
+- 初始校准完成前，`calibrateAtStop()` 直接返回“请等待初始校准完成”
+- 初始 1.5 秒从首个真实传感器样本开始计时，至少需要 30 帧且覆盖 1000ms；迟到首帧不会永远 pending，也不会把 calibrationCount 增为 2
 
 **和普通校准的区别**：
 | 方面 | 普通校准 | 停车校准 |
 |------|---------|---------|
 | 数据来源 | 校准开始后的 1.5 秒 | 历史缓冲区里最优的 75 帧 |
-| 速度补偿 | ❌ 不补偿 | ✅ 补偿 |
-| 重置主轴 | ❌ 不重置 | ✅ 重置 |
+| 速度处理 | 从零开始积分 | 静止窗归零并用新重力重放后段 |
+| 主轴处理 | 初始学习 | 保留既有主轴并按新重力正交化 |
 | 适用场景 | 启动时第一次校准 | 停车后主动校准，消除漂移 |
 
 ### 实时数据面板
@@ -132,7 +110,7 @@
 ```
 MetroSpeed/
 ├── AppScope/
-│   └── app.json5                    # 应用配置（versionName: 1.1.0, versionCode: 时间戳）
+│   └── app.json5                    # 应用配置（versionName: 1.1.2, versionCode: 时间戳）
 ├── entry/
 │   └── src/main/ets/
 │       ├── entryability/EntryAbility.ets
@@ -141,7 +119,7 @@ MetroSpeed/
 │           ├── SpeedEstimator.ets       # 惯性速度估算核心（仅用原始加速度+陀螺）
 │           ├── SensorController.ets     # 50Hz 加速度计+陀螺仪+4个辅助传感器
 │           ├── LocationController.ets   # GNSS 定位 + 卫星状态
-│           ├── ResearchRecorder.ets     # JSONL 全量记录（schema v13）
+│           ├── ResearchRecorder.ets     # JSONL 全量记录（schema v14）
 │           ├── BackgroundState.ets      # 后台记录状态共享
 │           └── SpeedTypes.ets           # 类型定义、向量运算、四元数
 ├── tools/
@@ -149,7 +127,7 @@ MetroSpeed/
 │   ├── _baseline_all.py                # 全量基线对比 (--dir --anchor-v2) — 临时诊断脚本
 │   ├── _tunnel_diag.py                 # 隧道分段MAE + 纯速度曲线 — 临时诊断脚本
 │   ├── _bias_diag.py                   # cal_0积分不对称 + 重力/主轴追踪 — 临时诊断脚本
-│   ├── param_sensitivity.py            # 83参数 ±50% 敏感度扫描 — 通用工具
+│   ├── param_sensitivity.py            # 78参数敏感度扫描（默认 ±20%）— 通用工具
 │   ├── sync_version.py                 # 版本号 ArkTS ↔ Python 同步 — 通用工具
 │   ├── trim_cal_segment.py             # 裁剪校准段 — 通用工具
 │   ├── _scan_anchor_interval.py        # 锚点间隔多进程并行扫描 — 诊断工具
@@ -253,24 +231,30 @@ MetroSpeed/
     - **设计演进**：逐帧切换不可行——磁力计 std 在地铁运行中频繁波动（175 次切换），任何切到驾车的帧都会让系统重力吃掉加速度，积分特性导致速度塌掉无法恢复。一次判定避开了所有逐帧切换问题
     - **市内驾车记录（07-03）数据缺失**：magX/sysGravityX 仅 0.0% 非空（15/109064 帧），原因是 c7ab07f 引入的辅助传感器丢失 bug，已修复，待重新采集验证
 15. **手持设备检测系统**（07-05 完成）：
-    - **方案**：40 帧滑窗（~0.8s）计算陀螺仪 RMS + 三轴 zeroCrossingRate。gyroRms > 0.3 + ZCR > 5/s + 40 帧（~0.8s）持续确认 → 触发手持
+    - **方案**：40 帧滑窗（~0.8s）计算陀螺仪 RMS + 三轴 zeroCrossingRate。当前止血阈值 gyroRms > 0.5 + ZCR > 5/s + 40 帧（~0.8s）持续确认 → 触发手持
     - **与车辆运动区分原理**：车辆急弯 RMS 可达 0.4 但零交叉率 ≈0.5/s（单方向转弯），手持零交叉率 37+ /s（手频繁换向）。路面颠簸 RMS 短暂升高但 ZCR 不高 + 0.8s 持续判决过滤
     - **验证**：14 条记录（地铁×7、驾车×3、公交×3、磁浮×1）零误触发。唯一触发是真手持（公交记录中靠在车窗上触发）
     - **UI**：SpeedPanel + StatsGrid 红色不透明（#DC2626）覆盖，三行引导文案："请将设备稳定放置，停车时重新开始测速，设备移动会中止测速"
     - **行为**：触发后调用 `stopMeasurement()` 终止测速，传感器状态由研究记录传感器自然覆盖，永不自恢复。开始测速时重置所有手持检测缓冲区
-16. **置信度公式重写**（07-05）：基线 1.0、倍率衰减模型：时间衰减×状态倍率（弯道×3/加速×2/振动×4/传导振动×1.5）+ 陀螺噪声项。pureMode 双速率（锚点 3min 触底 / 纯惯性 2min 触底）。停车校准不动置信度。22.9万帧 14 条记录标定验证单调性成立（10%→56.7 vs 90%→9.2 km/h P90）。双端同步
+16. **置信度公式重写**（07-05）：基线 1.0、倍率衰减模型：时间衰减×状态倍率（弯道×3/加速×2/振动×4/传导振动×1.5）+ 陀螺噪声项。pureMode 双速率（锚点 3min 触底 / 纯惯性 2min 触底）。停车校准请求/拒绝不刷新成功校准时龄，只有确认成功才重置衰减基准。22.9万帧 14 条记录标定验证单调性成立（10%→56.7 vs 90%→9.2 km/h P90）。双端同步
 17. **传感器状态汇总**：`startAuxiliarySensors()` 由仅列出辅助传感器改为列出全部可用传感器（加速度计、陀螺仪、重力、线性加速度、旋转向量、磁力计），避免覆盖测速启动时显示的核心传感器信息
 18. **停止测速后记录传感器不重启 bug**：`sensorController.stop()` 关闭全部传感器后 `researchSensorActive` 未重置，导致 `startResearchSensors()` 的 `if (researchSensorActive) return` 短路。修复：`stopMeasurement()` 中加 `this.researchSensorActive = false`
 19. **adaptive-gravity ArkTS 双端落地→已移除**（07-06）：磁力计场景检测器从 Python 分析层落地 ArkTS SpeedEstimator——前 500 帧滑动 std 中位数判定场景，驾车启用系统重力 (useSysGravity=true)，地铁用自估重力。后经 4 条新记录验证被移除：公交浦东100路 medianStd=0.19→错判驾车→系统重力吃加速→速度崩坏（MAE 1.73→6.92↓300%）；驾车苏沪新记录 medianStd=2.82→错判地铁→漏掉增益。且系统重力在新版偏置已修复的驾车记录上增益微弱（0.72→0.66）
 20. **初始校准期间禁止停车校准**（07-06）：新增 `initialCalibrationDone` 标志位——初始校准（beginCalibration→preCalBuffer 75 帧完成）之前 caribrateAtStop 被拒止（ArkTS 返回"请等待初始校准完成"状态文本，Python 返回 False）。根因：初始校准期间点停车校准会覆盖 `calibrationUntilMs`，而 preCalBuffer 不足 75 帧导致后续所有校准失败
 21. **手持检测 RMS+ZCR 算法失效**（07-06 确认）：公交浦东100路硬质表面上 10 次 stop 中大部分由手持误触发。根因：底盘高频振动在三个轴上同时过零——所有记录 ZCR P50=20-35，ZCR>5 阈值形同虚设；gyro RMS 均值法用 8s 窗仍压不掉公交底盘的 gyro_mean_mag（P99=0.109 vs 车窗 P99=0.054，区间重叠）。真手持数据缺乏。v1.1.1 将 GYRO_RMS 临时上调至 0.5（max_streak=36<40）。
-22. **版本号纪律**（07-06 沉淀）：只有 SpeedEstimator 内部逻辑变更才改 ALGORITHM_VERSION。v1.1.1 仅改 UX 层（手持阈值、移除 adaptive-gravity），ALGORITHM_VERSION 保持 anchor-delta-20260626-r1
+22. **版本号纪律**（07-06 沉淀）：只有 SpeedEstimator 内部逻辑变更才改 ALGORITHM_VERSION；`sync_version.py` 同时检查 ArkTS、Python 和 README，并在写入前完成输入与四份 staged 文本验证
 23. **入隧重力刷新必须移除**（07-07 确认）：`refreshGravityAtEntrance` 用 3.6s 滑动窗口从行驶数据中扫"最像静止的 1.5s"，任意时刻调用都会把行驶加速度当重力。驾车浦东大道记录 gY 从 4.29→3.73 导致 10 分钟飙到 991 km/h。地铁同理——入隧时车在高速行驶，buffer 里没有静止段。入隧只需冻结 GNSS 锚点
 24. **手持停止需标记来源**（07-07）：`stopMeasurement` 增加 `reason` 参数，JSONL 中区分 `handheld` vs `manual` 停止
+25. **测速与研究记录均需后台连续采集**（07-10）：`BackgroundState` 分离 `measurementActive` / `recordingActive`，任一活动存在时 `EntryAbility` 启动 LOCATION 长时任务，不再暂停普通测速传感器。增加操作代次校验，权限请求返回后只继续当前有效会话；长时任务启动结果使用前后台 generation 校验，避免回前台后异步启动滞留；停止失败有界重试。长时任务启动失败时暂停传感器，回前台恢复。同步补齐 `SensorController.stop()` 遗漏的磁力计退订。此项不改 SpeedEstimator 算法，ALGORITHM_VERSION 不变
+26. **停车校准未保证归零/立即起步丢失**（07-10 修复）：旧实现仅做“当前速度−历史窗末速度”，没有用新重力重算后段，静止可从 1.47km/h 变成 1.73km/h；成功后还清空主轴。现改为按钮前静止窗零速锚 + 新重力后段重放，且请求不再重置积分时间基准。点击时冻结按钮前证据，避免 100Hz 回调在 1.5s 等待期挤掉 75 帧窗口；候选窗末帧必须在点击前 300ms 内，避免复用过旧静止段；拒绝不刷新成功校准时龄。确定性验证 50/100Hz 停稳严格归零、按钮后立即起步保留正速度、拒绝轨迹零扰动
+27. **应用生命周期与研究数据保全**（07-10）：GNSS 锚只在停车成功结果后归零；GNSS 速度精度缺失/非正数明确回退纯惯性；页面 emitter 在销毁时注销；后台采集状态变化会即时收口/重启长时任务。研究日志维持单份覆盖语义，开始新记录时清理旧会话并截断固定本地文件；导出与新记录互斥，成功复制后才删除捕获的本地源文件；写入失败会同步停止后台记录状态。异常中断、缺少 `stop_record` 或尾部不可读时保留完整性 sidecar，界面告警并以 `INCOMPLETE` 文件名导出
+28. **离线回放/工具链漂移**（07-10）：修复停车 event 零锚不可达、GNSS 可靠性 gate、pureMode 双速率、重复“测速已在运行”误重置、runId/measurementActive 缺失边界、appParity 漏检锚点参数、reset 丢参数、坏 JSONL/同路径覆盖/非原子输出/空锚点。回放保留 JSONL 追加顺序，不再按可回拨墙钟全局重排；锚点按位置回调顺序激活，只读取回调前最近 5 帧的 -40ms 样本；GNSS 对比按 `measurementRunId` 隔离，禁止跨测速段插值。基线无有效 GNSS 指标、无成功样本或任一失败现返回非零，参数扫描与当前 CLI 参数自动验真，多个诊断脚本直接崩溃和旧字段已修
+29. **记录口径升级 schema v14**（07-10）：旧 schema v13 的 `estimatedSpeedKmh` 实为 GNSS 锚定后的界面显示速度，曾被离线工具误作纯惯性回归基准。v14 显式记录 `pureInertialSpeedKmh` / `displaySpeedKmh`，传感器行补齐 session/run/version 元数据并逐实际回调落盘；估算器回归按相邻 `recordSeq` 精确配对，不再跨缺失帧插值。旧 v13 只报告纯惯性比对不可用，不再产生伪差值
+30. **工程安全**（07-10）：`build-profile.json5` 已从 Git 索引移除并由 `.gitignore` 排除，本地文件保留；`sync_version.py` 使用进程锁、compare-and-swap、原换行保留与失败回滚防并发半写，并默认拒绝版本降级；`sign_app.ps1` 默认官方 `-pwdInputMode 1` 交互密码并阻止输出覆盖/路径别名。历史中的旧配置是否清理、签名材料是否轮换需按远端暴露情况单独决策
 
 ### 技术要点
 - **时间源**：`computeDeltaSeconds` 优先 sensorTimestamp，其余用 Date.now()（墙上时间语义），双轨正确
-- **双端一致**：~60 个常量一致，`ALGORITHM_VERSION` 由 `sync_version.py --check` 验证。分析层可自由扩展
+- **双端一致**：估算器配置与逐帧逻辑一致，`ALGORITHM_VERSION` 由 `sync_version.py --check` 在 ArkTS、Python、README 三处验证。分析层可自由扩展
 - **LocationSourceType**：1=GNSS, 4=RTK，`tunnelState !== 'inside'` 是防系统推算冒充的唯一防护
 - **传感器类功能开发流程**：必须遵循"先在研究记录中加字段采集数据→观察实际数据表现→再决定是否接入算法"，禁止在没有数据支撑的情况下直接修改算法
 - **UI兼容性**：API12下Button组件自定义borderRadius不生效，使用系统默认胶囊形，不要手动设置圆角数值，升级API版本后需要重新验证所有组件样式
@@ -280,13 +264,13 @@ MetroSpeed/
 
 ## 七、签名与上架
 
-**签名文件**（`signing/` 目录，不提交 git）：`release.p12`（EC 256 位密钥库）、`release.cer`（发布证书）、`releaseRelease.p7b`（Profile）。密码从环境变量 `METROSPEED_KEYSTORE_PASSWORD` 读取，密钥库密码和密钥密码相同。
+**签名文件**（`signing/` 目录，不提交 git）：`release.p12`（EC 256 位密钥库）、`release.cer`（发布证书）、`releaseRelease.p7b`（Profile）。`sign_app.ps1` 默认使用官方交互密码模式；仅显式 `-NonInteractivePassword` 时读取 `METROSPEED_KEYSTORE_PASSWORD`，且受 hap-sign-tool 接口限制会出现在 Java 进程参数中。
 
 **debug 签名**：DevEco Studio 自动配置，直接点运行即可。`build-profile.json5` 已移出版本控制，仓库只保留 `build-profile.template.json5` 模板。首次 clone 后需复制模板再让 DevEco 填充签名。
 
 **构建与签名命令**见 `project_rules.md` 2.2 节。release 签名的包不能 hdc install 直接安装，只能通过应用市场分发。
 
-**当前状态**：AppGallery 1.0.0 已上架（2026-06-29）；1.1.0 release 包已构建签名完成，待上架。
+**当前状态**：AppGallery v1.1.1 已发布；v1.1.2 可靠性修复候选正在完成发布构建、正式签名与真机回归。
 
 ---
 
@@ -331,6 +315,8 @@ MetroSpeed/
 | 07-07 | 惠南东-新场速度跳变调查 | 手机 v1.1.0（adaptive-gravity）记录出现 13→71、27→90→0 等速度跳变。经回放验证：当前 v1.1.1 revert 后完全无法复现——确认是 adaptive-gravity 在低置信度 + 系统重力下的产物，已随 revert 消除 |
 | 07-07 | 公交 71 路区间 / 地铁大连路-世纪大道 记录 | 公交 71 路纯惯性 MAE 8.89→锚点 3.83，手机侧躺轮壳重力正常；地铁全地下无 GNSS，积分 3.15km/4 站，6 次手动校准正常 |
 | 07-08 | 发布 1.1.1 最终包 | 签名、同步 README 应用介绍、commit 规范写入项目规则、移除过时计划文档 |
+| 07-10 | 全量可靠性修复 | 停车校准改为按钮前近期静止窗 + 新重力后段重放；初始样本保护；测速/研究后台连续采集；GNSS 仅成功归零且无有效精度时回退；研究日志 schema v14/单文件覆盖与完整性标记；回放按 run 和真实回调时序隔离；诊断工具、版本同步和签名脚本系统性修复；本地 build-profile 正式解除 Git 跟踪 |
+| 07-11 | v1.1.2 发布候选 | versionName 切换至 1.1.2；算法版本 `anchor-delta-20260710-r3`；开始发布构建、正式签名与真机验收 |
 ---
 
 ## 十、当前任务状态
@@ -348,7 +334,7 @@ MetroSpeed/
    - 当前 RMS+ZCR 方案在有振动传导的硬质表面上无法区分底盘振动 vs 手持摇晃
    - 下一步：需采集真手持记录 → 分析可行指标（加速度姿态变化、ROTATION_VECTOR 角速度等）
 3. 🟢 多语言支持（英文）
-4. 🟢 后台长时记录稳定性测试（需补充 lifecycle background/foreground 事件记录）
+4. 🟢 后台长时采集真机稳定性测试（代码已支持测速/研究记录，仍需补充 lifecycle background/foreground 事件记录并验证系统限电策略）
 5. 🟢 历史记录管理界面
 
 ---
@@ -362,7 +348,7 @@ MetroSpeed/
 
 **功能澄清**：
 4. **隧道模式手动切换**，不是自动检测。拒绝 GNSS 锚点是刻意设计（复刻鸿蒙系统隧道定位行为）。
-5. **refreshGravityAtEntrance() 只刷新重力估计**，不重置速度/主轴/锚点。
+5. **refreshGravityAtEntrance() 已删除**；入隧只冻结 GNSS 锚点，不在行驶中刷新重力。
 6. **4 个辅助传感器只做数据采集**，SpeedEstimator.ets 一行都不要改。
 
 **技术坑**：

@@ -42,6 +42,7 @@ function emptyResearchStatus(): ResearchRecorderStatus {
     sessionId: '',
     sampleCount: 0,
     hasExportableLog: false,
+    integrityWarning: false,
     lastEvent: '',
     lastExportPath: ''
   };
@@ -67,18 +68,30 @@ struct Index {
   @State private gnssSpeedKmh: number = 0;
   @State private isHandheld: boolean = false;
   @State private speedStatsHeight: number = 0;
+  @State private researchExportInProgress: boolean = false;
   private wasMeasuringBeforeBackground: boolean = false;
+  private backgroundSensorsPaused: boolean = false;
   private backgroundHandlerRegistered: boolean = false;
+  private measurementOperationId: number = 0;
+  private researchOperationId: number = 0;
   private tunnelState: 'unknown' | 'outside' | 'inside' = 'unknown';
   private feedbackUntilMs: number = 0;
   private lastAnchorGnssMps: number = 0;
   private lastAnchorInertialMps: number = 0;
   private hasGnssAnchor: boolean = false;
-  private gnssSpeedAccuracyMps: number = 0;
+  private gnssSpeedAccuracyMps: number = -1;
   private measurementLocationActive: boolean = false;
   private inertialSpeedHistory: SpeedHistoryEntry[] = [];
   private readonly INERTIAL_HISTORY_SIZE: number = 5;
   private readonly GNSS_LAG_MS: number = 40;
+  private readonly backgroundEventHandler: (data: emitter.EventData) => void = (data: emitter.EventData): void => {
+    const actionData: Record<string, string> = data.data as Record<string, string>;
+    if (actionData && actionData.action === 'stopSensors') {
+      this.onBgStopSensors();
+    } else if (actionData && actionData.action === 'restoreSensors') {
+      this.onBgRestoreSensors();
+    }
+  };
 
   private gyroBuf: GyroSample[] = [];
   private readonly GYRO_WINDOW: number = 40;
@@ -88,22 +101,57 @@ struct Index {
   private handheldSuspectStreak: number = 0;
 
   private onBgStopSensors(): void {
+    if (this.backgroundSensorsPaused) {
+      return;
+    }
+    this.backgroundSensorsPaused = true;
+    this.measurementOperationId += 1;
+    this.researchOperationId += 1;
     this.wasMeasuringBeforeBackground = this.isRunning;
+    if (this.researchStatus.running) {
+      this.researchStatus = this.researchRecorder.markSystemEvent(
+        Date.now(),
+        '后台采集暂停',
+        'LOCATION long task unavailable'
+      );
+      this.researchStatus = this.researchRecorder.flush();
+      this.syncResearchRuntimeState();
+    }
     this.sensorController.stop();
     this.locationController.stop();
+    this.researchSensorActive = false;
+    this.measurementLocationActive = false;
   }
 
   private onBgRestoreSensors(): void {
+    if (!this.backgroundSensorsPaused) {
+      return;
+    }
+    this.backgroundSensorsPaused = false;
     if (this.wasMeasuringBeforeBackground && this.isRunning) {
-      this.sensorController.start((frame: SensorFrame) => {
+      const restored = this.sensorController.start((frame: SensorFrame) => {
         this.onSensorFrame(frame);
       }, (message: string) => {
         this.sensorStatus = message;
       });
-      if (this.researchSensorActive) {
-        this.sensorController.startAuxiliarySensors();
+      if (!restored) {
+        this.stopMeasurement('background_restore_failed');
       }
-      this.startLocationForAll();
+    }
+    if (this.researchStatus.running) {
+      this.ensureResearchSensorsOrStop();
+    }
+    if ((this.isRunning || this.researchStatus.running) && !this.locationController.isRunning) {
+      this.startLocationForAll(this.researchStatus.running && !this.isRunning);
+    }
+    this.measurementLocationActive = this.isRunning && this.locationController.isRunning;
+    if (this.researchStatus.running) {
+      this.researchStatus = this.researchRecorder.markSystemEvent(
+        Date.now(),
+        '后台采集恢复',
+        'foreground sensor restore'
+      );
+      this.syncResearchRuntimeState();
     }
     this.wasMeasuringBeforeBackground = false;
   }
@@ -111,14 +159,7 @@ struct Index {
   aboutToAppear(): void {
     if (!this.backgroundHandlerRegistered) {
       this.backgroundHandlerRegistered = true;
-      emitter.on({ eventId: 100 }, (data: emitter.EventData) => {
-        const actionData: Record<string, string> = data.data as Record<string, string>;
-        if (actionData && actionData.action === 'stopSensors') {
-          this.onBgStopSensors();
-        } else if (actionData && actionData.action === 'restoreSensors') {
-          this.onBgRestoreSensors();
-        }
-      });
+      emitter.on({ eventId: 100 }, this.backgroundEventHandler);
     }
     const context = this.getAbilityContext();
     if (context) {
@@ -127,9 +168,34 @@ struct Index {
   }
 
   aboutToDisappear(): void {
-    this.researchStatus = this.researchRecorder.flush();
+    this.measurementOperationId += 1;
+    this.researchOperationId += 1;
+    BackgroundState.measurementActive = false;
+    BackgroundState.recordingActive = false;
+    this.notifyCollectionStateChanged();
+    const now = Date.now();
+    if (this.isRunning && this.researchStatus.running) {
+      this.researchStatus = this.researchRecorder.endMeasurement(now, 'reason=page_disappear');
+    }
+    if (this.isRunning) {
+      this.stats = this.estimator.stop(now);
+      this.isRunning = false;
+    }
+    this.researchStatus = this.researchStatus.running
+      ? this.researchRecorder.stop(now)
+      : this.researchRecorder.flush();
     this.sensorController.stop();
     this.locationController.stop();
+    if (this.backgroundHandlerRegistered) {
+      emitter.off(100, this.backgroundEventHandler);
+      this.backgroundHandlerRegistered = false;
+    }
+  }
+
+  private notifyCollectionStateChanged(): void {
+    emitter.emit({ eventId: 100 }, {
+      data: { action: 'collectionStateChanged' }
+    });
   }
 
   private async startMeasurement(): Promise<void> {
@@ -137,15 +203,18 @@ struct Index {
       return;
     }
 
+    const operationId = ++this.measurementOperationId;
     const now = Date.now();
     this.stats = this.estimator.start(now);
     this.isRunning = true;
     this.hasGnssAnchor = false;
+    this.inertialSpeedHistory = [];
     this.isHandheld = false;
     this.gyroBuf = [];
     this.handheldSuspectStreak = 0;
     this.sensorStatus = '正在启动传感器';
     this.researchStatus = this.researchRecorder.beginMeasurement(now, 'measurement started');
+    this.syncResearchRuntimeState();
     this.researchSensorActive = false;
     const sensorsStarted = this.sensorController.start((frame: SensorFrame) => {
       this.onSensorFrame(frame);
@@ -154,31 +223,39 @@ struct Index {
     });
     if (!sensorsStarted) {
       this.isRunning = false;
+      BackgroundState.measurementActive = false;
+      this.notifyCollectionStateChanged();
       this.sensorStatus = '传感器未启动';
       this.stats = this.estimator.reset(now);
       this.researchStatus = this.researchRecorder.cancelMeasurement(now, 'sensor start failed');
+      this.syncResearchRuntimeState();
       if (this.researchStatus.running) {
-        this.startResearchSensors();
+        this.ensureResearchSensorsOrStop();
       }
       return;
     }
+    BackgroundState.measurementActive = true;
+    this.notifyCollectionStateChanged();
     if (this.researchStatus.running) {
-      this.startResearchSensors();
+      this.ensureResearchSensorsOrStop();
     }
     await this.requestLocationPermission();
+    if (operationId !== this.measurementOperationId || !this.isRunning) {
+      return;
+    }
     this.startLocationForMeasurement();
   }
 
   private startLocationForMeasurement(): void {
-    if (this.measurementLocationActive) {
+    if (this.measurementLocationActive || this.locationController.isRunning) {
+      this.measurementLocationActive = true;
       return;
     }
-    this.measurementLocationActive = true;
-    this.startLocationForAll();
+    this.measurementLocationActive = this.startLocationForAll();
   }
 
-  private startLocationForAll(forRecording?: boolean): void {
-    this.locationController.start(
+  private startLocationForAll(forRecording?: boolean): boolean {
+    return this.locationController.start(
       (location: LocationSnapshot) => {
         if (this.researchStatus.running) {
           this.researchRecorder.updateLocation(location);
@@ -187,7 +264,8 @@ struct Index {
         this.updateLocationStatus(`定位 ${location.accuracy.toFixed(0)}m ${location.speedMps.toFixed(1)}m/s${satelliteText}`);
         this.researchStatus = this.researchRecorder.status();
         this.gnssSpeedKmh = Math.max(0, location.speedMps * 3.6);
-        this.gnssSpeedAccuracyMps = location.speedAccuracyMps ?? 0;
+        this.gnssSpeedAccuracyMps = location.speedAccuracyMps ?? -1;
+        this.syncResearchRuntimeState();
 
         if (this.isRunning) {
           const speedAcc = location.speedAccuracyMps;
@@ -196,7 +274,7 @@ struct Index {
           const inVibration = state === MotionState.StrongVibration || state === MotionState.ConductionVibration;
           if (speedAcc !== null && speedAcc > 0 && src !== null && (src === 1 || src === 4) && this.tunnelState !== 'inside' && !inVibration) {
             this.lastAnchorGnssMps = location.speedMps;
-            this.lastAnchorInertialMps = this.getInertialSpeedAtLag(this.GNSS_LAG_MS);
+            this.lastAnchorInertialMps = this.getInertialSpeedAtLag(this.GNSS_LAG_MS, location.timestampMs);
             this.hasGnssAnchor = true;
           }
         }
@@ -206,6 +284,7 @@ struct Index {
           this.researchRecorder.updateSatellite(satellite);
         }
         this.researchStatus = this.researchRecorder.status();
+        this.syncResearchRuntimeState();
       },
       (message: string) => {
         this.locationStatus = message;
@@ -228,19 +307,24 @@ struct Index {
       return;
     }
 
+    this.measurementOperationId += 1;
+    BackgroundState.measurementActive = false;
+    this.notifyCollectionStateChanged();
     const now = Date.now();
     this.sensorController.stop();
     this.sensorStatus = '传感器已停止';
     this.researchStatus = this.researchRecorder.endMeasurement(now,
       `reason=${reason} speed=${this.stats.currentSpeedKmh.toFixed(2)}km/h`);
+    this.syncResearchRuntimeState();
     this.stats = this.estimator.stop(now);
     this.isRunning = false;
     this.hasGnssAnchor = false;
+    this.inertialSpeedHistory = [];
     this.isHandheld = false;
     this.researchSensorActive = false;
     this.stopLocationIfUnused();
     if (this.researchStatus.running) {
-      this.startResearchSensors();
+      this.ensureResearchSensorsOrStop();
     }
   }
 
@@ -263,17 +347,14 @@ struct Index {
     const confidenceBeforeCalibration = this.stats.confidence;
     const stateBeforeCalibration = motionStateText(this.stats.motionState);
     this.stats = this.estimator.calibrateAtStop(now);
-    this.lastAnchorGnssMps = 0;
-    this.lastAnchorInertialMps = 0;
-    this.hasGnssAnchor = true;
-    this.gnssSpeedKmh = 0;
     if (this.researchStatus.running) {
       this.researchStatus = this.researchRecorder.markEvent(
         now,
-        '停车校准',
+        '停车校准请求',
         `beforeSpeed=${speedBeforeCalibration.toFixed(2)}km/h confidence=${confidenceBeforeCalibration.toFixed(2)} state=${stateBeforeCalibration}`
       );
     }
+    this.syncResearchRuntimeState();
   }
 
   private onSensorFrame(frame: SensorFrame): void {
@@ -285,21 +366,21 @@ struct Index {
       return;
     }
 
-    if (frame.gyroscope) {
-      this.gyroBuf.push({ gx: frame.gyroscope.x, gy: frame.gyroscope.y, gz: frame.gyroscope.z, ts: frame.timestampMs });
-      while (this.gyroBuf.length > this.GYRO_WINDOW * 2) {
-        this.gyroBuf.shift();
-      }
-      this.checkHandheld();
-      if (this.isHandheld) {
-        return;
-      }
+    const parkingCalibrationResult = this.estimator.consumeParkingCalibrationResult();
+    if (parkingCalibrationResult > 0) {
+      this.lastAnchorGnssMps = 0;
+      this.lastAnchorInertialMps = 0;
+      this.hasGnssAnchor = true;
+      this.gnssSpeedKmh = 0;
+      this.inertialSpeedHistory = [];
     }
 
     this.stats = nextFrame.stats;
     this.pureInertialSpeedKmh = this.stats.currentSpeedKmh;
 
-    const pure = (!this.hasGnssAnchor || this.gnssSpeedKmh < this.gnssSpeedAccuracyMps * 3.6) ? 1 : 0;
+    const gnssReliable = this.gnssSpeedAccuracyMps > 0 &&
+      this.gnssSpeedKmh >= this.gnssSpeedAccuracyMps * 3.6;
+    const pure = (!this.hasGnssAnchor || !gnssReliable) ? 1 : 0;
     this.estimator.setPureMode(pure);
 
     if (this.hasGnssAnchor) {
@@ -307,7 +388,7 @@ struct Index {
       const currentInertial = this.estimator.getVelocityMps();
       const delta = currentInertial - this.lastAnchorInertialMps;
       const anchorSpeedKmh = Math.max(0, (this.lastAnchorGnssMps + delta) * 3.6);
-      if (this.gnssSpeedKmh < this.gnssSpeedAccuracyMps * 3.6) {
+      if (!gnssReliable) {
         this.stats.currentSpeedKmh = pureSpeedKmh;
       } else {
         this.stats.currentSpeedKmh = anchorSpeedKmh;
@@ -315,17 +396,38 @@ struct Index {
     }
     this.researchRecorder.updateEstimator(nextFrame.sample, nextFrame.stats, nextFrame.calibration);
     this.researchStatus = this.researchRecorder.status();
+    if (parkingCalibrationResult > 0 && this.researchStatus.running) {
+      this.researchStatus = this.researchRecorder.markEvent(
+        frame.timestampMs,
+        '停车校准成功',
+        `speed=${this.stats.currentSpeedKmh.toFixed(2)}km/h`
+      );
+    } else if (parkingCalibrationResult < 0 && this.researchStatus.running) {
+      this.researchStatus = this.researchRecorder.markEvent(
+        frame.timestampMs,
+        '停车校准拒绝',
+        `speed=${this.stats.currentSpeedKmh.toFixed(2)}km/h`
+      );
+    }
+    this.syncResearchRuntimeState();
 
-    const now = Date.now();
     const currentInertialSpeed = this.estimator.getVelocityMps();
-    this.inertialSpeedHistory.push({ t: now, v: currentInertialSpeed });
+    this.inertialSpeedHistory.push({ t: frame.timestampMs, v: currentInertialSpeed });
     while (this.inertialSpeedHistory.length > this.INERTIAL_HISTORY_SIZE) {
       this.inertialSpeedHistory.shift();
     }
+
+    if (frame.gyroscope) {
+      this.gyroBuf.push({ gx: frame.gyroscope.x, gy: frame.gyroscope.y, gz: frame.gyroscope.z, ts: frame.timestampMs });
+      while (this.gyroBuf.length > this.GYRO_WINDOW * 2) {
+        this.gyroBuf.shift();
+      }
+      this.checkHandheld();
+    }
   }
 
-  private getInertialSpeedAtLag(delayMs: number): number {
-    const target = Date.now() - delayMs;
+  private getInertialSpeedAtLag(delayMs: number, referenceTimestampMs: number): number {
+    const target = referenceTimestampMs - delayMs;
     let best = this.estimator.getVelocityMps();
     let bestDiff = Infinity;
     for (const entry of this.inertialSpeedHistory) {
@@ -392,6 +494,9 @@ struct Index {
   }
 
   private abortStartCalibration(): void {
+    this.measurementOperationId += 1;
+    BackgroundState.measurementActive = false;
+    this.notifyCollectionStateChanged();
     const now = Date.now();
     this.sensorController.stop();
     this.researchSensorActive = false;
@@ -411,12 +516,15 @@ struct Index {
     this.isHandheld = false;
     this.sensorStatus = '开始失败：初始校准不稳';
     this.researchStatus = this.researchRecorder.cancelMeasurement(now, resetStats.statusText);
+    this.syncResearchRuntimeState();
+    this.stopLocationIfUnused();
     if (this.researchStatus.running) {
-      this.startResearchSensors();
+      this.ensureResearchSensorsOrStop();
     }
   }
 
   private async toggleResearchRecording(): Promise<void> {
+    const operationId = ++this.researchOperationId;
     const now = Date.now();
     if (this.researchStatus.running) {
       this.stopResearchSensorsIfIdle();
@@ -426,6 +534,7 @@ struct Index {
       this.researchStatus = this.researchRecorder.stop(now);
       this.stopLocationIfUnused();
       BackgroundState.recordingActive = false;
+      this.notifyCollectionStateChanged();
       return;
     }
 
@@ -436,20 +545,43 @@ struct Index {
     }
 
     this.researchStatus = this.researchRecorder.start(now, context);
+    if (!this.researchStatus.running) {
+      BackgroundState.recordingActive = false;
+      this.notifyCollectionStateChanged();
+      return;
+    }
+    BackgroundState.recordingActive = true;
+    this.notifyCollectionStateChanged();
+    if (!this.ensureResearchSensorsOrStop()) {
+      return;
+    }
     if (this.isRunning) {
       this.researchStatus = this.researchRecorder.noteMeasurementAlreadyActive(
         now,
         `recording started while measurement active; elapsed=${this.stats.elapsedMs}ms`
       );
+      this.syncResearchRuntimeState();
+      if (!this.researchStatus.running) {
+        return;
+      }
     }
     this.feedbackUntilMs = 0;
     const permissionGranted = await this.requestLocationPermission();
+    if (operationId !== this.researchOperationId || !this.researchStatus.running) {
+      return;
+    }
     this.researchStatus = this.researchRecorder.markSystemEvent(
       Date.now(),
       permissionGranted ? '定位权限可用' : '定位权限不可用',
       this.locationStatus
     );
-    this.startLocationForAll(true);
+    this.syncResearchRuntimeState();
+    if (!this.researchStatus.running) {
+      return;
+    }
+    if (!this.locationController.isRunning) {
+      this.startLocationForAll(true);
+    }
     const locationStarted = this.locationController.isRunning;
 
     if (!locationStarted) {
@@ -458,20 +590,19 @@ struct Index {
     } else {
       this.researchStatus = this.researchRecorder.markSystemEvent(Date.now(), '定位启动成功', this.locationStatus);
     }
+    this.syncResearchRuntimeState();
 
-    BackgroundState.recordingActive = true;
-    this.startResearchSensors();
   }
 
-  private startResearchSensors(): void {
+  private startResearchSensors(): boolean {
     if (this.researchSensorActive) {
-      return;
+      return true;
     }
 
     if (this.isRunning) {
       this.sensorController.startAuxiliarySensors();
       this.researchSensorActive = true;
-      return;
+      return true;
     }
 
     this.researchRecorder.clearEstimatorSnapshot();
@@ -487,6 +618,19 @@ struct Index {
     if (!started) {
       this.sensorStatus = '研究记录传感器未启动';
     }
+    return started;
+  }
+
+  private ensureResearchSensorsOrStop(): boolean {
+    if (!this.researchStatus.running || this.startResearchSensors()) {
+      return true;
+    }
+    this.researchStatus = this.researchRecorder.stop(Date.now());
+    BackgroundState.recordingActive = false;
+    this.notifyCollectionStateChanged();
+    this.researchSensorActive = false;
+    this.stopLocationIfUnused();
+    return false;
   }
 
   private stopResearchSensorsIfIdle(): void {
@@ -507,6 +651,21 @@ struct Index {
   private onResearchSensorFrame(frame: SensorFrame): void {
     this.researchRecorder.recordSensorFrame(frame);
     this.researchStatus = this.researchRecorder.status();
+    this.syncResearchRuntimeState();
+  }
+
+  private syncResearchRuntimeState(): void {
+    if (this.researchStatus.running || !BackgroundState.recordingActive) {
+      return;
+    }
+    if (this.researchStatus.integrityWarning) {
+      this.sensorStatus = '研究日志写入失败，记录已停止';
+      this.locationStatus = this.researchStatus.lastExportPath || '日志可能不完整';
+    }
+    BackgroundState.recordingActive = false;
+    this.notifyCollectionStateChanged();
+    this.stopResearchSensorsIfIdle();
+    this.stopLocationIfUnused();
   }
 
   private getAbilityContext(): common.UIAbilityContext | undefined {
@@ -546,6 +705,7 @@ struct Index {
 
   private markResearchEventWithNotes(event: string, notes: string): void {
     this.researchStatus = this.researchRecorder.markEvent(Date.now(), event, notes);
+    this.syncResearchRuntimeState();
     this.flashMarkedEvent(event);
     this.locationStatus = `已标记：${event}`;
   }
@@ -586,17 +746,24 @@ struct Index {
   }
 
   private async exportResearchLog(): Promise<void> {
+    if (this.researchExportInProgress) {
+      return;
+    }
     const context = this.getAbilityContext();
     if (!context) {
       this.locationStatus = '无法获取应用上下文';
       return;
     }
 
+    this.researchExportInProgress = true;
     try {
       this.locationStatus = '请选择导出位置';
       this.researchStatus = await this.researchRecorder.exportJsonl(context);
+      this.locationStatus = this.researchStatus.lastExportPath || '导出完成';
     } catch (error) {
       this.locationStatus = '导出失败';
+    } finally {
+      this.researchExportInProgress = false;
     }
   }
 
@@ -901,6 +1068,7 @@ struct Index {
           .height(40)
           .width(0)
           .layoutWeight(1)
+          .enabled(!this.researchExportInProgress)
           .backgroundColor(this.researchStatus.running ? '#EF4444' : '#4FD1C5')
           .borderRadius(8)
           .onClick(() => {
@@ -908,20 +1076,28 @@ struct Index {
           });
 
         Button() {
-          Text('导出')
+          Text(this.researchExportInProgress ? '导出中' : '导出')
             .fontSize(14)
-            .fontColor(this.hasResearchLog() ? '#0B1020' : '#94A3B8')
+            .fontColor(this.hasResearchLog() && !this.researchStatus.running && !this.researchExportInProgress ? '#0B1020' : '#94A3B8')
         }
           .height(40)
           .width(86)
-          .enabled(this.hasResearchLog())
-          .backgroundColor(this.hasResearchLog() ? '#F59E0B' : '#1E293B')
+          .enabled(this.hasResearchLog() && !this.researchStatus.running && !this.researchExportInProgress)
+          .backgroundColor(this.hasResearchLog() && !this.researchStatus.running && !this.researchExportInProgress ? '#F59E0B' : '#1E293B')
           .borderRadius(8)
           .onClick(() => {
             this.exportResearchLog();
           });
       }
       .width('100%');
+
+      if (this.researchStatus.integrityWarning) {
+        Text(this.researchStatus.lastExportPath || '日志可能不完整，导出时将标注 INCOMPLETE')
+          .fontSize(12)
+          .fontColor('#F87171')
+          .maxLines(2)
+          .width('100%');
+      }
 
       Row() {
         Column() {

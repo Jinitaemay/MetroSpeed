@@ -11,6 +11,12 @@ from pathlib import Path
 REPLAY = Path(__file__).resolve().parent / "replay_estimator.py"
 
 files = [a for a in sys.argv[1:] if not a.startswith("--")]
+if not files:
+    print("Usage: python tools/_speed_profile.py <file1.jsonl> [file2.jsonl ...]", file=sys.stderr)
+    raise SystemExit(1)
+
+success_count = 0
+failure_count = 0
 
 for fname in files:
     path = Path(fname)
@@ -22,12 +28,23 @@ for fname in files:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"ERROR {path.name}: {result.stderr.strip()[:200]}")
+        failure_count += 1
         continue
-    d = json.loads(result.stdout)
+    try:
+        d = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        print(f"ERROR {path.name}: invalid replay JSON: {error}")
+        failure_count += 1
+        continue
 
     spd = d.get("speed", {})
     conf = d.get("confidence", {})
     samples = d.get("sensorSamples", 0)
+    if not isinstance(samples, int) or samples <= 0:
+        print(f"ERROR {path.name}: replay produced no sensor samples")
+        failure_count += 1
+        continue
+    success_count += 1
     events = d.get("events", [])
 
     print(f"\n=== {path.name} ===")
@@ -51,7 +68,7 @@ for fname in files:
         print(f"    {e['event']}@{ts} cal#{cal_count} g={g_str}")
 
     # Key events
-    key_events = [e for e in events if e.get("event") in ("stop", "tunnel_gravity_refresh")]
+    key_events = [e for e in events if e.get("event") in ("stop", "tunnel_enter", "tunnel_exit")]
     if key_events:
         print(f"  key events ({len(key_events)}):")
         for e in key_events[:10]:
@@ -59,3 +76,6 @@ for fname in files:
             ev = e.get("event")
             v = e.get("speedKmh", "")
             print(f"    {ev}@{ts} v={v}")
+
+if success_count == 0 or failure_count > 0:
+    raise SystemExit(1)

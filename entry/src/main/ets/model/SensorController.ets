@@ -63,6 +63,7 @@ export class SensorController {
     const accelerationStarted = this.subscribeAcceleration();
     if (!accelerationStarted) {
       this.stop();
+      return false;
     }
 
     const availableSensors: string[] = ['加速度'];
@@ -70,7 +71,7 @@ export class SensorController {
     if (this.gravityAvailable) availableSensors.push('重力');
     this.emitStatus(`已启动传感器：${availableSensors.join('、')}，请求 ${HIGH_RATE_HZ}Hz`);
 
-    return accelerationStarted;
+    return true;
   }
 
   startAuxiliarySensors(): void {
@@ -119,6 +120,7 @@ export class SensorController {
     this.safeOffGravity();
     this.safeOffLinearAcceleration();
     this.safeOffRotationVector();
+    this.safeOffMagneticField();
 
     this.latestGyroscope = undefined;
     this.latestGyroscopeTimestamp = null;
@@ -132,6 +134,9 @@ export class SensorController {
     this.latestRotationVector = undefined;
     this.latestRotationVectorTimestamp = null;
     this.rotationVectorAvailable = false;
+    this.latestMagneticField = undefined;
+    this.latestMagneticFieldTimestamp = null;
+    this.magneticFieldAvailable = false;
   }
 
   private subscribeAcceleration(): boolean {

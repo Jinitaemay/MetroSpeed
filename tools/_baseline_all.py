@@ -89,10 +89,14 @@ if GLOBAL_LAG_MS is not None:
 if extra_args:
     print(f"extra: {' '.join(extra_args)}")
 
+success_count = 0
+failure_count = 0
+gnss_comparison_count = 0
 for fname in FILES:
     path = DATA_DIR / fname
     if not path.exists():
         print(f"SKIP {fname}: file not found")
+        failure_count += 1
         continue
     cmd = [sys.executable, str(REPLAY), str(path)]
     if ANCHOR_V2:
@@ -107,9 +111,22 @@ for fname in FILES:
     )
     if result.returncode != 0:
         print(f"ERROR {fname}: {result.stderr.strip()[:120]}")
+        failure_count += 1
         continue
-    d = json.loads(result.stdout)
-
+    try:
+        d = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        print(f"ERROR {fname}: invalid replay JSON: {error}")
+        failure_count += 1
+        continue
+    try:
+        sensor_samples = int(d.get("sensorSamples", 0))
+    except (TypeError, ValueError):
+        sensor_samples = 0
+    if sensor_samples <= 0:
+        print(f"ERROR {fname}: replay produced no sensor samples")
+        failure_count += 1
+        continue
     if ANCHOR_V2:
         comp = d.get("anchoredComparison", {})
         moving = comp.get("moving", {})
@@ -128,6 +145,18 @@ for fname in FILES:
         median_kmh = spd.get("medianKmh", 0)
 
     samples = d.get("sensorSamples", 0)
+    has_gnss_comparison = (
+        isinstance(pairs, (int, float))
+        and pairs > 0
+        and isinstance(all_comp.get("count"), (int, float))
+        and all_comp["count"] > 0
+    )
+    if has_gnss_comparison:
+        success_count += 1
+        gnss_comparison_count += 1
+    else:
+        print(f"ERROR {fname}: replay produced no GNSS comparison metrics")
+        failure_count += 1
     print(
         f"moving_mae={moving.get('maeKmh', 'N/A')} "
         f"moving_count={moving.get('count', 0)} "
@@ -139,3 +168,10 @@ for fname in FILES:
         f"median_kmh={median_kmh:.0f} "
         f"file={fname}"
     )
+
+print(
+    f"summary: success={success_count} failed_or_missing={failure_count} "
+    f"with_gnss_comparison={gnss_comparison_count}"
+)
+if success_count == 0 or failure_count > 0 or gnss_comparison_count != success_count:
+    raise SystemExit(1)

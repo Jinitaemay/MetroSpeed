@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """参数敏感度扫描 — subprocess 运行 replay_estimator.py 改 CLI 参数"""
-import argparse, json, subprocess, sys
+import argparse, inspect, json, subprocess, sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -24,7 +24,7 @@ SCANS: List[Dict[str, Any]] = [
     {"name": "dt_clamp_hi", "flag": "--dt-clamp-hi", "default": 0.08, "fmt": ".3f"},
     # calibration
     {"name": "calibration_duration_ms", "flag": "--calibration-duration-ms", "default": 1500, "fmt": ".0f"},
-    {"name": "calibration_rms_threshold", "flag": "--calibration-rms-threshold", "default": 0.12, "fmt": ".2f"},
+    {"name": "calibration_rms_threshold", "flag": "--calibration-rms-threshold", "default": 0.25, "fmt": ".2f"},
     {"name": "calibration_gravity_error", "flag": "--calibration-gravity-error", "default": 0.25, "fmt": ".2f"},
     {"name": "calibration_motion_gyro_mean", "flag": "--calibration-motion-gyro-mean", "default": 0.08, "fmt": ".2f"},
     {"name": "calibration_motion_gyro_max", "flag": "--calibration-motion-gyro-max", "default": 0.25, "fmt": ".2f"},
@@ -88,19 +88,38 @@ SCANS: List[Dict[str, Any]] = [
     {"name": "dead_zone", "flag": "--dead-zone", "default": 0.025, "fmt": ".3f"},
     {"name": "conduction_scale", "flag": "--conduction-scale", "default": 0.45, "fmt": ".2f"},
     # confidence
-    {"name": "confidence_base", "flag": "--confidence-base", "default": 0.86, "fmt": ".2f"},
-    {"name": "confidence_decay_divisor", "flag": "--confidence-decay-divisor", "default": 240000.0, "fmt": ".0f"},
-    {"name": "confidence_decay_max", "flag": "--confidence-decay-max", "default": 0.35, "fmt": ".2f"},
+    {"name": "confidence_base", "flag": "--confidence-base", "default": 1.0, "fmt": ".2f"},
+    {"name": "confidence_decay_rate", "flag": "--confidence-decay-rate", "default": (0.85 / 180000), "fmt": ".8f"},
     {"name": "confidence_gyro_divisor", "flag": "--confidence-gyro-divisor", "default": 3.0, "fmt": ".1f"},
     {"name": "confidence_gyro_max", "flag": "--confidence-gyro-max", "default": 0.2, "fmt": ".1f"},
-    {"name": "confidence_penalty_curve", "flag": "--confidence-penalty-curve", "default": 0.28, "fmt": ".2f"},
-    {"name": "confidence_penalty_low", "flag": "--confidence-penalty-low", "default": 0.35, "fmt": ".2f"},
-    {"name": "confidence_penalty_strong", "flag": "--confidence-penalty-strong", "default": 0.48, "fmt": ".2f"},
-    {"name": "confidence_penalty_conduction", "flag": "--confidence-penalty-conduction", "default": 0.20, "fmt": ".2f"},
-    {"name": "confidence_calibrating", "flag": "--confidence-calibrating", "default": 0.35, "fmt": ".2f"},
-    {"name": "confidence_clamp_lo", "flag": "--confidence-clamp-lo", "default": 0.08, "fmt": ".2f"},
-    {"name": "confidence_clamp_hi", "flag": "--confidence-clamp-hi", "default": 0.95, "fmt": ".2f"},
+    {"name": "confidence_clamp_lo", "flag": "--confidence-clamp-lo", "default": 0.05, "fmt": ".2f"},
+    {"name": "confidence_clamp_hi", "flag": "--confidence-clamp-hi", "default": 0.95, "fmt": ".2f", "max": 1.0},
 ]
+
+
+def validate_scan_schema() -> List[str]:
+    """Fail fast when the estimator constructor or replay CLI drifts from this table."""
+    from replay_estimator import SpeedEstimator
+
+    errors: List[str] = []
+    parameters = inspect.signature(SpeedEstimator.__init__).parameters
+    help_result = subprocess.run(
+        [sys.executable, str(REPLAY), "--help"],
+        capture_output=True, text=True, cwd=str(ROOT),
+    )
+    if help_result.returncode != 0:
+        return [f"failed to inspect replay CLI: {help_result.stderr.strip()[:200]}"]
+    for scan in SCANS:
+        parameter = parameters.get(scan["name"])
+        if parameter is None:
+            errors.append(f"constructor parameter missing: {scan['name']}")
+        elif parameter.default != scan["default"]:
+            errors.append(
+                f"default mismatch for {scan['name']}: scan={scan['default']} estimator={parameter.default}"
+            )
+        if scan["flag"] not in help_result.stdout:
+            errors.append(f"CLI flag missing: {scan['flag']}")
+    return errors
 
 
 def replay_one(jsonl: Path, flag: str, value_str: str, bucket: str = None) -> Dict[str, Any]:
@@ -134,6 +153,12 @@ def main() -> int:
     parser.add_argument("--param", type=str, default=None, help="Scan only one parameter")
     parser.add_argument("--bucket", type=str, default=None, help="Use calibrationDecay bucket instead of global MAE")
     args = parser.parse_args()
+
+    schema_errors = validate_scan_schema()
+    if schema_errors:
+        for error in schema_errors:
+            print(f"scan schema error: {error}", file=sys.stderr)
+        return 1
     pert = args.perturbation
     bucket = args.bucket
 
@@ -156,6 +181,7 @@ def main() -> int:
             return 1
 
     results: List[Dict[str, Any]] = []
+    failed_scans = 0
     for s in scans:
         name = s["name"]
         flag = s["flag"]
@@ -163,17 +189,23 @@ def main() -> int:
         fmt = s["fmt"]
         up_val = default * (1 + pert)
         dn_val = default * (1 - pert)
+        if "max" in s:
+            up_val = min(up_val, s["max"])
+        if "min" in s:
+            dn_val = max(dn_val, s["min"])
         try:
             up = replay_one(args.jsonl, flag, f"{up_val:{fmt}}", bucket)
             dn = replay_one(args.jsonl, flag, f"{dn_val:{fmt}}", bucket)
         except Exception as e:
             print(f"  SKIP {name}: {e}")
+            failed_scans += 1
             continue
 
         up_mae = up.get("mae")
         dn_mae = dn.get("mae")
         if up_mae is None or dn_mae is None:
             print(f"  SKIP {name}: mae missing up={up_mae} dn={dn_mae}")
+            failed_scans += 1
             continue
         up_d = up_mae - baseline["mae"]
         dn_d = dn_mae - baseline["mae"]
@@ -187,7 +219,7 @@ def main() -> int:
     results.sort(key=lambda r: r["impact"], reverse=True)
     if not results:
         print("no results")
-        return 0
+        return 1
 
     print(f"{'param':<38} {'default':>8} {'+':>8} {'-':>8} {'impact':>7}")
     print("-" * 72)
@@ -206,7 +238,7 @@ def main() -> int:
     else:
         print("\nno parameters exceeded impact 0.5 threshold")
 
-    return 0
+    return 1 if failed_scans > 0 else 0
 
 
 if __name__ == "__main__":

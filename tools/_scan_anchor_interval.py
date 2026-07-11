@@ -32,8 +32,8 @@ def resolve_files(data_dir: Path, files_arg: str | None) -> list[Path]:
 
 
 def run_one(args):
-    fname, interval, data_dir = args
-    path = data_dir / fname if not Path(fname).is_absolute() else Path(fname)
+    path_text, interval = args
+    path = Path(path_text)
     r = subprocess.run(
         [PYTHON, str(REPLAY), str(path),
          "--anchor-v2", "--pure-zero", "--gnss-lag-ms=-40",
@@ -41,11 +41,18 @@ def run_one(args):
         capture_output=True, text=True, cwd=CWD
     )
     if r.returncode != 0:
-        return (fname, interval, None)
-    d = json.loads(r.stdout)
-    mae = d["anchoredComparison"]["moving"]["maeKmh"]
-    pairs = d["anchoredComparison"]["pairedLocationRows"]
-    return (fname, interval, mae, pairs)
+        return (path_text, interval, None, 0)
+    try:
+        d = json.loads(r.stdout)
+        comparison = d.get("anchoredComparison", {})
+        moving = comparison.get("moving", {})
+        mae = moving.get("maeKmh")
+        pairs = comparison.get("pairedLocationRows", 0)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return (path_text, interval, None, 0)
+    if mae is None:
+        return (path_text, interval, None, pairs)
+    return (path_text, interval, mae, pairs)
 
 
 def main() -> int:
@@ -62,15 +69,13 @@ def main() -> int:
         print("请用 --dir <目录> 或设置环境变量 METROSPEED_DATA_DIR", file=sys.stderr)
         return 1
 
-    files = resolve_files(args.dir, args.files)
+    files = [path.resolve() for path in resolve_files(args.dir, args.files)]
     if not files:
         print(f"错误：目录 {args.dir} 下没有可处理的 jsonl 文件", file=sys.stderr)
         return 1
 
-    file_names = [f.name for f in files]
-
     workers = max(1, cpu_count() - 1)
-    tasks = [(name, interval, args.dir) for name in file_names for interval in INTERVALS]
+    tasks = [(str(path), interval) for path in files for interval in INTERVALS]
     total = len(tasks)
     print(f"Running {total} jobs on {workers} workers ...")
 
@@ -88,12 +93,16 @@ def main() -> int:
 
     print(f"\n{'file':<42} {'int_s':>5} {'mae':>8} {'pairs':>6}  ratio")
     print("-" * 72)
-    for fname in file_names:
+    had_errors = False
+    for path in files:
+        path_text = str(path)
+        fname = path.name
         base_mae = None
         for interval in INTERVALS:
-            r = results.get((fname, interval))
+            r = results.get((path_text, interval))
             if r is None or r[2] is None:
                 print(f"{fname[:40]:<42} {interval/1000:>4.0f}s  ERROR")
+                had_errors = True
                 continue
             mae = r[2]
             pairs = r[3]
@@ -107,7 +116,7 @@ def main() -> int:
             print(f"{fname[:40]:<42} {interval/1000:>4.0f}s  {mae:>8.2f} {pairs:>6}  {ratio}")
         print()
 
-    return 0
+    return 1 if had_errors else 0
 
 
 if __name__ == "__main__":

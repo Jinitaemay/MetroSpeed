@@ -5,7 +5,7 @@ from pathlib import Path
 from collections import deque
 
 GYRO_WINDOW = 40
-GYRO_RMS_THRESHOLD = 0.3
+GYRO_RMS_THRESHOLD = 0.5
 ZCR_THRESHOLD = 5.0
 ACTIVATE_FRAMES = 40
 

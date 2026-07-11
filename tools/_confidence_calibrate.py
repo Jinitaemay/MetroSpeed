@@ -1,5 +1,6 @@
 """Run confidence calibration across all old records (parallel)."""
 import json
+import os
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -73,7 +74,7 @@ def quantile(values: list[float], q: float) -> float:
     return s[min(len(s) - 1, int(len(s) * q))]
 
 
-def main():
+def main() -> int:
     data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(os.environ.get("METROSPEED_DATA_DIR", "."))
     files = sorted(data_dir.glob("*.jsonl"))
     files = [f for f in files if "_replay_" not in f.name]
@@ -95,6 +96,9 @@ def main():
     print()
     print(f"Total matched frames: {len(all_frames)}")
     print()
+    if not all_frames:
+        print("No frames could be paired with GNSS", file=sys.stderr)
+        return 1
 
     conf_buckets: dict[int, list[float]] = defaultdict(list)
     for conf, err, _, _ in all_frames:
@@ -120,7 +124,8 @@ def main():
     for state in sorted(state_errs.keys()):
         errs = state_errs[state]
         print(f"  {state:<22s}  n={len(errs):>6d}  mean={sum(errs)/len(errs):.2f}  p50={quantile(errs,0.5):.2f}  p90={quantile(errs,0.9):.2f} km/h")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -10,9 +10,25 @@ const BG_EVENT_ID = 100;
 
 export default class EntryAbility extends UIAbility {
   private isLongTaskRunning: boolean = false;
+  private isLongTaskStartPending: boolean = false;
+  private isLongTaskStopPending: boolean = false;
+  private longTaskStopRetryCount: number = 0;
+  private isInBackground: boolean = false;
+  private longTaskGeneration: number = 0;
+  private collectionHandlerRegistered: boolean = false;
+  private mainWindow?: window.Window;
+  private readonly collectionEventHandler: (data: emitter.EventData) => void = (data: emitter.EventData): void => {
+    const actionData: Record<string, string> = data.data as Record<string, string>;
+    if (actionData && actionData.action === 'collectionStateChanged') {
+      this.reconcileBackgroundCollectionState();
+      this.updateKeepScreenOn();
+    }
+  };
 
   onBackground(): void {
-    if (BackgroundState.recordingActive) {
+    this.isInBackground = true;
+    this.updateKeepScreenOn();
+    if (BackgroundState.isCollectionActive()) {
       this.startLongTask();
       return;
     }
@@ -22,21 +38,40 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
-    if (this.isLongTaskRunning) {
-      backgroundTaskManager.stopBackgroundRunning(this.context).catch((err: BusinessError) => {
-        console.error(`Long task stop failed: ${err.message}`);
-      });
-      this.isLongTaskRunning = false;
-    }
+    this.isInBackground = false;
+    this.longTaskGeneration += 1;
+    this.stopLongTask();
+    this.updateKeepScreenOn();
     emitter.emit({ eventId: BG_EVENT_ID }, {
       data: { action: 'restoreSensors' }
     });
   }
 
-  private startLongTask(): void {
-    if (this.isLongTaskRunning) {
+  private reconcileBackgroundCollectionState(): void {
+    if (!this.isInBackground) {
       return;
     }
+    if (BackgroundState.isCollectionActive()) {
+      this.startLongTask();
+      return;
+    }
+    this.longTaskGeneration += 1;
+    this.stopLongTask();
+  }
+
+  private restartLongTaskIfNeeded(): void {
+    if (this.isInBackground && BackgroundState.isCollectionActive() &&
+      !this.isLongTaskRunning && !this.isLongTaskStartPending) {
+      this.startLongTask();
+    }
+  }
+
+  private startLongTask(): void {
+    if (this.isLongTaskRunning || this.isLongTaskStartPending) {
+      return;
+    }
+    this.isLongTaskStartPending = true;
+    const generation = ++this.longTaskGeneration;
     const wantAgentInfo: wantAgent.WantAgentInfo = {
       wants: [
         {
@@ -50,27 +85,94 @@ export default class EntryAbility extends UIAbility {
     };
 
     wantAgent.getWantAgent(wantAgentInfo).then((agent: WantAgent) => {
+      if (!this.shouldKeepLongTask(generation)) {
+        this.isLongTaskStartPending = false;
+        this.restartLongTaskIfNeeded();
+        return;
+      }
       backgroundTaskManager.startBackgroundRunning(
         this.context,
         backgroundTaskManager.BackgroundMode.LOCATION,
         agent
       ).then(() => {
+        this.isLongTaskStartPending = false;
         this.isLongTaskRunning = true;
+        this.longTaskStopRetryCount = 0;
+        if (!this.shouldKeepLongTask(generation)) {
+          this.stopLongTask();
+        }
       }).catch((err: BusinessError) => {
+        this.isLongTaskStartPending = false;
         console.error(`Long task start failed: ${err.message}`);
+        if (this.shouldKeepLongTask(generation)) {
+          emitter.emit({ eventId: BG_EVENT_ID }, {
+            data: { action: 'stopSensors' }
+          });
+        } else {
+          this.restartLongTaskIfNeeded();
+        }
+      });
+    }).catch((err: BusinessError) => {
+      this.isLongTaskStartPending = false;
+      console.error(`Failed to create want agent: ${err.message}`);
+      if (this.shouldKeepLongTask(generation)) {
         emitter.emit({ eventId: BG_EVENT_ID }, {
           data: { action: 'stopSensors' }
         });
-      });
+      } else {
+        this.restartLongTaskIfNeeded();
+      }
+    });
+  }
+
+  private shouldKeepLongTask(generation: number): boolean {
+    return generation === this.longTaskGeneration &&
+      this.isInBackground &&
+      BackgroundState.isCollectionActive();
+  }
+
+  private stopLongTask(): void {
+    if (!this.isLongTaskRunning || this.isLongTaskStopPending) {
+      return;
+    }
+    this.isLongTaskStopPending = true;
+    backgroundTaskManager.stopBackgroundRunning(this.context).then(() => {
+      this.isLongTaskStopPending = false;
+      this.isLongTaskRunning = false;
+      this.longTaskStopRetryCount = 0;
+      this.restartLongTaskIfNeeded();
     }).catch((err: BusinessError) => {
-      console.error(`Failed to create want agent: ${err.message}`);
-      emitter.emit({ eventId: BG_EVENT_ID }, {
-        data: { action: 'stopSensors' }
-      });
+      this.isLongTaskStopPending = false;
+      console.error(`Long task stop failed: ${err.message}`);
+      if (this.longTaskStopRetryCount < 3 &&
+        (!this.isInBackground || !BackgroundState.isCollectionActive())) {
+        this.longTaskStopRetryCount += 1;
+        const retryDelayMs = this.longTaskStopRetryCount * 300;
+        setTimeout(() => {
+          if (this.isLongTaskRunning && !this.isLongTaskStopPending &&
+            (!this.isInBackground || !BackgroundState.isCollectionActive())) {
+            this.stopLongTask();
+          }
+        }, retryDelayMs);
+      }
+    });
+  }
+
+  private updateKeepScreenOn(): void {
+    if (!this.mainWindow) {
+      return;
+    }
+    const keepScreenOn = !this.isInBackground && BackgroundState.isCollectionActive();
+    this.mainWindow.setWindowKeepScreenOn(keepScreenOn).catch((screenError: BusinessError) => {
+      console.warn(`Failed to update keep-screen-on state: ${screenError.message}`);
     });
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
+    if (!this.collectionHandlerRegistered) {
+      emitter.on({ eventId: BG_EVENT_ID }, this.collectionEventHandler);
+      this.collectionHandlerRegistered = true;
+    }
     windowStage.loadContent('pages/Index', (err: BusinessError) => {
       if (err.code) {
         console.error(`Failed to load page. code=${err.code}, message=${err.message}`);
@@ -82,6 +184,7 @@ export default class EntryAbility extends UIAbility {
           console.error(`Failed to get main window. code=${windowError.code}, message=${windowError.message}`);
           return;
         }
+        this.mainWindow = mainWindow;
 
         mainWindow.setWindowSystemBarProperties({
           statusBarColor: '#0B1020',
@@ -92,10 +195,24 @@ export default class EntryAbility extends UIAbility {
           console.warn(`Failed to set system bar style. code=${barError.code}, message=${barError.message}`);
         });
 
-        mainWindow.setWindowKeepScreenOn(true).catch((screenError: BusinessError) => {
-          console.warn(`Failed to keep screen on. code=${screenError.code}, message=${screenError.message}`);
-        });
+        this.updateKeepScreenOn();
       });
     });
+  }
+
+  onWindowStageDestroy(): void {
+    this.isInBackground = false;
+    this.longTaskGeneration += 1;
+    this.stopLongTask();
+    if (this.mainWindow) {
+      this.mainWindow.setWindowKeepScreenOn(false).catch((screenError: BusinessError) => {
+        console.warn(`Failed to release keep-screen-on state: ${screenError.message}`);
+      });
+      this.mainWindow = undefined;
+    }
+    if (this.collectionHandlerRegistered) {
+      emitter.off(BG_EVENT_ID, this.collectionEventHandler);
+      this.collectionHandlerRegistered = false;
+    }
   }
 }

@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.codex.metrospeed",
     "vendor": "Jinitaemay",
-    "versionCode": 1783497867,
-    "versionName": "1.1.1",
+    "versionCode": 1783749567,
+    "versionName": "1.1.2",
     "icon": "$media:app_icon_ai",
     "label": "$string:app_name"
   }
