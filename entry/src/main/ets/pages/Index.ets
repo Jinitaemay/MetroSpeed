@@ -6,6 +6,7 @@ import { LocationController, LocationSnapshot, SatelliteSnapshot } from '../mode
 import { ResearchRecorder, ResearchRecorderStatus } from '../model/ResearchRecorder';
 import { BackgroundState } from '../model/BackgroundState';
 import { emitter } from '@kit.BasicServicesKit';
+import router from '@ohos.router';
 import {
   EstimatorFrame,
   MotionState,
@@ -1037,6 +1038,17 @@ struct Index {
         .lineHeight(18)
         .maxLines(3)
         .margin({ top: 6 });
+      Button('打开隧道灯光测速')
+        .width('100%')
+        .height(40)
+        .fontSize(14)
+        .fontColor('#0B1020')
+        .backgroundColor('#60A5FA')
+        .borderRadius(8)
+        .margin({ top: 10 })
+        .onClick(() => {
+          router.pushUrl({ url: 'pages/TunnelLight' });
+        });
     }
     .width('100%')
     .padding(12)
