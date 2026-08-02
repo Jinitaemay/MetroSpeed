@@ -2,13 +2,33 @@
 
 > 本文档是项目的硬规则，约束 AI 助手的行为。规则本身也可被质疑和修改——前提是人工明确要求。
 
+## 0. 规则使用与验收约定
+
+稳定规则 ID 不随章节移动而改变。执行任务时先按“触发”选择规则，再完成
+“验证”，并在交接记录中保存“最小证据”；章节正文仍是完整约束。命令示例
+属于安全运行步骤，不携带本机口令、密钥关系或候选状态，也不能取代对应
+硬规则。
+
+| 规则 ID | 触发 | 必须达到的结果 | 验证入口 | 最小证据 |
+|---|---|---|---|---|
+| `ALG-001` | 修改估算器或产品显示速度的融合/锚点语义 | ArkTS 与 Python 产品等价路径保持 bug-for-bug 一致，并更新适用的算法标识 | `python tools/sync_version.py --check`；再按 `REG-001` 回放 | 完整命令、算法标识、逐记录结果 |
+| `VER-001` | 执行 HAP/APP 构建或调整版本字段 | 两处版本字段由受控入口同步，最终包内版本与候选记录一致 | 构建钩子或 `sync_version.py`；最终包元数据核验 | versionName、versionCode、构建结果 |
+| `REL-001` | 生成或替换正式候选 | 测试、工程级构建、双层签名/Profile/元数据核验全部针对同一源码状态和最终产物 | 第 2.3 节核验清单 | 原始验签输出、最终字节数与 SHA-256、候选状态 |
+| `CAL-001` | 修改停车校准、静止窗或校准时龄 | 成功严格归零并保留按钮后真实增量；拒绝路径不改变速度或锚点 | 自动化测试与适用的确定性回放 | 成功、立即起步、拒绝三类结果 |
+| `DATA-001` | 修改研究 schema、写入、保留或导出 | 保持事务替换、完整性标记、异步复制和敏感数据不入库 | 自动化测试、故障路径检查、最终包权限核验 | schema、失败/恢复结果、权限与忽略规则 |
+| `REG-001` | 任何算法层或显示融合改动 | 对人工确认的当前代回归集做前后同输入、同参数的逐记录比较 | 第 5 节；版本化 manifest 落地前执行临时清单规则 | 输入清单及 SHA-256、参数、完整性、逐记录结果 |
+| `DOC-001` | 公开事实、当前状态、逆向证据或规则发生变化 | 信息写入唯一职责文档，其他文档只摘要并链接 | 第 8 节职责表与链接检查 | 更新文件、事实来源、交叉链接 |
+| `GIT-001` | commit、push、tag、Release、PR 或上架操作 | 权限不逐级推导，操作范围与用户明确授权一致 | 第 10 节 | staged diff、提交哈希或外部操作结果 |
+
 ---
 
 ## 1. Python-ArkTS 一致性（算法层）
 
+**规则 ID：`ALG-001`**
+
 `tools/replay_estimator.py` 中的 `SpeedEstimator` 类和 `replay()` 函数必须 **bug-for-bug** 复现 `entry/src/main/ets/model/SpeedEstimator.ets` 的估算逻辑。
 
-- 一致性作用域：`SpeedEstimator` 类内部的所有方法（状态检测、主轴追踪、有效加速度、积分、校准等），以及 `InertialSpeed.ets` 中会改变产品显示速度的 GNSS 可靠性、隧道冻结和锚点增量语义。给定相同输入，两端的产品等价默认路径必须产出相同速度序列。
+- 一致性作用域：`SpeedEstimator` 类内部的所有方法（状态检测、主轴追踪、有效加速度、积分、校准等），以及 `InertialSpeed.ets` 中会改变产品显示速度的 GNSS 可靠性、GNSS 锚点冻结和锚点增量语义。给定相同输入，两端的产品等价默认路径必须产出相同速度序列。
 - **不得**在算法层擅自增加 ArkTS 端没有的检查、闸门或分支
 - 修改 `SpeedEstimator`，或修改会改变显示结果的融合/锚点语义时，必须更换完整 `ALGORITHM_VERSION`；纯诊断、统计和不参与产品默认路径的实验参数不更换
 - `ALGORITHM_VERSION` 使用 `算法族-算法定版日期-r公开修订号`。`rN` 只按已经向用户公开分发的算法代次连续编号，不因数字偏好跳号；尚未上架且后来被替代的内部候选不占正式修订号，由完整日期、`appVersionCode` 和 Git commit 区分
@@ -25,15 +45,19 @@
 
 分析层不修改 `SpeedEstimator` 的行为，仅供离线测试使用。
 
-分析层已知开关：
-- `--use-gyro-gravity`：陀螺仪重力追踪（已验证失败，保留为实验开关）
-- `--use-sys-gravity`：仅用于旧 v13/v15 日志离线分析；用历史系统 GRAVITY 输出替代自估重力（地铁 NO-GO，自 schema v16 起不再采集）
+分析层兼容性边界：
+- `--use-gyro-gravity` 只允许作为离线实验开关；任何有效性结论必须引用对应
+  回归证据，不能因开关存在而进入产品默认路径
+- `--use-sys-gravity` 仅用于旧 v13/v15 日志离线兼容分析；schema v16 起的
+  新记录不再采集系统 `GRAVITY`，不得把该开关描述成当前产品输入
 
 ---
 
 ## 2. 构建与版本号
 
 ### 2.1 版本号
+
+**规则 ID：`VER-001`**
 
 每次构建（`hvigorw assembleHap` / `assembleApp` 或 DevEco Studio build）时，`hvigorfile.ts` 会自动更新 `AppScope/app.json5` 中的 `versionCode`。
 
@@ -46,7 +70,8 @@
 
 ### 2.2 构建命令
 
-CLI 构建（需设置环境变量）：
+以下是安全运行步骤，不是本机环境状态的权威记录。路径按实际 DevEco 安装
+位置调整，执行结果仍须满足 `VER-001` / `REL-001`：
 ```powershell
 $env:NODE_HOME = "C:\Program Files\Huawei\DevEco Studio\tools\node"
 $env:DEVECO_SDK_HOME = "C:\Program Files\Huawei\DevEco Studio\sdk"
@@ -60,15 +85,26 @@ $env:PATH = "$env:NODE_HOME;$env:JAVA_HOME\bin;" + $env:PATH
 & "C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat" assembleApp --mode project -p product=default -p buildMode=release --no-daemon
 ```
 
-### 2.3 签名
+### 2.3 发布与签名
+
+**规则 ID：`REL-001`**
+
+#### 2.3.1 硬约束
 
 `build-profile.json5` 已从版本控制移除（含 DevEco 自动填充的 debug 签名，属本地敏感配置）。仓库只保留 `build-profile.template.json5` 模板（`signingConfigs` 为空数组），由 `.gitignore` 排除实际文件。模板只定义可实际使用的 `default` product；不得增加没有对应 signingConfig、且正式流程不会使用的伪 `release` product。
+
+版本控制中的文档不得记录任何实际口令、口令之间的关系、私钥可用状态、
+灾备清单内容或其他会随本机密钥轮换而变化的事实。此类信息只能保存在仓库
+外的私有密钥管理系统中；发布证据只记录证书/Profile 的公开身份、有效期、
+验证结果和最终产物指纹。
+
+#### 2.3.2 安全运行步骤
 
 首次 clone 后需：
 1. 复制模板：`Copy-Item build-profile.template.json5 build-profile.json5`
 2. 用 DevEco Studio 打开工程，让其自动填充 debug 签名；或手动配置签名
 
-release 签名使用 `tools/sign_app.ps1` 脚本手动签名。脚本默认从实际 `build-profile.json5` 和仓库模板解析 compatible API，要求所有可用配置得到唯一一致的值；显式传入 `-CompatibleApiVersion` 时也必须与配置一致，禁止硬编码旧 API。脚本默认交互读取密码；仅自动化环境显式使用 `-NonInteractivePassword`，并分别设置密钥库密码和密钥密码（两者相同时应省略第二项并回退到第一项）。当前 `release.p12` 已验证两者相同；灾备清单中的“密钥密码：同上（与密钥库密码相同）”是复用说明，不是独立口令：
+release 签名使用 `tools/sign_app.ps1` 脚本手动签名。脚本默认从实际 `build-profile.json5` 和仓库模板解析 compatible API，要求所有可用配置得到唯一一致的值；显式传入 `-CompatibleApiVersion` 时也必须与配置一致，禁止硬编码旧 API。脚本默认交互读取密码；仅自动化环境显式使用 `-NonInteractivePassword`，并按脚本接口在进程运行时提供所需环境变量。不得把变量值回显、写入仓库文件或复制到构建/验签记录：
 ```powershell
 $env:METROSPEED_KEYSTORE_PASSWORD = "<密钥库密码>"
 $env:METROSPEED_KEY_PASSWORD = "<密钥密码>"
@@ -96,7 +132,9 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -JavaPath "D:\Java\b
 
 签名流程：解压 .app → 签内部 HAP → 重新打包 → 签 .app 本身。
 
-正式候选必须在最后一项影响包内容的源码、资源、配置或构建脚本修改完成，并完成适用的自动化测试、规则 5 回归和版本一致性检查后，再执行工程级 `assembleApp`。构建钩子对 `AppScope/app.json5` 与 `ResearchRecorder.ets` 的同步更新属于本次构建的一部分。每个确定的源码状态只生成一个成功的正式候选，避免无意义重复构建抬升 `versionCode`。
+#### 2.3.3 正式候选生成与核验
+
+正式候选必须在最后一项影响包内容的源码、资源、配置或构建脚本修改完成，并完成适用的自动化测试、`REG-001` 回归和版本一致性检查后，再执行工程级 `assembleApp`。构建钩子对 `AppScope/app.json5` 与 `ResearchRecorder.ets` 的同步更新属于本次构建的一部分。每个确定的源码状态只生成一个成功的正式候选，避免无意义重复构建抬升 `versionCode`。
 
 成功构建后可以且必须补写仅由产物才能确定的证据文档，包括最终 `versionCode`、文件名、字节数、SHA-256、验签结果和候选状态；这些证据性文档修改不要求重新构建。若构建后又修改任何会进入 APP/HAP，或改变其行为、权限、版本、资源、构建或签名输入的文件，原候选立即失效，必须重新完成测试、构建、签名和验签。
 
@@ -112,16 +150,21 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -JavaPath "D:\Java\b
 
 正式包必须使用包含 `versionName` 和 `versionCode` 的独立文件名，验签证据也必须使用对应版本号的独立目录或文件名。新的候选完成正式签名、全部核验并由用户确认替代关系前，不得覆盖或删除当前已提交/已发布候选、上一份完整验签通过的候选及其验签证据；通用的 `MetroSpeed-default-*` 中间产物可以覆盖。已经提交或发布的旧包，其文件名、哈希、包内算法标识和提交事实只能作为历史事实保留，不得改写。
 
-签名文件位于 `signing/` 目录（不提交）：
-- `release.p12`：密钥库（EC 256位）
-- `release.cer`：发布证书
-- `releaseRelease.p7b`：Profile 文件
+`tools/sign_app.ps1` 的默认本地文件名约定如下，`signing/` 整个目录不得提交：
+- `release.p12`：密钥库输入
+- `release.cer`：发布证书输入
+- `releaseRelease.p7b`：Profile 输入
+
+这些名称只是脚本接口，不证明任一文件当前存在、可用或采用何种密钥参数；
+实际证书/Profile 身份只在对应候选的私有发布环境和最终验签证据中确认。
 
 > **注意**：release 证书签名的 HAP/APP 不能直接通过 `hdc install` 安装到手机，会报 "signature verification failed due to not trusted app source"。release 签名包只能通过应用市场分发。调试请使用 DevEco Studio 的 debug 证书。
 
 ---
 
 ## 3. 信任用户校准
+
+**规则 ID：`CAL-001`**
 
 停车校准由用户手动触发，`calibrate_at_stop` 不引入额外速度阈值拦截。
 
@@ -135,7 +178,9 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -JavaPath "D:\Java\b
 
 ## 4. 数据文件路径
 
-所有 JSONL 数据存放在本地方研究记录目录，设置环境变量 `METROSPEED_DATA_DIR` 指向该目录。
+**规则 ID：`DATA-001`**
+
+所有 JSONL 数据存放在本地研究记录目录，设置环境变量 `METROSPEED_DATA_DIR` 指向该目录。
 
 schema v14 起，所有实际传感器回调都必须逐条落盘并携带 `sessionId`、`measurementRunId` 和版本字段；估算器行必须同时保留纯惯性 `pureInertialSpeedKmh` 与界面显示 `displaySpeedKmh`。schema v15 进一步要求保存独立 `sensor_callback` 记录、请求周期、传感器时间戳和回调时间戳，任何频率判断都必须以实际时间戳为准，不得把请求值或加速度计驱动帧率套给其他传感器。schema v16 的新记录只订阅六类 100Hz 请求传感器，不再采集系统 `GRAVITY` / `LINEAR_ACCELEROMETER`；旧 v13/v15 的 `sysGravity*` 数据和分析开关必须保持可读。schema v17 沿用 v16 的传感器范围，并要求用独立 `device_health` 行在记录开始、结束及运行中每 10 秒保存 `batteryTemperatureC` 与 `thermalLevel`，不得把设备健康字段复制到每条 100Hz 记录。离线对比必须按 `measurementRunId` 隔离，纯惯性回归只允许与同一 `recordSeq` 邻接的精确传感器样本配对，禁止跨测速段或跨缺失样本插值；schema v13 的 `estimatedSpeedKmh` 是锚定后的显示速度，不能当作纯惯性回归基准。
 
@@ -150,17 +195,33 @@ python tools/replay_estimator.py "<数据目录>\<文件名>.jsonl"
 
 ## 5. 算法改动必须多记录验证
 
+**规则 ID：`REG-001`**
+
 任何算法层面的改动（阈值、条件、状态机顺序、缩放系数、GNSS 锚点条件等）都必须做改动前/后对比；**不得**仅凭单条记录的 MAE 变化决定改动是否生效。
 
 ### 5.1 当前代主回归集
 
-`METROSPEED_DATA_DIR` 根目录中的 JSONL 是当前代主回归集；明确归档到 `50Hz/`、`旧记录/` 等子目录的文件不自动计入。当前主回归集只有地铁、公交、驾车三条记录，因此算法或融合逻辑改动必须完整回放这三条，不能仅因单文件体积较大而跳过。
+当前代主回归集的长期权威入口必须是**受版本控制且经人工确认的
+manifest**，至少记录每个输入的稳定逻辑 ID、场景、文件 SHA-256、字节数、
+schema、完整性口径和必跑参数配置。算法或融合逻辑改动必须严格使用 manifest
+锁定的全部输入，不能按目录当时恰好存在的文件静默增删，也不能仅因单文件
+体积较大而跳过。
+
+> **待办 `REG-MANIFEST-001`（尚未落地）**：当前仓库没有经过人工确认、可
+> 安全提交的回归 manifest；本规则不伪造文件名、记录名或哈希。在该待办完成
+> 前，`METROSPEED_DATA_DIR` 根目录中的 JSONL 暂作为当前代候选集合，明确
+> 归档到 `50Hz/`、`旧记录/` 等子目录的文件不自动计入。每次基线开始前必须
+> 先生成并保存本轮精确输入清单（路径或脱敏逻辑 ID、字节数、SHA-256、schema、
+> 完整性和完整命令行参数），由人工确认仍对应地铁、公交、驾车三条当前记录；
+> 缺少这份清单时不得声称完成“当前代全量回归”。
 
 - 改动前跑主回归基线：`python tools/_baseline_all.py --dir <METROSPEED_DATA_DIR>`
 - 改动后用相同文件、相同参数跑对比；涉及锚点时同时使用 `--anchor-v2 --pure-zero`
 - 必须逐文件报告结果和异常，不能只给汇总平均值
 - 地铁数据零影响不等于改动安全，可能只是该记录没有触发对应分支
 - 如果部分记录改善、部分记录恶化，必须逐条分析原因后再决定
+- manifest 落地后，运行报告必须记录 manifest 自身的版本或 Git commit；
+  落地前必须记录上述临时输入清单的 SHA-256
 
 ### 5.2 历史档案与大文件
 
@@ -175,11 +236,15 @@ python tools/replay_estimator.py "<数据目录>\<文件名>.jsonl"
 
 已确认仅在 EOF 写入中断的记录可以显式使用 `--allow-truncated-tail`，但必须让改动前后读取同一有效前缀，并把结果标为 `incomplete`。`_baseline_all.py` 必须显示 `inputIntegrity` 状态并以非零退出，禁止把截断输入计入完整全绿。
 
-如果未来当前代主回归集继续增长到日常无法完整运行，应先建立并经人工确认一个受版本控制的分段回归清单，再修改本规则；不得自行静默抽样。
+如果当前代主回归集增长到日常无法完整运行，应先在 manifest 中建立并经
+人工确认的分段配置，再修改本规则；不得自行静默抽样。`REG-MANIFEST-001`
+完成前不得以“数据量还小”为由继续推迟可复现清单。
 
 ---
 
 ## 6. 参数扫描方法
+
+**规则 ID：`SCAN-001`；主回归验收仍受 `REG-001` 约束。**
 
 参数扫描分两阶段，不得跳过第一阶段的筛选：
 
@@ -221,14 +286,16 @@ python tools/replay_estimator.py "<数据目录>\<文件名>.jsonl"
 
 ## 8. 说明文件维护
 
+**规则 ID：`DOC-001`**
+
 以下四个文件均可被后续证据质疑和修正，但职责不得混用：
 
 | 文件 | 定位 | 更新时机 |
 |---|---|---|
-| `.trae/rules/project_rules.md` | 约束 AI 行为的硬规则 | 发现缺失或不适用时，仅在用户明确确认后更新 |
-| `.trae/documents/investigation_status.md` | 当前工作交接快照：当前候选、已完成验证、关键结论边界、外部状态和下一步；隧道机制只保留可恢复上下文的摘要并链接主记录 | 任何持久代码、配置或文档改动，新验证证据或外部提交状态生效后，在提交或交接前更新 |
-| `.trae/documents/harmonyos_tunnel_positioning_reverse_engineering.md` | HarmonyOS 隧道定位研究的权威长记录：镜像/真机对象、哈希、函数链、证据等级、复现方法、未知项和研究时间线 | 系统机制研究出现新证据、反证、边界变化或解释修正时更新；纯 MetroSpeed 发版状态不写入此文档 |
-| `README.md` | 面向公开仓库的稳定项目说明：当前公开版或下一公开候选、用户可见功能与限制、公式、数据资产、仓库结构和里程碑 | 公开事实、产品行为、限制、算法版本、数据资产或仓库结构变化时同步更新；不展开内部候选流水账 |
+| [`.trae/rules/project_rules.md`](project_rules.md) | 约束 AI 行为的硬规则 | 发现缺失或不适用时，仅在用户明确确认后更新 |
+| [`.trae/documents/investigation_status.md`](../documents/investigation_status.md) | 当前工作交接快照：当前候选、已完成验证、关键结论边界、外部状态和下一步；隧道机制只保留可恢复上下文的摘要并链接主记录 | 任何持久代码、配置或文档改动，新验证证据或外部提交状态生效后，在提交或交接前更新 |
+| [`.trae/documents/harmonyos_tunnel_positioning_reverse_engineering.md`](../documents/harmonyos_tunnel_positioning_reverse_engineering.md) | HarmonyOS 隧道定位研究的权威长记录：镜像/真机对象、哈希、函数链、证据等级、复现方法、未知项和研究时间线 | 系统机制研究出现新证据、反证、边界变化或解释修正时更新；纯 MetroSpeed 发版状态不写入此文档 |
+| [`README.md`](../../README.md) | 面向公开仓库的稳定项目说明：当前公开版或下一公开候选、用户可见功能与限制、公式、数据资产、仓库结构和里程碑 | 公开事实、产品行为、限制、算法版本、数据资产或仓库结构变化时同步更新；不展开内部候选流水账 |
 
 同一隧道机制结论以逆向主记录为权威来源；status 只摘要当前结论与未决项，README 只保留公开层面的研究边界和里程碑，禁止三处复制整段机制正文。
 
@@ -247,6 +314,8 @@ AppGallery 和 GitHub Release 的更新说明是发布页面输入，默认不�
 
 ## 9. 规则质疑与违规告知
 
+**例外流程 ID：`EXC-001`。任何规则例外必须引用被例外的稳定规则 ID。**
+
 上述规则均为当前阶段的最佳实践总结，**不是死命令**。当 AI 认为某条规则在特定情境下不再适用、或违反规则能带来明确收益时，必须：
 
 1. **明确告知用户** — 说明哪条规则、为什么认为应该违反、预期收益是什么
@@ -258,6 +327,8 @@ AppGallery 和 GitHub Release 的更新说明是发布页面输入，默认不�
 ---
 
 ## 10. Commit message 规范
+
+**规则 ID：`GIT-001`**
 
 - 标题应概括与上一个 commit 之间发生的变化，说明做了什么、为什么
 - **不得包含版本号**（如 `v1.1.1`）——版本号由 Release tag 承载，commit message 描述内容变化

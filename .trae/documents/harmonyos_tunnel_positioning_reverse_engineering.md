@@ -2,7 +2,9 @@
 
 > 状态：供给镜像的静态机制与采样链已解析；Pura 70 只读运行态已做部分核查，
 > 真实驾车/隧道动态验证仍待补，可作为接手入口
-> 文档版本：v0.8（2026-08-02）
+> **document_version**：v0.9
+> **last_edited**：2026-08-02（结构与文字最后编辑日，不代表新增运行证据）
+> **evidence_cutoff**：2026-07-28（本文现有镜像、真机与日志证据的截止日）
 > 分析对象：HarmonyOS 6.1.1 模拟器镜像，API 24，镜像包版本
 > `6.1.0.125`，guest build `HarmonyOS 6.1.0.125(SP9)`
 > 镜像目录：
@@ -10,6 +12,51 @@
 >
 > 真机核查对象：HUAWEI Pura 70（ADY-AL10），
 > `6.1.0.135(SP8C00E120R5P6)` / API 24，AArch64
+
+## 阅读与检索入口
+
+### 文档职责
+
+本文是 HarmonyOS 隧道定位机制的权威技术证据记录，保存分析对象、哈希、
+函数链、证据等级、复现边界、未知项和调查日志；不维护 MetroSpeed 候选包、
+审核状态或易漂移的当前 UI 细节。
+
+- 当前公开产品行为与稳定限制见 [`README.md`](../../README.md)。
+- 当前候选、验证证据和下一步见
+  [`investigation_status.md`](investigation_status.md)。
+- 算法、回归、发布与文档职责硬规则见
+  [`project_rules.md`](../rules/project_rules.md)。
+
+### 问题索引
+
+- **现在可以证明什么、不能证明什么？** 见[第 1 节](#rev-current-conclusions)和
+  [第 2 节](#rev-evidence-boundary)。
+- **镜像与真机对象是否可识别？** 见[第 3 节](#rev-image-identity)和
+  [第 9 节](#rev-variants-runtime)。
+- **PVT、传感器、VDR 与输出如何连接？** 见[第 4 节](#rev-call-chain)。
+- **隧道内依靠哪些约束连续定位？** 见[第 5～7 节](#rev-driving-detection)。
+- **应用能否从 `sourceType` 判断 VDR？** 见[第 8 节](#rev-source-type)。
+- **这些证据与 MetroSpeed 有什么边界？** 见[第 11 节](#rev-metrospeed-boundary)。
+- **怎样复核、还缺什么、如何接手？** 见[第 13～15 节](#rev-reproduction)。
+- **按日期查看证据增量？** 见[第 16 节](#rev-log)。
+
+### 简洁证据矩阵
+
+矩阵只用于检索；详细段落、地址、边界和反证仍以对应章节为准。
+
+| Claim ID | 可复核结论 | 对象与证据等级 | 详细入口 | 主要未决边界 |
+|---|---|---|---|---|
+| `IMG-001` | 供给镜像和四个 HiGeo 核心载荷具有可重复哈希 | 供给镜像；直接证据 | [第 3 节](#rev-image-identity) | 镜像载荷不等于模拟器或量产机实际加载版本 |
+| `FLOW-001` | manager 入口后的 PVT 与 IMU/磁场缓存可进入 3D VDR 更新链 | 1102a/1106；直接证据 | [第 4 节](#rev-call-chain) | 外部 PVT producer 与真实 cadence 未闭环 |
+| `SENSOR-001` | 主要 IMU/磁场名义请求 10 ms，算法按实际时间戳逐组合样本更新 | 1102a/1106；直接证据 | [第 4.3 节](#rev-call-chain) | 不能外推为 1105 真机实测 100 Hz 或 PVT 频率 |
+| `IPC-001` | 融合 PVT 可序列化为 `Location:`，经 8234 到 `ReportMsgToSa(string)` / IPC transaction 1 | 1106 + GNSS ext；直接证据 | [第 4.6 节](#rev-call-chain) | receiver 与标准 GNSS callback 没有静态连边 |
+| `AIVDR-001` | AI-VDR 使用 208×6 窗、两个 88-float 状态并把速度量测送入 Kalman | 1106；直接证据 | [第 6.3 节](#rev-tunnel-positioning) | 模型图、训练口径及产品默认启用状态未知 |
+| `PF-001` | 1106 含隧道路网、PF 选择及 VDR 回退路径 | 1106；直接证据 + 运行解释边界 | [第 6.4 节](#rev-tunnel-positioning) | 具体产品、城市和隧道是否启用未知 |
+| `TMM-001` | 1106 的三轴磁序列 FastDTW/欧氏匹配可取参考 LLH 并修正 Kalman | 1106；直接证据 | [第 6.5～6.6 节](#rev-tunnel-positioning) | 参考资产覆盖与运行启用未知 |
+| `SOURCE-001` | 公开 `sourceType` 1/4 是 GNSS/RTK，不能表达 VDR provenance | API 24 SDK + system 库；直接证据 | [第 8 节](#rev-source-type) | 产品最终 provider 选择路径未闭环 |
+| `RUNTIME-001` | Pura 70 可见 1105 GNSS 进程及 XDR 控制下发 | Pura 70，2026-07-28；运行态直接证据 | [第 9.1 节](#rev-variants-runtime) | maps、实际配置、算法启停与内部频率受权限限制 |
+
+<a id="rev-current-conclusions"></a>
 
 ## 1. 当前结论
 
@@ -51,6 +98,8 @@
 参考资产缺失都会增大误差或触发退出；停车可能通过零速和零偏更新提供
 校正。这些机制不能保证量产机在任意隧道中无限时间保持绝对位置。
 
+<a id="rev-evidence-boundary"></a>
+
 ## 2. 证据等级与边界
 
 本文用以下标签避免把逆向推断写成已证实事实：
@@ -86,6 +135,8 @@
   IMU 标定和云端隧道数据；静态代码可证明能力与数据流，不能替代数公里
   真机精度测试。
 
+<a id="rev-image-identity"></a>
+
 ## 3. 镜像身份与可重复性
 
 ### 3.1 完整镜像哈希
@@ -118,6 +169,8 @@
 | `/vendor/etc/aivdr.net` | `47B7102FDA1F5F93D197A5B51BB85DE5F03578985B325FBC0A8019BB87541F78` |
 | `/vendor/etc/aipdr_v283.net` | `362EF68CEFA10957F6E61C47EB8A65A64C22BD7E8771847ADFCFA3309D803014` |
 | `/vendor/etc/aipdr_riemann.net` | `64A5EB025CDB644FF851E0085FDD02292ADA48931255623A9CEF40B3672AFF48` |
+
+<a id="rev-call-chain"></a>
 
 ## 4. 系统调用链
 
@@ -469,6 +522,8 @@ UTF-16LE
 模块、芯片产品模块或模拟器裁剪内容；不能声称 8234 已进入标准 GNSS
 callback 或应用。
 
+<a id="rev-driving-detection"></a>
+
 ## 5. 入隧道前：系统如何知道“现在在车里”
 
 ### 5.1 驾车状态识别
@@ -515,6 +570,8 @@ HiGeo service 的完整本地符号直接暴露了：
 手机可以横放、竖放或固定在支架上，IMU 坐标系并不等于车辆坐标系。
 安装角估计把手机测得的角速度和加速度旋转到车辆前/右/上坐标系，这是
 车辆非完整约束和前向速度估计能够成立的前提。
+
+<a id="rev-tunnel-positioning"></a>
 
 ## 6. 隧道内：位置是如何连续生成的
 
@@ -713,6 +770,8 @@ manager 的直接字符串和调用还确认：
 “联网一定只用于下载 TMM”仍不能下结论，因为同一 manager 还下载辅助
 GNSS、停车场和其他地图数据。
 
+<a id="rev-inputs-config"></a>
+
 ## 7. 输入、开关与降级条件
 
 ### 7.1 已确认输入
@@ -834,6 +893,8 @@ service 预处理还有另一层重采样语义：1106 的
 具体置信度阈值以及上层何时“停止上报/改报低精度/转网络位置”仍依赖
 运行时配置和系统服务状态，静态镜像不能给出单一固定顺序。
 
+<a id="rev-source-type"></a>
+
 ## 8. 对外 `Location.sourceType` 的真实含义
 
 API 24 SDK 的 `@ohos.geoLocationManager.d.ts` 明确定义：
@@ -863,9 +924,9 @@ API 24 SDK 的 `@ohos.geoLocationManager.d.ts` 明确定义：
   `FUSION_REPORT_PROCESS` 阶段的私有 hook 实现。
 
 **已解决结论**：MetroSpeed 中接受的 `sourceType 1/4` 分别是
-GNSS/RTK，不是“原始 GNSS/系统惯导”二分标志。继续保留“进入手动隧道
-模式后冻结锚点”的做法是保守且必要的实验隔离，否则潜在的系统融合延拓点
-可能反向污染独立惯性实验。
+GNSS/RTK，不是“原始 GNSS/系统惯导”二分标志。手动开启“GNSS 锚点冻结”
+实验是保守且必要的实验隔离，否则潜在的系统融合延拓点可能反向污染独立
+惯性实验；该名称不表示应用已经识别隧道或提高精度。
 
 第 4.6 节已把 HiGeo output 闭环到
 `ILocationGnssExtCallback::ReportMsgToSa(string)` 的 IPC transaction 1，
@@ -875,6 +936,8 @@ GNSS/RTK，不是“原始 GNSS/系统惯导”二分标志。继续保留“进
 callback 固定写 1 与消息 8234 是两条各自成立、但**没有静态连边**的
 证据。无论走哪条产品路径，公开 `sourceType` 本身都无法表达 VDR
 provenance。
+
+<a id="rev-variants-runtime"></a>
 
 ## 9. 1102a 与 1106 变体差异
 
@@ -974,6 +1037,8 @@ MainUpdate3dvdr
 `DROP DETECTION` 客户端；HiGeo 的镜像链路直接使用 Sensor HDI，因而
 不能据此否定其私有订阅，也不能读出它的实际请求或回调节拍。
 
+<a id="rev-public-crosscheck"></a>
+
 ## 10. 与公开资料的交叉验证
 
 ### 10.1 已量产行为
@@ -1034,16 +1099,20 @@ MainUpdate3dvdr
 （约 \(0.0098\,m/s^2\)），180 秒也会累积约 159 m；陀螺航向误差还会
 把前向速度投影成横向漂移。数公里稳定输出必然需要持续约束或外部锚点。
 
-## 11. 与 MetroSpeed 现有实现的关系
+<a id="rev-metrospeed-boundary"></a>
 
-MetroSpeed 当前的惯性估计器解决的是“一维速度估计”，而鸿蒙系统隧道
-定位解决的是“二维/三维位置、速度、姿态与地图约束融合”。两者不是同一
-复杂度：
+## 11. 与 MetroSpeed 的能力边界
 
-| 能力 | MetroSpeed 当前实现 | 镜像中直接证明的能力 |
+本节只保留不会随候选包和 UI 迭代频繁变化的能力边界；当前公开产品行为见
+[`README.md`](../../README.md)，当前源码/候选与验证状态见
+[`investigation_status.md`](investigation_status.md)。截至 `evidence_cutoff`，
+MetroSpeed 的惯性估计器解决的是“一维速度估计”，而鸿蒙系统隧道定位解决
+的是“二维/三维位置、速度、姿态与地图约束融合”。两者不是同一复杂度：
+
+| 能力 | MetroSpeed 能力边界 | 镜像中直接证明的能力 |
 |---|---|---|
 | 原始 IMU 采集 | 有 | 有 |
-| GNSS 入隧道锚点 | 有 | 有 |
+| GNSS 速度锚点与手动冻结实验 | 有；冻结仅用于对照隔离 | 有 GNSS/VDR 更新输入；不等同于 MetroSpeed 开关语义 |
 | 一维惯性速度 | 有 | 有，且有 AI/滤波辅助 |
 | 手机安装角估计 | 主轴学习，能力有限 | 专用 Mount/AiMount 流程 |
 | 3D 姿态/位置滤波 | 无 | 3D VDR + Kalman |
@@ -1062,7 +1131,10 @@ MetroSpeed 当前的惯性估计器解决的是“一维速度估计”，而鸿
 4. 加入离线道路中心线/隧道拓扑匹配；
 5. 最后研究磁序列匹配和学习式速度估计。
 
-在这些层完成前，不应把当前纯惯性速度输出描述为“已复刻鸿蒙隧道定位”。
+在这些层完成前，不应把 MetroSpeed 的一维纯惯性速度输出描述为“已复刻
+鸿蒙隧道定位”。
+
+<a id="rev-evidence-paths"></a>
 
 ## 12. 关键证据目录
 
@@ -1092,6 +1164,8 @@ MetroSpeed 当前的惯性估计器解决的是“一维速度估计”，而鸿
 | `/vendor/etc/aipdr_riemann.net` | AI-PDR Riemann 模型 |
 
 分析中二进制只提取到系统临时目录，没有复制进项目，也不应提交到仓库。
+
+<a id="rev-reproduction"></a>
 
 ## 13. 复现环境与命令
 
@@ -1124,6 +1198,27 @@ llvm-nm.exe -C --defined-only library.debug
 这一步是本次能够从“字符串猜测”推进到“函数级证据”的关键。
 
 ### 13.2 仓库内复核工具
+
+#### Clean-clone 复现边界与待办
+
+仓库只包含只读检索/调用恢复工具，不包含 HarmonyOS 镜像、提取后的专有
+ELF、解压后的 mini-debug ELF 或真机持久日志。因此，从 clean clone 开始时
+必须先自行取得与第 3 节哈希一致的镜像；没有匹配哈希时只能形成新的分析
+对象，不能复用本文地址和结论等级。
+
+当前已经记录并验证的入口包括：第 13.1 节的依赖与通用
+`.gnu_debugdata` 提取步骤、下文两个仓库工具的接口，以及工具自身的架构、
+`.text` 布局和 Build ID 配对检查。安全顺序是：先核对镜像哈希，再使用
+`hmos_image_inspect.py extract` 的显式单文件、拒绝覆盖接口并保存其 SHA-256，
+随后按第 13.1 节解压该 ELF 自带的 `.gnu_debugdata`，最后才运行
+`hmos_elf_calls.py`。每次复核都要保存实际命令、宿主工具版本、提取物哈希和
+输出；不得只引用历史临时目录。
+
+> **待办 `REPRO-001`（尚未闭环）**：本文还没有一条在 clean clone 上重新
+> 执行并核验过的端到端脚本，能够从四个镜像自动定位全部目标 ELF、逐一提取
+> `.gnu_debugdata` 并生成预期摘要。下文命令只覆盖已验证的通用步骤和历史
+> 会话中的已提取文件，不能拼接猜测命令冒充一键复现。后续只有在重新执行、
+> 记录输入哈希并核对输出后，才能把该脚本或完整命令提升为复现入口。
 
 `tools/hmos_image_inspect.py` 对 ext4 镜像只读操作，支持：
 
@@ -1161,7 +1256,8 @@ python tools/hmos_elf_calls.py list library.so library.debug Higeo3dvdrProcess
 python tools/hmos_elf_calls.py calls library.so library.debug Higeo3dvdrProcess --depth 2
 ```
 
-第 4.3 节的采样链可从已提取 1106 文件最小复核：
+第 4.3 节的采样链可从已提取 1106 文件最小复核；以下路径来自历史分析
+会话，假定提取物已经按上述边界准备完成，不是 clean-clone 入口：
 
 ```powershell
 $re = Join-Path $env:TEMP 'metrospeed-hmos-re'
@@ -1220,18 +1316,20 @@ $hilogTool = Join-Path $env:ProgramFiles 'Huawei\DevEco Studio\sdk\default\hms\t
 不存在。设备版本、进程 PID 和持久日志文件名会随升级/重启轮换，复核时
 必须重新记录。
 
-### 13.4 当前临时分析目录
+### 13.4 历史会话临时分析目录（非复现入口）
 
-当前会话的提取物位于：
+形成本文现有证据时，会话提取物位于：
 
 ```text
 $env:TEMP\metrospeed-hmos-re
 $env:TEMP\higeo-runtime-audit-<session-id>
 ```
 
-它们不是项目资产，清理临时目录后会消失。二进制与真机持久日志也不应
-复制进仓库；可重复提取、直接调用恢复和日志解码命令已记在上文，结论以
-本文、镜像哈希和原始日志来源为准。
+它们不是项目资产，清理临时目录后会消失，也不能据此判断当前宿主仍存在
+这些文件。二进制与真机持久日志不应复制进仓库；结论以本文、镜像哈希和
+原始日志来源为准，clean-clone 的剩余缺口按 `REPRO-001` 处理。
+
+<a id="rev-open-questions"></a>
 
 ## 14. 尚未完成的问题
 
@@ -1263,6 +1361,8 @@ $env:TEMP\higeo-runtime-audit-<session-id>
    退出原因和出隧道重捕获。若仍受 SELinux 限制，需要调试签名系统组件、
    工程固件或厂商侧日志权限，不能通过普通 shell 猜测。
 
+<a id="rev-handoff"></a>
+
 ## 15. 接手清单
 
 新接手者先按以下顺序工作：
@@ -1274,6 +1374,8 @@ $env:TEMP\higeo-runtime-audit-<session-id>
    和结论等级；
 5. 任何涉及 MetroSpeed 算法的改动，必须先做 ArkTS/Python 双端一致性与
    现有回放验证，不能因逆向发现直接改写产品算法。
+
+<a id="rev-log"></a>
 
 ## 16. 调查日志
 
