@@ -1,8 +1,32 @@
 # MetroSpeed 项目工作记忆
 
-> **记忆版本**：v43
-> **最后更新**：2026-07-10
-> **对应阶段**：全量可靠性修复 — 停车后段重放、后台连续采集、回放/工具一致性、签名配置隔离；算法版本 anchor-delta-20260710-r3
+> **记忆版本**：v72
+> **最后更新**：2026-08-02
+> **对应阶段**：MetroSpeed 1.2.0 当前源码算法版本仍为 `anchor-delta-20260801-r4`。AppGallery 对 versionCode 1785602095 的审核指出“停车校准”和“导出”两个禁用按钮文字对比度仅 1.86/1.84；
+> 当前源码不再让可见按钮进入会强制灰显的 `.enabled(false)` 状态，改由点击命中、焦点、无障碍文案和业务入口共同阻止不可用操作，同时补强其他动态按钮配色。“停车校准”真机截图约 5.64:1；研究记录、GNSS 锚点冻结和真实定位运行状态现合并为同一张实验卡片，明确标注“仅供对照实验”“可能增加漂移”，开启时整张卡片使用深琥珀底与细描边。开关反馈不会再改写定位状态文字。“导出”已恢复 1.1.2 的 `#F59E0B/#0B1020` 可用态原色，同时保留当前胶囊外形和禁用灰显修复。最终正式候选 `MetroSpeed-1.2.0-1785660666-release.app` 已完成工程级构建、双层发布签名和独立验签，并已提交 AppGallery 复审
+
+---
+
+## 零、当前调查任务：HarmonyOS 驾车隧道定位
+
+完整、持续更新的主记录见
+[`harmonyos_tunnel_positioning_reverse_engineering.md`](harmonyos_tunnel_positioning_reverse_engineering.md)。
+该文档是本任务的接手入口，包含镜像哈希、服务调用链、函数级证据、结论
+等级、复现方法、未知项和后续清单。
+
+截至 2026-07-28，供给镜像已静态还原 HiGeo 3D VDR、安装角、NHC、Kalman、
+AI-VDR，以及 1106 的隧道路网 PF、三轴磁匹配和资产管理主干；1102a 的模型
+路径与镜像资产目录不一致，不能据此证明运行时成功加载。manager 入口后的
+PVT 调用、Sensor HDI 缓存/对齐和消息 8234 输出已追到各自静态证据终点，
+但外部 PVT producer、实际节拍、IPC 接收解析器和标准 Location callback
+仍未形成端到端闭环。
+
+1102a/1106 对主要 IMU/磁场名义请求 10 ms，对气压/光照请求 50 ms；这只
+证明供给镜像变体的请求值和逐样本时间戳语义，不等于量产机实测频率，也
+不代表 PVT tick 为 100 Hz。Pura 70 只读核查仅确认其 GNSS 主进程为
+`hignss_1105_ohos` 且启动时下发 XDR 控制参数；普通 shell 无权确认其实际
+HiGeo 载荷与 `higeo.conf`。公开 `sourceType` 也不能区分实时卫星解与私有
+融合延拓。完整证据、边界和待办统一见逆向主记录第 14 节。
 
 ---
 
@@ -11,13 +35,13 @@
 **项目名称**：MetroSpeed · 地铁测速
 **平台**：鸿蒙 HarmonyOS (ArkTS)
 **项目路径**：`<项目根目录>`
-**算法版本**：`anchor-delta-20260710-r3`
-**当前阶段**：v1.1.2 发布候选；停车校准、后台连续采集、研究日志完整性、双端回放和工程工具可靠性修复已完成
+**算法版本**：`anchor-delta-20260801-r4`
+**当前阶段**：1.2.0 的 versionCode 1785602095 包曾提交 AppGallery，但因两个禁用按钮的实际对比度仅 1.86/1.84 被驳回。当前正式候选 versionCode 为 1785660666；“停车校准”禁用态已在同源码 HAP 上真机确认约 5.64:1，“导出”恢复 1.1.2 可用态原色后为 8.82:1，禁用分支继续使用 5.71:1 的同类配色和修复后渲染路径。新 APP 已完成正式签名和 APP/HAP/Profile/元数据独立验签，并已提交 AppGallery 复审。实车、锁屏与长时验收仍未完成
 **许可证**：MIT
 **包名**：`com.codex.metrospeed`
 **应用名称**：地铁测速
-**版本号**：versionName = "1.1.2"，versionCode = Unix 时间戳（自动生成）
-**SDK版本**：compatibleSdkVersion/targetSdkVersion = 5.0.0(12)（保持 API12，不升级 API20）
+**版本号**：versionName = "1.2.0"，当前正式候选 versionCode = 1785660666；最终 UI 复检 HAP versionCode = 1785659833；AppGallery 对 versionCode 1785602095 的审核已驳回（构建钩子按 Unix 时间戳自动生成）
+**SDK版本**：compatibleSdkVersion = 6.0.0(20)，targetSdkVersion = 6.1.1(24)
 
 ---
 
@@ -26,7 +50,7 @@
 本项目有两个核心目标：
 
 1. **纯惯性测速**：仅用手机加速度计和陀螺仪，不依赖 GNSS 或系统融合输出，实时估算轨道交通/车辆的行驶速度。算法自行分离重力、学习主轴、检测运动状态、积分速度。
-2. **复刻鸿蒙隧道定位机制**：在 GNSS 失效的隧道场景中，用惯性推算维持速度输出——模拟鸿蒙系统在隧道内从 GNSS 切换到 IMU dead reckoning 的行为。隧道模式手动切换，入隧时冻结 GNSS 锚点，防止系统推算污染速度。
+2. **研究并逐步复刻鸿蒙隧道定位机制**：当前产品只在 GNSS 失效的隧道场景中用一维惯性估计维持速度输出；这只模拟“失锁后继续推算”的外部行为，不等同于鸿蒙的完整实现。镜像逆向已确认系统还包含 3D VDR、安装角估计、车辆约束、地图/粒子滤波和磁匹配。隧道模式仍手动切换，入隧时冻结 GNSS 锚点，防止系统融合位置反向污染独立测速实验。
 
 所有算法设计、数据采集、技术选型均围绕这两个目标展开。
 
@@ -35,39 +59,50 @@
 ## 三、项目核心功能
 
 ### 核心算法
-- **纯惯性测速**：自研 9 状态检测算法 + 主轴学习 + 重力补偿，从原始传感器数据中提取真实运动加速度，积分得到实时速度
-- **9 状态优先级**：`CURVE > CONDUCTION_VIB > STRONG_VIB > LOW_CONFIDENCE > IDLE > ACCEL > BRAKING > CRUISE`
-- **GNSS 锚点融合**：GNSS 信号良好时自动启用锚定模式，以 GNSS 速度为锚点叠加惯性增量（pure=0 模式）
+- **纯惯性测速**：8 类运行时运动状态检测 + 2 类生命周期状态、主轴学习与重力补偿，从原始传感器数据中提取真实运动加速度，积分得到实时速度
+- **8 类运行时优先级**：`CURVE > CONDUCTION_VIB > STRONG_VIB > LOW_CONFIDENCE > IDLE > ACCEL > BRAKING > CRUISE`；`Calibrating` 与 `Stopped` 不参与该优先级
+- **GNSS 锚点融合**：速度精度有效、速度高于误差量级且公开来源为 type 1/4 时建立可靠锚点，以 GNSS 速度叠加惯性增量（pure=0 模式）；传导振动和强振动不参与 GNSS 可靠性判定
 - **速度合成公式**：锚定速度 = GNSS锚点 + (当前纯惯性 - GNSS时刻纯惯性)
-- **信噪比切换**：`gnssSpeedKmh < speedAccuracyMps × 3.6` 时回退纯惯性，否则用锚点+增量
+- **速度/精度量级切换**：速度精度缺失/非正数或 `gnssSpeedKmh < speedAccuracyMps × 3.6` 时回退纯惯性；隧道内冻结最后一个可靠锚点的数值与可用状态，出隧后等待新可靠回调
 - **核心原则**：算法仅使用原始加速度计（含重力）+ 陀螺仪，自算重力+统计主轴学习，不依赖系统融合输出
 
 ### 关键特性
-1. **隧道模式**：用户手动拨动开关切换，入隧时冻结 GNSS 锚点，防止系统推算污染速度。已移除 `refreshGravityAtEntrance()` 调用（行驶中 preCalBuffer 无静止段，会把加速度当重力）
-2. **自适应停车校准**：只扫描按钮前 preCalBuffer（180 帧）内最优 75 帧静止段，重估重力后从零速锚重放后续帧；静止严格归零，按钮后立即起步仍保留增量
-3. **GNSS -40ms 固定延迟补偿**：所有记录一致显示 locationTimeMs 比传感器时间晚约 40ms，ArkTS 端在锚点采集时用速度历史缓冲区查找 40ms 前的惯性速度，Python 端通过 `--gnss-lag-ms=-40` 补偿
-4. **研究记录模式**：全量 50Hz 传感器数据 + GNSS 数据 JSONL 格式记录，支持导出离线分析
-   - **Schema v13**：sensor记录新增4个辅助传感器共17个字段，全部用于数据采集验证，**暂未接入算法**
-   - 新增字段：系统重力(sysGravityX/Y/Z)、系统线性加速度(linearAccX/Y/Z)、9DOF旋转矢量(rotVecX/Y/Z/W)、磁场(magX/Y/Z)，及各传感器时间戳
-   - 现有`gravityX/Y/Z`（estimator记录中）仍为算法自估计重力，与系统传感器输出分开记录方便对比
+1. **隧道模式**：用户手动拨动开关切换，入隧时冻结最后一个可靠 GNSS 锚点的数值和可用状态，隧道内的劣质定位回调不会停用冻结锚；出隧时先停用旧锚并等待下一次可靠回调，防止继续沿用过时速度。已移除 `refreshGravityAtEntrance()` 调用（行驶中 preCalBuffer 无静止段，会把加速度当重力）
+2. **自适应停车校准**：只扫描按钮前约 3.6 秒 preCalBuffer 内最优 1.5 秒静止段（至少 30 个样本），重估重力后从零速锚重放后续样本；静止严格归零，按钮后立即起步仍保留增量
+3. **GNSS 锚点与离线对比时序**：ArkTS 与 Python 锚点合成都在内部查询位置回调前 40 ms 的惯性历史；`--gnss-lag-ms=-40` 仅用于离线定位对比时移动参考时间，不改变锚点合成
+4. **研究记录模式**：按各传感器实际回调逐条写入 JSONL，支持导出离线分析
+   - **Schema v15（历史）**：新增 `sensor_callback` 记录，保存 `sensorType`、请求周期、传感器时间戳、回调时间戳及相邻间隔；估算器仍显式分开 `pureInertialSpeedKmh` / `displaySpeedKmh`
+   - **Schema v16（历史）**：保留上述节拍记录，采集加速度计、陀螺仪、旋转矢量、校准磁场、未校准陀螺仪和未校准磁场六类传感器，均请求 10ms（100Hz）；所有结论以记录中的实际回调时间戳为准
+   - **Schema v17（当前）**：沿用 v16 的六类传感器和节拍语义，新增独立 `device_health` 行；记录开始/结束各采样一次，运行中每 10 秒采样一次电池温度 `batteryTemperatureC` 与系统综合热等级 `thermalLevel`，不写入 100Hz 传感器行
+   - 不再订阅系统 GRAVITY 与 LINEAR_ACCELEROMETER：二者不参与 MetroSpeed 估算，也未在已分析的 HiGeo 1102a/1106 主输入链中出现；旧 v13/v15 日志与离线分析保持兼容
+   - 不采集气压与光照：它们没有被证明直接约束 MetroSpeed 一维纵向速度，且容易受天气、车厢环境与照明布局影响
+   - `gravityX/Y/Z`（estimator 记录中）仍为算法自估计重力，不是系统 GRAVITY 传感器输出
+   - 定位行可包含精确经纬度、海拔、速度、精度与卫星统计；设备健康行包含电池温度与系统热等级。README 与隐私政策必须完整说明这些数据只在用户主动记录时保存在本机且不会自动上传；定位权限理由说明位置与卫星数据用途。页面研究记录卡片保持精简，不重复长篇采集清单
+   - 本地只保留最近一次记录：新会话文件完成首行写入、刷新和状态确认后才删除旧记录；建立失败时回滚旧记录。导出使用异步分块复制，成功后保留源文件，失败时清理不完整目标
 
-### 辅助传感器数据采集（v13新增，仅记录不参与算法）
-为验证系统传感器融合误差特性、为隧道精度优化提供数据支撑，v13版本开始记录以下4个辅助传感器数据：
+### 研究传感器采集范围（v17 当前；v13/v15/v16 历史兼容）
+当前研究记录采集六类传感器，其中加速度计和陀螺仪参与测速，另外四类只用于研究对齐：
 
-| 传感器 | SensorId | API版本 | 输出 | 采集目的 |
-|--------|----------|---------|------|----------|
-| GRAVITY | sensor.SensorId.GRAVITY | API9+ | 重力向量(x,y,z) | 对比系统融合重力与自估计重力差异，验证"吃小加速度"问题 |
-| LINEAR_ACCELEROMETER | sensor.SensorId.LINEAR_ACCELEROMETER | API9+ | 线性加速度(x,y,z) | 验证核心假设：**系统重力 + 系统线性加速度 ≈ 原始加速度计读数** |
-| ROTATION_VECTOR | sensor.SensorId.ROTATION_VECTOR | API9+ | 四元数(x,y,z,w) | 9DOF融合含磁力计，分析磁干扰对姿态的影响 |
-| MAGNETIC_FIELD | sensor.SensorId.MAGNETIC_FIELD | API9+ | 磁场向量(x,y,z) | 测量隧道内实际磁干扰强度 |
+| 传感器 | 当前用途 | 请求周期 |
+|--------|----------|----------|
+| ACCELEROMETER | 驱动估算帧并逐回调记录 | 10ms |
+| GYROSCOPE | 稳定性/手持检测并逐回调记录 | 10ms |
+| ROTATION_VECTOR | 仅研究系统姿态与时间对齐 | 10ms |
+| MAGNETIC_FIELD | 仅研究磁场与系统链路 | 10ms |
+| GYROSCOPE_UNCALIBRATED | 仅研究原始值与 bias | 10ms |
+| MAGNETIC_FIELD_UNCALIBRATED | 仅研究原始值与 bias | 10ms |
+
+旧 v13/v15 曾采集 GRAVITY 与 LINEAR_ACCELEROMETER，用于验证系统融合重力、线性加速度与原始加速度的关系。相关历史数据和结论保留，但自 schema v16 起不再新订阅这两路派生信号。
+
+**未校准加速度计边界**：已分析的 HiGeo 1102a/1106 `InitConfig`、Sensor HDI 订阅、service 输入槽和缓存链中均未发现 `ACCELEROMETER_UNCALIBRATED`（ID 281），而校准/未校准陀螺仪和磁力计均有明确订阅。这是对这两个镜像变体主输入链的高置信静态结论；不能外推为 Pura 70 的 1105 或所有 HarmonyOS 版本都不采集。VDR 内部仍会估计加速度偏置，内部偏置状态也不等于订阅了未校准加速度计。
 
 **重要说明**：GAME_ROTATION_VECTOR（6DOF无磁旋转矢量）底层C API支持（ID=262，API13+），但**鸿蒙ArkTS公开API未暴露该SensorId常量**，普通应用无法直接订阅，相关死代码已全部清理，待后续API版本开放后再考虑支持。
 
 **实现细节**：
-- 所有传感器统一请求20ms间隔（50Hz），与加速度计/陀螺仪保持一致
+- 六类传感器均请求 10ms；实际 Hz 以 `sensorTimestamp` / `callbackTimestampMs` 计算
 - 每个传感器独立订阅，try-catch包裹，不支持时静默跳过，不影响其他传感器
-- 和陀螺仪相同的60ms新鲜度判断逻辑，过期数据不写入帧
-- 启动后状态文字显示所有可用传感器列表
+- 估算器由加速度计回调驱动，使用传感器时间戳计算 dt；研究记录不再把不同传感器强行拼成统一“帧率”
+- 启动后状态文字自然增高并完整显示所有可用传感器列表
 - DevEco已自动配置debug签名，直接点击运行即可自动签名安装到手机
 
 ### refreshGravityAtEntrance() — 已删除
@@ -79,7 +114,7 @@
 
 **详细步骤**：
 1. 标记 `parkingCalibrationPending` 并记录按钮时间；重复点击幂等，不重启窗口或增加计数
-2. 约 1.5 秒后只在按钮时间之前的缓冲帧中扫描最优 75 帧静止窗；短历史直接拒绝，不再用“当前时点强制归零”兜底
+2. 约 1.5 秒后只在按钮时间之前约 3.6 秒的缓冲中扫描最优 1.5 秒静止窗（至少 30 个样本）；短历史直接拒绝，不再用“当前时点强制归零”兜底
 3. 通过陀螺仪均值/最大值、加速度跳动、rmsDeviation、重力模长五道检查后更新 `gravityEstimate`
 4. 把静止窗作为零速锚，清空并预热低通/判态短窗，再以新重力逐帧重放静止窗之后的数据；保留主轴初始化、锁定和计数状态
 5. 若没有持续起步证据则速度严格置 0；若按钮后已起步则保留重放得到的真实增量
@@ -92,7 +127,7 @@
 **和普通校准的区别**：
 | 方面 | 普通校准 | 停车校准 |
 |------|---------|---------|
-| 数据来源 | 校准开始后的 1.5 秒 | 历史缓冲区里最优的 75 帧 |
+| 数据来源 | 校准开始后的 1.5 秒 | 按钮前约 3.6 秒缓冲中最优 1.5 秒窗（至少 30 样本） |
 | 速度处理 | 从零开始积分 | 静止窗归零并用新重力重放后段 |
 | 主轴处理 | 初始学习 | 保留既有主轴并按新重力正交化 |
 | 适用场景 | 启动时第一次校准 | 停车后主动校准，消除漂移 |
@@ -110,34 +145,30 @@
 ```
 MetroSpeed/
 ├── AppScope/
-│   └── app.json5                    # 应用配置（versionName: 1.1.2, versionCode: 时间戳）
+│   └── app.json5                    # 应用配置（versionName: 1.2.0, versionCode: 时间戳）
 ├── entry/
 │   └── src/main/ets/
 │       ├── entryability/EntryAbility.ets
-│       ├── pages/Index.ets              # 主界面 + 锚点逻辑
+│       ├── pages/Index.ets              # 并列测速方式首页
+│       ├── pages/InertialSpeed.ets      # 惯性测速界面 + 锚点逻辑
+│       ├── pages/TunnelLight.ets        # 灯光打点测速界面
 │       └── model/
 │           ├── SpeedEstimator.ets       # 惯性速度估算核心（仅用原始加速度+陀螺）
-│           ├── SensorController.ets     # 50Hz 加速度计+陀螺仪+4个辅助传感器
+│           ├── TunnelLightSpeedEstimator.ets # 灯光打点速度计算
+│           ├── SensorController.ets     # 六类 100Hz 请求传感器
 │           ├── LocationController.ets   # GNSS 定位 + 卫星状态
-│           ├── ResearchRecorder.ets     # JSONL 全量记录（schema v14）
-│           ├── BackgroundState.ets      # 后台记录状态共享
+│           ├── ResearchRecorder.ets     # JSONL 全量记录（schema v17）
+│           ├── BackgroundState.ets      # 后台测速/记录状态共享
 │           └── SpeedTypes.ets           # 类型定义、向量运算、四元数
 ├── tools/
 │   ├── replay_estimator.py             # 离线回放引擎 + 锚点v2 + --use-sys-gravity 分析开关 — 核心工具
-│   ├── _baseline_all.py                # 全量基线对比 (--dir --anchor-v2) — 临时诊断脚本
-│   ├── _tunnel_diag.py                 # 隧道分段MAE + 纯速度曲线 — 临时诊断脚本
-│   ├── _bias_diag.py                   # cal_0积分不对称 + 重力/主轴追踪 — 临时诊断脚本
+│   ├── _baseline_all.py                # 当前代顶层多记录回归（--dir/--files/--anchor-v2）
 │   ├── param_sensitivity.py            # 78参数敏感度扫描（默认 ±20%）— 通用工具
 │   ├── sync_version.py                 # 版本号 ArkTS ↔ Python 同步 — 通用工具
-│   ├── trim_cal_segment.py             # 裁剪校准段 — 通用工具
-│   ├── _scan_anchor_interval.py        # 锚点间隔多进程并行扫描 — 诊断工具
-│   ├── _check_gnss.py                  # GNSS检查脚本
-│   ├── _speed_profile.py               # 速度剖面分析
-│   ├── _speed_series.py                # 速度时间序列分析
-│   ├── _run_new_batch.py               # 批量多组参数对比 (--dir/--files) — 诊断脚本
-│   ├── _handheld_detector.py           # 手持检测离线验证（gyroRms + zeroCrossingRate）— 诊断脚本
-│   ├── _confidence_analysis.py          # 置信度延迟扫描 + 状态误差分析 — 诊断脚本
-│   ├── _confidence_calibrate.py         # 置信度全量标定（多进程）— 诊断脚本
+│   ├── aux_sensor_location_diag.py      # 传感器/GNSS 实际回调节拍诊断
+│   ├── hmos_image_inspect.py            # HarmonyOS ext4 镜像及压缩归档只读检索
+│   ├── hmos_elf_calls.py                # stripped ELF + mini-debug 直接调用恢复
+│   ├── test_*.py                        # 回放、记录和发布契约回归测试
 │   └── sign_app.ps1                    # 一键签名脚本
 ├── signing/                             # 签名文件（敏感，不提交）
 │   ├── release.p12                     # 密钥库（EC 256位）
@@ -145,7 +176,7 @@ MetroSpeed/
 │   └── releaseRelease.p7b              # Profile 文件
 ├── .trae/                              # AI 项目配置
 │   ├── rules/project_rules.md          # 项目规则
-│   ├── specs/gravity-sensor-integration/ # 重力传感器接入 spec
+│   ├── documents/harmonyos_tunnel_positioning_reverse_engineering.md # 隧道定位逆向主记录
 │   └── documents/investigation_status.md  # 研究状态（本文件）
 ├── hvigorfile.ts                       # 构建脚本（自动更新 versionCode）
 ├── build-profile.template.json5        # 构建配置模板（signingConfigs 为空，仓库只保留此模板）
@@ -158,7 +189,7 @@ MetroSpeed/
 
 **tools/ 目录命名约定**：
 - 正常命名（如 replay_estimator.py）：核心/通用工具，长期保留
-- `_` 下划线开头（如 _baseline_all.py）：临时诊断脚本，一次性/探索性的，用完可能会清理或合并
+- `_` 下划线开头：内部回归/诊断入口；当前 `_baseline_all.py` 由规则和测试明确保留，其余一次性脚本用完清理或合并
 
 ---
 
@@ -178,7 +209,7 @@ MetroSpeed/
 | 驾车_东靖路(短) | 3.21 | **0.13** | 城市短途 |
 | 驾车_东靖路-沪常高速(长) | 23.89 | **14.52** | 高速+隧道 |
 
-> pure MAE 为 pure inertial 模式 moving MAE，pure=0(-40ms) 为 anchor-v2 + pure-zero + GNSS lag 补偿。
+> pure MAE 为 pure inertial 模式 moving MAE；pure=0(-40ms) 使用 anchor-v2 + pure-zero，括号内 -40 ms 仅表示离线定位对比的参考时间偏移，锚点合成自身固定查询回调前 40 ms 的惯性历史。
 
 ### v13 全传感器记录
 | 记录 | pure MAE | pure=0(-40ms) | 辅助传感器 |
@@ -186,7 +217,11 @@ MetroSpeed/
 | 地铁_南京东路-豫园-老西门·新天地_20260629 | — | — | ✅ gyro/grav/la/rot/mag 15076帧全，已采集算法输出 |
 | 驾车_苏沪伪通勤_放置在充电位_20260630 | — | 正常段0.46 | ✅ 162753帧/4706定位/81min，延迟扫描-40ms |
 
-**传感器频率发现**：代码请求 50Hz（sensorIntervalMs=20ms），但实际系统输出只有 33~37 Hz。
+**传感器频率发现（分版本）**：
+- 旧 v13 记录中，应用请求 50Hz 时曾实测约 33～37Hz；这是旧版本/旧会话结果，不能代表当前实现。
+- 2026-07-28 的旧 schema v15 短记录约 20.5 秒：加速度计/陀螺仪约 100Hz，旋转矢量/校准磁场/未校准陀螺仪约 100Hz，重力/线性加速度/未校准磁场约 50Hz。
+- 当前 schema v17 沿用 v16 的六类 100Hz 请求传感器，并低频记录设备热状态。当前代主回归集已有三条：地铁 47.5MB、公交 465.3MB、驾车 866.3MB；尚待逐条分析长时 Hz、抖动、丢样、后台状态、发热与日志体积。
+- 上述是 MetroSpeed 应用回调实测，不是 HiGeo 私有 Sensor HDI 链的实测频率。
 
 **数据存放路径**：本地研究记录目录，不纳入版本控制
 
@@ -207,22 +242,22 @@ MetroSpeed/
    - **sec 210 重力变化（gy 4.308→4.908）是校准时车辆停在坡道导致**，不是行驶中漂移，且发生在 831 km/h 漂移之后
 3. **历史踩坑记录**：
    - 系统线性加速度传感器：0.1g起步加速被系统融合吃进重力估计，进入匀速后速度倒退回零——这也是为什么要采集数据验证"重力+线性加速度是否等于原始加速度"
-   - 未校准加速度计：系统bias恒为0，无法去偏
+   - 未校准加速度计：早期应用侧公开传感器试验中 bias 输出为 0，无法直接去偏，因此未接入；这不是“HiGeo 内部 bias 恒为 0”的证据，1102a/1106 主链未订阅 ID 281 与 VDR 内部自估 acc bias 也不矛盾
    - 陀螺仪积分旋转矩阵：MEMS零偏累积，几分钟后重力方向漂移速度爆炸
    - gyro gravity（ω×g）：同样受陀螺仪零偏影响，重力方向歪掉
 4. **核心教训**：加速度计本身分不清重力和0.1g的起步加速，任何依赖系统融合分离重力的输出都可能继承这层误差——必须先采集数据验证，不直接接入算法
 5. **GNSS -40ms 固定延迟**：全量记录一致显示 locationTimeMs 比传感器时间戳 ~40ms
-6. **传感器实际频率只有 33~37 Hz**：代码请求 50Hz，但系统实际输出达不到。
-7. **鸿蒙API坑**：GAME_ROTATION_VECTOR底层C API支持，但ArkTS公开API未暴露SensorId常量，普通应用无法订阅；LINEAR_ACCELERATION正确名称是LINEAR_ACCELEROMETER，响应类型是LinearAccelerometerResponse
-8. **API版本选择**：不升级API20，因为API20也不支持GAME_ROTATION_VECTOR，反而会导致Button等系统组件默认样式变化（自定义borderRadius在API12不生效，用系统默认胶囊形；API20自定义样式生效导致圆角变小），且之前beta API问题是DevEco Beta版导致的，不是API12本身问题
+6. **传感器频率必须按版本和证据轨描述**：旧 v13 与旧 v15 的 50Hz/33～37Hz 结论只属于历史记录；当前 schema v17 沿用 v16 的六类 100Hz 请求传感器且尚待长时实测。应用请求、应用回调、Sensor HDI 私有请求、硬件能力下限和 HiGeo 实际消费率不是同一指标。
+7. **鸿蒙API坑（历史）**：GAME_ROTATION_VECTOR底层C API支持，但ArkTS公开API未暴露SensorId常量；旧采集使用的 LINEAR_ACCELERATION 正确名称是 LINEAR_ACCELEROMETER，响应类型是 LinearAccelerometerResponse
+8. **API版本选择已更新**：当前 `compatibleSdkVersion=6.0.0(20)`、`targetSdkVersion=6.1.1(24)`，用于跟进系统版本而非解锁某个测速功能。升级后系统 Button 默认外观发生变化，胶囊按钮需由组件自身显式约束高度和 `borderRadius=高度/2`，不能再依赖 API12 的旧默认样式。
 9. **rawAcc ≈ sysGravity + linearAcc 已验证成立**：首条 v13 全传感器地铁记录（南京东路→新天地），15076帧上中位偏差 0.05 m/s²，|la|>0.5 加速段中位 0.12 m/s²。等式在地铁动态场景成立，系统传感器的拆分自洽。
 10. **地铁地板微振阻止初始校准**：列车停站时空调/铁轨传导的高频微振（~10-50Hz）导致加速度计 rmsDeviation=0.20，超过旧阈值 0.12。现象：设备放地铁地板上，用户按"开始"后几秒显示"开始失败：初始校准不稳"。陀螺仪无异常（gyroMax=0.048），重力值正常（9.81±0.004），纯 rmsDeviation 超标。
-11. **隧道模式阻止 GNSS 锚点导致长隧道惯性漂移**：苏沪伪通勤记录（81min）中 3 次手动入隧（44-65min，最长单段 8.5min），`tunnelState='inside'` 完全拒绝 GNSS 锚点更新（Index.ets#L171）。惯性在 8.5min 无锚点修正后漂移至 361 km/h，校准时达 831 km/h。正常段（排除隧道）锚点 v2 MAE = 0.46 km/h。隧道模式拒绝锚点是刻意设计——复刻鸿蒙系统隧道定位机制，漂移是纯惯性测速的固有限制。
-12. **鸿蒙系统隧道定位机制 = IMU 惯性推算**：苏沪伪通勤记录数据分析确认，系统在隧道内不是接收真实 GNSS 信号，而是 IMU dead reckoning。证据：入隧后 `satelliteFixCount` 从 71→5 并恒定，`satelliteCount=57` 全程不变，`accuracy` 从 5m 劣化到 40m 并精确卡住。推算持续约 7 分钟后置信度耗尽，降级到基站定位（srcType=2, speed=0, accuracy=141m）。偏离路网的原因是陀螺仪零偏导致航向积分累积旋转。
+11. **隧道模式阻止 GNSS 锚点导致长隧道惯性漂移**：苏沪伪通勤记录（81min）中 3 次手动入隧（44-65min，最长单段 8.5min），`tunnelState='inside'` 完全拒绝 GNSS 锚点更新；模式拆分后 gate 位于 `entry/src/main/ets/pages/InertialSpeed.ets`。惯性在 8.5min 无锚点修正后漂移至 361 km/h，校准时达 831 km/h。正常段（排除隧道）锚点 v2 MAE = 0.46 km/h。拒绝锚点是刻意的实验隔离：它防止可能的系统融合延拓点污染独立惯性口径，也会故意暴露 MetroSpeed 的纯惯性漂移；这不等同于复刻 HiGeo 的内部机制。
+12. **早期行程观测提示位置不宜按纯实时卫星解解释**：苏沪伪通勤记录中，入隧后 `satelliteFixCount` 从 71→5 并恒定、`satelliteCount=57` 全程不变、`accuracy` 从 5m 劣化并卡在 40m，约 7 分钟后该次行程转为网络位置（srcType=2, speed=0, accuracy=141m）。这些黑盒现象支持“输出可能包含延拓/融合或冻结状态”的假设，但单独不足以证明实时卫星解完全不存在。镜像逆向现已证明内部机制远不止 IMU：还包含 3D VDR、安装角、NHC、AI-VDR、地图/PF，以及 1106 的三轴磁序列 FastDTW。仅凭这条行程不能把约 7 分钟解释为 HiGeo 固定超时，也不能把轨迹偏差单因归结为陀螺零偏；它可能同时受变体、产品配置、地图/TMM 覆盖、姿态和上层 provider 选择影响。
 13. **系统重力传感器分场景结论**：`--use-sys-gravity` 模式对比（2 条 v13 记录）显示**地铁 NO-GO / 驾车有效**：
     - **地铁场景吃加速度（NO-GO）**：中位速度从 40.9 km/h 塌到 0.6 km/h——系统重力将地铁起步加速吃进重力分量，与 4 月踩坑一致
     - **驾车场景显著有效**：苏沪伪通勤记录（81min，含 3 次隧道段）anchor-v2+pure-zero 模式下，moving MAE 从 14.14 → 1.86 km/h（87%↓），bias 从 13.80 → 0.47 km/h，pure maxKmh 从 909 → 80 km/h
-    - **修正早期错误论断**：之前文档写"驾车改善实为系统自比不可信，系统重力隐含 GNSS 推算"——**此论断错误**。鸿蒙 GRAVITY 传感器是 9DOF 融合（加速度计+陀螺仪+磁力计），**不融合 GNSS 速度**；数据反证：若依赖 GNSS，隧道段（GNSS 失效）应突然变差，但系统重力模式隧道段 maxAbsKmh 仅 58（vs 默认 231），磁力计提供绝对航向参考抑制了陀螺仪零偏漂移
+    - **可证结论边界**：该驾车记录中，系统 GRAVITY 模式在低 satellite fix 区间没有突变，隧道段 maxAbsKmh 为 58（默认 231）。这只能证明该次回放改善没有随着卫星 fix 下降而消失；系统 GRAVITY 的内部输入、是否包含其他融合信号，以及改善究竟来自姿态、滤波还是偏置处理，现有应用数据不能判定
     - **当前状态**：驾车有效但地铁无效，差异来自运动模式不同（地铁起步加速被系统融合误判为重力分量），待研究场景自适应切换方案
 14. **`--adaptive-gravity` 分析层验证通过**：磁力计场景检测器 + 场景切换重力源，在两条数据完整的 v13 记录上验证：
     - **方案**：前 500 帧（~15s）采集磁力计 |mag| 滑窗 std 中位数，判定一次场景（阈值 2.5μT），之后不再切换。判定为驾车→全程启用系统重力，判定为地铁→全程自估重力
@@ -230,47 +265,79 @@ MetroSpeed/
     - **苏沪高速**（81min）：medianStd=2.01→判驾车→全程系统重力→anchored moving MAE=2.10（vs 默认 14.14，85%↓），接近 sys-gravity 的 1.86（差 0.24 来自前 15s 判定期用自估重力）
     - **设计演进**：逐帧切换不可行——磁力计 std 在地铁运行中频繁波动（175 次切换），任何切到驾车的帧都会让系统重力吃掉加速度，积分特性导致速度塌掉无法恢复。一次判定避开了所有逐帧切换问题
     - **市内驾车记录（07-03）数据缺失**：magX/sysGravityX 仅 0.0% 非空（15/109064 帧），原因是 c7ab07f 引入的辅助传感器丢失 bug，已修复，待重新采集验证
-15. **手持设备检测系统**（07-05 完成）：
-    - **方案**：40 帧滑窗（~0.8s）计算陀螺仪 RMS + 三轴 zeroCrossingRate。当前止血阈值 gyroRms > 0.5 + ZCR > 5/s + 40 帧（~0.8s）持续确认 → 触发手持
-    - **与车辆运动区分原理**：车辆急弯 RMS 可达 0.4 但零交叉率 ≈0.5/s（单方向转弯），手持零交叉率 37+ /s（手频繁换向）。路面颠簸 RMS 短暂升高但 ZCR 不高 + 0.8s 持续判决过滤
-    - **验证**：14 条记录（地铁×7、驾车×3、公交×3、磁浮×1）零误触发。唯一触发是真手持（公交记录中靠在车窗上触发）
-    - **UI**：SpeedPanel + StatsGrid 红色不透明（#DC2626）覆盖，三行引导文案："请将设备稳定放置，停车时重新开始测速，设备移动会中止测速"
-    - **行为**：触发后调用 `stopMeasurement()` 终止测速，传感器状态由研究记录传感器自然覆盖，永不自恢复。开始测速时重置所有手持检测缓冲区
+15. **手持设备检测系统的当前边界**（07-05 初版，07-06 证伪，07-28 时间化）：
+    - **当前实现**：约 780ms 陀螺仪窗口计算 RMS + 三轴 zeroCrossingRate；`gyroRms > 0.5` 且 `ZCR > 5/s` 连续约 800ms 后触发
+    - **证据状态**：07-05 的 14 条记录初筛曾看似零误触发，但 07-06 新公交硬质表面记录已证明底盘高频振动可造成多数误触；现有 RMS+ZCR 信号不能可靠区分底盘振动与手持晃动，且仍缺合格真手持数据集
+    - **UI**：触发后显示“持续晃动”提示，明确惯性测速已经停止，并引导手持用户切换到灯光打点测速
+    - **行为**：立即停止当前惯性测速；开始新测速时重置缓冲、怀疑计时和提示锁存。该检测仍不描述为已验证可靠的手持分类器，只将触发条件表述为“持续晃动”
 16. **置信度公式重写**（07-05）：基线 1.0、倍率衰减模型：时间衰减×状态倍率（弯道×3/加速×2/振动×4/传导振动×1.5）+ 陀螺噪声项。pureMode 双速率（锚点 3min 触底 / 纯惯性 2min 触底）。停车校准请求/拒绝不刷新成功校准时龄，只有确认成功才重置衰减基准。22.9万帧 14 条记录标定验证单调性成立（10%→56.7 vs 90%→9.2 km/h P90）。双端同步
 17. **传感器状态汇总**：`startAuxiliarySensors()` 由仅列出辅助传感器改为列出全部可用传感器（加速度计、陀螺仪、重力、线性加速度、旋转向量、磁力计），避免覆盖测速启动时显示的核心传感器信息
 18. **停止测速后记录传感器不重启 bug**：`sensorController.stop()` 关闭全部传感器后 `researchSensorActive` 未重置，导致 `startResearchSensors()` 的 `if (researchSensorActive) return` 短路。修复：`stopMeasurement()` 中加 `this.researchSensorActive = false`
 19. **adaptive-gravity ArkTS 双端落地→已移除**（07-06）：磁力计场景检测器从 Python 分析层落地 ArkTS SpeedEstimator——前 500 帧滑动 std 中位数判定场景，驾车启用系统重力 (useSysGravity=true)，地铁用自估重力。后经 4 条新记录验证被移除：公交浦东100路 medianStd=0.19→错判驾车→系统重力吃加速→速度崩坏（MAE 1.73→6.92↓300%）；驾车苏沪新记录 medianStd=2.82→错判地铁→漏掉增益。且系统重力在新版偏置已修复的驾车记录上增益微弱（0.72→0.66）
-20. **初始校准期间禁止停车校准**（07-06）：新增 `initialCalibrationDone` 标志位——初始校准（beginCalibration→preCalBuffer 75 帧完成）之前 caribrateAtStop 被拒止（ArkTS 返回"请等待初始校准完成"状态文本，Python 返回 False）。根因：初始校准期间点停车校准会覆盖 `calibrationUntilMs`，而 preCalBuffer 不足 75 帧导致后续所有校准失败
+20. **初始校准期间禁止停车校准**（07-06，07-28 时间化）：新增 `initialCalibrationDone` 标志位，初始校准完成前 `calibrateAtStop` 被拒止（ArkTS 返回“请等待初始校准完成”，Python 返回 False）。早期实现以 75 帧判断，07-28 的 100Hz 候选改为初始 1.5 秒内至少 30 个样本且覆盖至少 1000ms，避免采样率改变语义。
 21. **手持检测 RMS+ZCR 算法失效**（07-06 确认）：公交浦东100路硬质表面上 10 次 stop 中大部分由手持误触发。根因：底盘高频振动在三个轴上同时过零——所有记录 ZCR P50=20-35，ZCR>5 阈值形同虚设；gyro RMS 均值法用 8s 窗仍压不掉公交底盘的 gyro_mean_mag（P99=0.109 vs 车窗 P99=0.054，区间重叠）。真手持数据缺乏。v1.1.1 将 GYRO_RMS 临时上调至 0.5（max_streak=36<40）。
-22. **版本号纪律**（07-06 沉淀）：只有 SpeedEstimator 内部逻辑变更才改 ALGORITHM_VERSION；`sync_version.py` 同时检查 ArkTS、Python 和 README，并在写入前完成输入与四份 staged 文本验证
+22. **版本号纪律**（07-06 沉淀，08-01 修订）：SpeedEstimator 内部逻辑，或会改变产品显示结果的融合/锚点语义变更，都必须更换完整 ALGORITHM_VERSION；纯诊断、统计与非产品默认实验参数不更换。`rN` 只按实际公开分发的算法代次连续编号，不跳号；构建、签名或提交审核但尚未公开的候选不占正式号。内部快照由完整日期、可选 `-cN`、`appVersionCode` 和 Git commit 区分，日志以 `(algorithmVersion, appVersionCode)` 为构建级追溯键。历史日志和签名包中的旧标识不可改写，只能注明已替代。`sync_version.py` 同时检查 ArkTS、Python 和 README，并在写入前完成输入与四份 staged 文本验证
 23. **入隧重力刷新必须移除**（07-07 确认）：`refreshGravityAtEntrance` 用 3.6s 滑动窗口从行驶数据中扫"最像静止的 1.5s"，任意时刻调用都会把行驶加速度当重力。驾车浦东大道记录 gY 从 4.29→3.73 导致 10 分钟飙到 991 km/h。地铁同理——入隧时车在高速行驶，buffer 里没有静止段。入隧只需冻结 GNSS 锚点
 24. **手持停止需标记来源**（07-07）：`stopMeasurement` 增加 `reason` 参数，JSONL 中区分 `handheld` vs `manual` 停止
-25. **测速与研究记录均需后台连续采集**（07-10）：`BackgroundState` 分离 `measurementActive` / `recordingActive`，任一活动存在时 `EntryAbility` 启动 LOCATION 长时任务，不再暂停普通测速传感器。增加操作代次校验，权限请求返回后只继续当前有效会话；长时任务启动结果使用前后台 generation 校验，避免回前台后异步启动滞留；停止失败有界重试。长时任务启动失败时暂停传感器，回前台恢复。同步补齐 `SensorController.stop()` 遗漏的磁力计退订。此项不改 SpeedEstimator 算法，ALGORITHM_VERSION 不变
-26. **停车校准未保证归零/立即起步丢失**（07-10 修复）：旧实现仅做“当前速度−历史窗末速度”，没有用新重力重算后段，静止可从 1.47km/h 变成 1.73km/h；成功后还清空主轴。现改为按钮前静止窗零速锚 + 新重力后段重放，且请求不再重置积分时间基准。点击时冻结按钮前证据，避免 100Hz 回调在 1.5s 等待期挤掉 75 帧窗口；候选窗末帧必须在点击前 300ms 内，避免复用过旧静止段；拒绝不刷新成功校准时龄。确定性验证 50/100Hz 停稳严格归零、按钮后立即起步保留正速度、拒绝轨迹零扰动
-27. **应用生命周期与研究数据保全**（07-10）：GNSS 锚只在停车成功结果后归零；GNSS 速度精度缺失/非正数明确回退纯惯性；页面 emitter 在销毁时注销；后台采集状态变化会即时收口/重启长时任务。研究日志维持单份覆盖语义，开始新记录时清理旧会话并截断固定本地文件；导出与新记录互斥，成功复制后才删除捕获的本地源文件；写入失败会同步停止后台记录状态。异常中断、缺少 `stop_record` 或尾部不可读时保留完整性 sidecar，界面告警并以 `INCOMPLETE` 文件名导出
-28. **离线回放/工具链漂移**（07-10）：修复停车 event 零锚不可达、GNSS 可靠性 gate、pureMode 双速率、重复“测速已在运行”误重置、runId/measurementActive 缺失边界、appParity 漏检锚点参数、reset 丢参数、坏 JSONL/同路径覆盖/非原子输出/空锚点。回放保留 JSONL 追加顺序，不再按可回拨墙钟全局重排；锚点按位置回调顺序激活，只读取回调前最近 5 帧的 -40ms 样本；GNSS 对比按 `measurementRunId` 隔离，禁止跨测速段插值。基线无有效 GNSS 指标、无成功样本或任一失败现返回非零，参数扫描与当前 CLI 参数自动验真，多个诊断脚本直接崩溃和旧字段已修
+25. **测速与研究记录均需后台连续采集**（07-10，07-31 修订）：`BackgroundState` 分离 `measurementActive` / `recordingActive`，任一活动存在时 `EntryAbility` 启动 LOCATION 长时任务，不再暂停普通测速传感器。增加操作代次校验，权限请求返回后只继续当前有效会话；长时任务启动结果使用前后台 generation 校验，避免回前台后异步启动滞留；停止失败有界重试。位置仅请求 `LOCATION` 与 `APPROXIMATELY_LOCATION`，不声明或请求 `LOCATION_IN_BACKGROUND`；退到后台后的连续采集由 `KEEP_BACKGROUND_RUNNING`、`backgroundModes=location` 和 LOCATION 长时任务共同提供。长时任务无法启动或被系统取消时，不再暂停后自动续算，而是结束测速与记录、刷新日志并要求前台重新开始，避免把未知缺口计入连续测量。同步补齐 `SensorController.stop()` 遗漏的磁力计退订
+26. **停车校准未保证归零/立即起步丢失**（07-10 修复，07-28 时间化）：旧实现仅做“当前速度−历史窗末速度”，没有用新重力重算后段，静止可从 1.47km/h 变成 1.73km/h；成功后还清空主轴。现改为按钮前静止窗零速锚 + 新重力后段重放，且请求不再重置积分时间基准。点击时冻结按钮前约 3.6 秒证据，避免高频回调在 1.5 秒等待期挤掉静止窗；候选窗覆盖 1.5 秒且至少 30 样本，末样本必须在点击前 300ms 内。拒绝不刷新成功校准时龄。确定性验证 50/100Hz 停稳严格归零、按钮后立即起步保留正速度、拒绝轨迹零扰动
+27. **应用生命周期与研究数据保全**（07-10，07-31 修订）：GNSS 锚只在停车成功结果后归零；GNSS 速度精度缺失/非正数明确回退纯惯性；页面 emitter 在销毁时注销；后台采集状态变化会即时收口长时任务。研究日志维持单份保留语义，但不再先删旧文件：每次新建会话使用独立文件，完成头部写入、`fsync` 和导出状态刷新后才清理旧记录，失败则回滚旧状态。导出与新记录互斥，按 64 KiB 异步分块复制并周期让出 UI；成功后保留本地源文件及完整性 sidecar并允许重复导出，失败则删除或截断不完整目标。写入失败会同步停止后台记录状态。异常中断、缺少 `stop_record` 或尾部不可读时保留完整性 sidecar，界面告警并以 `INCOMPLETE` 文件名导出
+28. **离线回放/工具链漂移**（07-10，07-31 候选补齐）：修复停车 event 零锚不可达、GNSS 可靠性 gate、pureMode 双速率、重复“测速已在运行”误重置、runId/measurementActive 缺失边界、appParity 漏检锚点参数、reset 丢参数、坏 JSONL/同路径覆盖/非原子输出/空锚点。回放保留 JSONL 追加顺序，不再按可回拨墙钟全局重排；锚点按位置回调顺序激活，只读取回调前最近 5 帧的 -40ms 样本；GNSS 对比按 `measurementRunId` 隔离，禁止跨测速段插值。07-31 内部候选进一步与应用同步“隧道内冻结锚点可用状态、出隧失效等待新锚”和融合显示最高/平均速度。基线无有效 GNSS 指标、无成功样本或任一失败现返回非零，参数扫描与当前 CLI 参数自动验真，多个诊断脚本直接崩溃和旧字段已修
 29. **记录口径升级 schema v14**（07-10）：旧 schema v13 的 `estimatedSpeedKmh` 实为 GNSS 锚定后的界面显示速度，曾被离线工具误作纯惯性回归基准。v14 显式记录 `pureInertialSpeedKmh` / `displaySpeedKmh`，传感器行补齐 session/run/version 元数据并逐实际回调落盘；估算器回归按相邻 `recordSeq` 精确配对，不再跨缺失帧插值。旧 v13 只报告纯惯性比对不可用，不再产生伪差值
-30. **工程安全**（07-10）：`build-profile.json5` 已从 Git 索引移除并由 `.gitignore` 排除，本地文件保留；`sync_version.py` 使用进程锁、compare-and-swap、原换行保留与失败回滚防并发半写，并默认拒绝版本降级；`sign_app.ps1` 默认官方 `-pwdInputMode 1` 交互密码并阻止输出覆盖/路径别名。历史中的旧配置是否清理、签名材料是否轮换需按远端暴露情况单独决策
+30. **工程安全**（07-10，07-31 修订）：`build-profile.json5` 已从 Git 索引移除并由 `.gitignore` 排除，本地文件保留；`sync_version.py` 使用进程锁、compare-and-swap、原换行保留与失败回滚防并发半写，并默认拒绝版本降级；`sign_app.ps1` 默认官方 `-pwdInputMode 1` 交互密码并阻止输出覆盖/路径别名。07-31 移除签名脚本硬编码 compatible API 12：脚本改从实际/模板构建配置解析 compatible API，要求唯一且一致，并拒绝显式覆盖值不匹配。`.gitignore` 补充 JSONL、备份清单及常见密钥扩展名。历史中的旧配置是否清理、签名材料是否轮换需按远端暴露情况单独决策
+31. **HarmonyOS 隧道定位静态核心机制已还原**（07-26）：供给的 HarmonyOS 6.1.1 / API 24 镜像证明 1102a/1106 共享 3D VDR、安装角、NHC、Kalman 与带 LSTM 状态的 AI-VDR 代码主干；AI-VDR 接口为 208×6 IMU 窗 + 两个 88-float 循环状态，输出三轴速度/不确定度并进入 Kalman。1102a 的模型搜索路径与当前资产目录不一致，不能据此证明运行时成功加载。1106 进一步把隧道路网 PF、三轴磁序列 FastDTW/欧氏距离、参考 LLH 量测修正和道路/TMM 下载缓存接入主循环。manager 入口后的 PVT 调用与 IMU/磁场异步缓存已追踪，socket 输入是控制面；融合 PVT 回程通过 `Location:`、消息 8234 到达 `ReportMsgToSa(string)`/IPC transaction 1。外部 PVT producer、IPC 接收解析器、量产启停配置和标准 GNSS callback 仍未闭环。完整证据见独立主记录，不得把这些系统私有能力等同于 MetroSpeed 当前一维测速。
+32. **HiGeo 时限与版本边界**（07-26）：VDR/PDR DR time 是 `higeo.conf` 运行时字段，四个镜像和整个 SDK 都无有效配置，结构清零不能解释为固定秒数。独立保护包括“无 GNSS 且无 AI-VDR 更新累计 60 次检查”、未安装姿态 60 秒、离车和拿起/放下手机。两个 manager 按 `hi1102a`/`hi1106` 映射不同 service；镜像存在不代表 x86 模拟器或任意真机实际启用，量产值和变体选择只能由目标真机日志确认。
+33. **HiGeo 名义 100Hz 静态采样链**（07-28）：1102a/1106 manager 都对 acc、cal/uncal gyro、cal/uncal mag、rotation vector 硬编码请求 10,000μs，对 pressure/light 请求 50,000μs；`EnableSensor` 乘 1000 后调用 HDI `SetBatch`。回调逐 event 缓存，`SensorBufCombination` 以 acc 为时间线插值 gyro，`MainUpdate3dvdr`/`MainPredict3dvdr` 用相邻 acc 时间戳逐样本调用 VDR step。预处理默认批目标为 100 条，时间修复逻辑另按 10ms 推进；100 条本身不带 Hz 单位。AI-VDR 首次需 208 个有效特征行，之后每 16 行尝试一次推理。100Hz 是 1102a/1106 名义设计，不是 1105 真机实测，也不代表逐样本 dt 或 PVT tick 固定为 10ms。
+34. **Pura 70 1105 运行态边界**（07-28）：目标机是 ADY-AL10 / API24 / AArch64，GNSS 主进程为 `/vendor/bin/hignss_1105_ohos -normal`。两段持久 hilog 重复证明 GNSS 启动会执行 `SendXdrCsEnable`、下发 `$XdrCsVal...` 并进入 GNSS ext `MsgDataPackCommon`；这证明控制面链路，不证明 3D VDR/AI-VDR/PF/TMM 已运行。普通 shell 对进程 maps、vendor 载荷和配置目录受限，因此当前不能确认所加载变体、SetBatch 参数或产品 `higeo.conf`。
+35. **输出 receiver 检索缺口进一步收窄**（07-28）：新增解压 HAP/HSP/HAR/ZIP 条目检索；system 180 个归档/15,836 个条目、sys_prod 8 个归档/173 个条目均无不可读项，未命中精确 callback 描述符或 `ReportMsgToSa`。这只是更强的静态未命中，不是接收实现不存在；剥离/无字面量实现、动态产品模块和量产机差异仍未排除。
+36. **1.2.0 全量发布审查**（07-31）：修复隧道内劣质位置回调停用已冻结可靠锚点、融合大字速度与最高/平均统计口径不一致、停止后副速度残留、长时任务取消后跨未知缺口续算、手持窗口混用墙钟与传感器时间、灯光打点累计计数随五点窗口封顶等问题；灯光计时改用启动后单调时钟。研究记录改为传感器启动成功后才建文件，新旧记录事务化替换并异步分块导出；失败新会话残片持久隔离，导出文件关闭失败不再误报成功。补齐精确位置/卫星/设备热数据说明、关键无障碍标签和导航防重复触发；按最小权限原则移除 `LOCATION_IN_BACKGROUND`，保留 LOCATION 长时任务及失败安全中止。当时内部候选标识为 `anchor-delta-20260731-r5`，ArkTS/Python 回放与契约测试同步。34 项自动化测试、正式 release 构建、APP/HAP/Profile/代码签名及元数据验证均通过并提交 AppGallery，但该包尚未公开且已被 08-01 候选替代；包内旧标识保留为历史事实，不占正式算法代次。
+37. **GitHub 提交前清理**（07-31）：release 编译清单确认全部页面、模型与资源均有入口，不删除生产文件。移除只写不读字段、未使用参数/返回值和 Python import；删除已被现有工具覆盖的 `_check_gnss.py`、`_speed_profile.py`、`_speed_series.py`，以及仍按帧数实现、与当前 780ms/800ms 时间语义失配的 `_handheld_detector.py`。清理 DevEco/Hvigor/Python 缓存和旧 1785488071 构建产物，仅保留当时的 1785489243 提交包及其验签证据。改动不触及估算公式、阈值或状态机，算法版本不变；34 项测试、Python 编译、版本同步和 ArkTS release 编译均通过。
+38. **振动期间 GNSS 锚点恢复**（08-01）：传导振动与强振动只描述手机运动状态，不是 GNSS 可靠性证据；应用与 Python 回放同步移除该 gate，可靠位置回调仍按来源、速度精度、速度不低于精度误差量级和隧道状态判定。该变更会改变融合显示结果，成果定为当前发布候选 `anchor-delta-20260801-r4`；此前短暂使用的 `anchor-delta-20260801-r6` 仅为未公开内部标识。三条当前代记录的 A/B 结果见本轮回归结论。
+    - 地铁 12,243 个传感器样本：旧/新输出与 54 次锚点应用完全一致；没有可配对定位行，只能确认未引入变化，不能给出 MAE 结论。
+    - 公交 119,409 个传感器样本：锚点应用 41,352→74,258；all MAE 2.632→0.742 km/h（改善 71.81%），moving MAE 3.912→0.778 km/h（改善 80.12%），对应 maxAbs 分别改善 62.58% 和 74.27%。
+    - 驾车旧半份导出曾记录 223,259 个传感器样本：当时两版报告锚点应用 196,783→204,246、all MAE 162.747→151.449 km/h、moving MAE 183.071→169.974 km/h，并把 `anchorSpeed` p90 591.678→567.039 / max>2,200 误写成“原始定位速度异常”。08-01 复核确认该字段实际统计的是融合后的 `anchoredSpeedKmh`，不是原始 GNSS，因此原归因本身不成立。旧截断文件已不存在，不能把当前完整文件的字节范围称为与其完全相同的前缀；仅作补充核查，当前完整文件截至 908,394,074 字节的完整行前缀中，r4 replay pure max 97.3402 km/h、手机实录 pure max 97.3057 km/h、原始可用 GNSS max 123.9467 km/h，按公式理论上界 221.2869 km/h，也无法复现旧摘要。旧数值仅保留为当时工具输出，原始 GNSS 爆速归因正式撤回。
+39. **GitHub 提交前第二轮可靠性核查**（08-01）：
+    - 首次定位授权原先发生在估算器和传感器启动之后，授权操作会落入初始 1.5 秒校准窗。现改为先等待授权结果、核对操作代次，再以新的时间戳启动校准；拒绝定位仍可进入纯惯性测速，等待期间按钮显示“准备中”并防重复启动，页面离开后的旧授权结果不再写回状态。
+    - `SensorController.start()` 原先忽略陀螺仪订阅失败，只要加速度计成功就报告启动成功；缺失陀螺仪时校准运动门禁、状态检测和手持停止都会失真。现将校准陀螺仪设为惯性测速硬要求并保留具体错误；研究记录单独运行时允许明确降级为其他可用传感器，已有研究会话在测速尝试失败后恢复订阅而不被误停。核心/辅助订阅分别带代次门禁，即使系统 `off()` 失败，旧闭包也不能在重新订阅后复活。空闲应用退到后台也不再误发 `stopSensors`。
+    - 首轮真机日志又暴露出 `start()`/`stop()` 会对从未成功订阅的传感器调用 `off()`，产生无效退订并掩盖真实清理失败。现为六类传感器分别维护订阅所有权：只有 `on()` 成功后才允许 `off()`，成功退订后才清除标志；退订失败保留所有权并在下次启动前重试。核心残留未清理时拒绝重复订阅，可选辅助项的清理失败则单独降级并延后重试，不阻止核心测速。连续停止、测速与研究记录切换因此成为幂等操作。
+    - 离线回放的 `anchorSpeed` 摘要实际统计锚定显示速度，已新增无歧义的 `anchoredDisplaySpeed` 与 `rawEligibleAnchorSpeed`，旧键仅作带弃用标记的兼容别名。锚点时刻惯性历史改为随源行推进的 200ms 滑动窗，lag 扫描复用已分组输出，估算器行配对改为索引查找，消除三处重复全量扫描。
+    - 52 项自动化测试通过。三条当前代完整记录按 `--anchor-v2 --pure-zero --gnss-lag-ms=-40` 顺序回放：地铁 12,243 帧、无原始可用 GNSS、锚定显示 max 70.252 km/h；公交 119,409 帧、733 个原始可用锚点、原始 max 44.982 / 显示 max 44.941 km/h、moving/all MAE 0.758/0.734 km/h，用时 64.95 秒；驾车 451,770 帧、2,916 个测速段内且非隧道的原始可用锚点、原始 max 123.947 / 显示 max 123.946 km/h、moving/all MAE 7.242/7.014 km/h，用时 237.34 秒，输入均为 complete。产品 GNSS 门控未改，算法版本保持 `anchor-delta-20260801-r4`。当轮 `versionCode 1785595537` 的 module release `assembleHap` 完整通过（含 CompileArkTS/PackageHap/SignHap），HAP SHA-256 为 `42732EA5842F2C0ACD21FC93800A8E73798DD6307536546F495B5D4FBC2A2ABB`；使用本地调试 Profile 签名并完成短时真机回归，覆盖首次授权界面、定位拒绝、正常启停、研究记录单独/并行运行及模式切换，无效传感器退订未再出现。当时尚未执行项目级 APP 构建、正式发布签名或 AppGallery 重新提交；当前正式候选见第 40 项。
+40. **第二轮可靠性修复后的正式候选**（08-02）：基于当前源码完成工程级 release `assembleApp`，构建钩子生成 versionCode 1785602095；未签名 APP 为 339,149 字节，SHA-256 `BBC3D383C5B6657112B805E74DC5ECB54F653A69C934C465A3553BF1B4EA2710`。随后生成正式发布包 `MetroSpeed-1.2.0-1785602095-release.app`，353,233 字节，SHA-256 `9B071F681E8831A1C6C6DC7E8F02F930E23B3C70659A155745632252E0194E2B`；APP 外层摘要/签名、内部 HAP 摘要/签名/代码签名及内外一致的 release/app_gallery Profile 均独立验证通过。包内确认 `com.codex.metrospeed`、1.2.0/1785602095、compatible20/target24、compile SDK 6.1.1.125、`debug=false`、`buildMode=release`、`anchor-delta-20260801-r4`、schema v17，以及恰好五项预期权限且不含 `LOCATION_IN_BACKGROUND`。该正式 APP 后由用户提交 AppGallery，并因禁用按钮对比度问题被驳回；短时真机回归证据仍来自第 39 项的 debug Profile HAP。
+41. **全量核查修复后的正式候选**（08-02）：在定位订阅、研究记录导出与候选扫描修复及旧诊断脚本清理完成后，55 项自动化测试、Python 全量编译和版本同步检查通过；对最终源码唯一一次执行工程级 release `assembleApp`，生成 versionCode 1785644059。未签名 APP 为 339,874 字节，SHA-256 `1B6A96C683EE3048667A50F69A6A657097D7E93D602F2DF5D33A80723A0F0B05`；正式包 `MetroSpeed-1.2.0-1785644059-release.app` 为 353,881 字节，SHA-256 `8716A7C6865BC89477560E6963E29E39E69F2474EDBA6929232BEB654F87888A`。APP 外层摘要/签名、内部 HAP 摘要/签名/代码签名及内外一致的 release/app_gallery Profile 均独立验证通过；内部 HAP 为 466,558 字节，SHA-256 `4EAD48A3D8AE46D5E6D87246C1B63799CF0EAA98B2A3AAC2D360A18E8F9B6904`。包内确认 `com.codex.metrospeed`、1.2.0/1785644059、compatible20/target24、compile SDK 6.1.1.125、`debug=false`、`buildMode=release`、`anchor-delta-20260801-r4`、schema v17，以及恰好五项预期权限且不含 `LOCATION_IN_BACKGROUND`。当前 `release.p12` 的私钥口令已验证与密钥库口令相同；灾备清单以“同上（与密钥库密码相同）”正确记录这一关系。该 APP 未提交 AppGallery；对比度驳回证明它含相同修复前 UI，因此已被第 42 项源码淘汰。
+42. **AppGallery 禁用按钮对比度修复**（08-02）：AppGallery 对 versionCode 1785602095 的审核截图标出“停车校准”和“导出”，实际对比度分别为 1.86/1.84。两处设计色 `#94A3B8/#1E293B` 静态对比度约 5.70:1，根因是 `.enabled(false)` 触发 ArkUI 默认 0.4 禁用透明度；仅用 disabled `stateStyles.opacity(1)` 的首轮尝试在 Button 上仍被内部灰显，真机约 1.9:1，已撤销。最终实现不再让可见按钮进入系统禁用渲染，改用 `stateEffect`、`focusable`、`hitTestBehavior(BLOCK_DESCENDANTS)`、带“不可用”的无障碍文案和业务方法 guard 共同阻止操作；“准备中”文字改为 `#CBD5E1`，运行态红底改为 `#DC2626`。56 项测试、版本同步和 versionCode 1785651102 的 module release HAP 编译通过；HAP 为 465,183 字节，SHA-256 `79F3C5A888AFCF49E1B7AFAFCE0C6CECB6A150502CC892727FA7F2EB5E52B459`，已覆盖安装到真机。“停车校准”截图中背景主色为 `#1E293B`、文字代表像素约 `#96A3B6`，对比度约 5.64:1；“导出”禁用分支复用 `#94A3B8/#1E293B` 且不再经过系统禁用渲染，为保护现有 5267 条研究记录未强行制造空记录状态。`1785644059` 正式 APP 含修复前 UI，已失效。用户要求删除的本地 `1785602095` APP 已移入 Windows 回收站，验签证据未删除。
+43. **对比度修复后的正式候选**（08-02）：发布前 56 项自动化测试、Python 全量编译、版本同步和差异检查通过；对最终源码唯一一次执行工程级 `assembleApp`，生成 versionCode 1785651334。未签名 APP 为 340,620 字节，SHA-256 `0452D6E25E07A1E7D0ACD587A366507B3279682033C68876169B36BA1C7E371D`；正式包 `MetroSpeed-1.2.0-1785651334-release.app` 为 354,573 字节，SHA-256 `6A448A6DA0826124CA43C4FAF3F308F3F86AECC95B7780F59B79AD532D67431C`。内部 HAP 为 465,126 字节，SHA-256 `D35BBE401582937F022CBFE42604E9A71350A495C78FBA3ACEA2CFC70F371A38`。APP 外层摘要/签名、内部 HAP 摘要/签名/代码签名及内外一致的 release/app_gallery Profile 均独立验证通过；包内确认 1.2.0/1785651334、compatible20/target24、compile SDK 6.1.1.125、`debug=false`、`buildMode=release`、算法 r4、schema v17，以及恰好五项预期权限且不含 `LOCATION_IN_BACKGROUND`。首次验签包装器因工具把缺少可选 `outproof` 写到 stderr 而被 PowerShell `Stop` 模式中断，92 字节原始警告已保留；随后使用不升级该警告的包装方式完整重跑并全绿。原始验签、Profile、解包元数据、ABC 反汇编、真机截图和汇总 JSON 位于 `verify-1785651334-final`。随后“定位状态”标题被改为“隧道模式”，因此该包已由第 44 项源码淘汰，只保留作构建与验签证据，不得提交。
+44. **隧道开关首轮语义修正**（08-02）：原卡片标题“定位状态”会把手动隧道开关与底部真实定位运行状态混为一谈，首轮改为“隧道模式”；说明仍为“入隧时开启，出隧后关闭”，底部继续独立显示“定位未启动”等运行状态。57 项自动化测试、Python 编译、版本同步和差异检查通过；versionCode 1785653378 的本地签名 HAP 构建成功并覆盖安装，保留手机内研究记录。HAP 为 784,234 字节，SHA-256 `86DA4669ED2D523763DA96E6934A5B1BDBBF11D96F0AE42C28C78183D29B1F82`；真机截图为 `build/outputs/default/metrospeed-tunnel-label-1785653378.jpeg`。真机复核后确认“隧道模式”及“入隧时开启”仍可能被理解为提高隧道测速精度，因此又被第 45 项源码淘汰。
+45. **锚点冻结实验属性显式化**（08-02）：开关改按真实机制命名为“GNSS 锚点冻结”，关闭态说明固定为两行“仅供对照实验 / 停止刷新锚点，可能增加漂移”，开启反馈明确“不保证提高精度”；无障碍文案同步改为开启/关闭锚点冻结和恢复刷新，不再使用“标记为隧道内”等场景推荐语言。versionCode 1785654429 的本地签名 HAP 构建成功并覆盖安装，保留手机内 123 条研究记录；HAP 为 784,131 字节，SHA-256 `E138C78EFAF35417A188371AB8ED90ED62D22931661449650C55A4B2C6AE2BAF`。关闭态真机截图为 `build/outputs/default/metrospeed-anchor-freeze-1785654429.jpeg`；本轮尚未重新构建正式 APP。
+46. **锚点冻结与定位状态视觉解耦**（08-02）：原实现开启锚点冻结时把整张卡片背景从 `#0F172A` 改为 `#3A2711`，使同一卡片底部的“定位未启动”等真实定位状态也像发生了变化。现固定卡片背景为 `#0F172A`，只保留 Toggle 自身的 `#F59E0B` 开启色；契约测试禁止再次按 `tunnelSwitchOn` 改变卡片背景。versionCode 1785654694 的本地签名 HAP 构建成功并覆盖安装，研究记录保留；HAP 为 784,189 字节，SHA-256 `9376DF2A3120432FE05EE7FCC165F2F354976E1408C9BF6CD380C875F6E6CE84`。关闭/开启态真机截图分别为 `build/outputs/default/metrospeed-anchor-fixed-off-1785654694.jpeg` 和 `build/outputs/default/metrospeed-anchor-fixed-on-1785654694.jpeg`，开启态布局树同时确认 Toggle `checked=true`。本轮尚未重新构建正式 APP。
+47. **实验卡片合并方案**（08-02）：用户确认第 46 项把整张卡片固定为不变属于过度修正。现将“GNSS 锚点冻结”并入研究记录卡片，开启时整张实验卡片使用 `#3A2711`，关闭时使用 `#0F172A`；`locationStatus` 改为研究卡片下方独立的固定深色状态条。手动开关反馈不再写入 `locationStatus`，而由锚点冻结说明自身短暂显示，避免真实定位状态文本也被实验动作污染。57 项自动化测试、Python 编译、版本同步和差异检查通过；versionCode 1785655255 的本地签名 HAP 构建成功并覆盖安装，HAP 为 783,383 字节，SHA-256 `97B4E04BDD2B7D4A9BBE5C1AD81C0B7D215D30D86B0649A9F99B4FA482365B05`。关闭/开启态真机截图分别为 `build/outputs/default/metrospeed-research-anchor-off-1785655255.jpeg` 和 `build/outputs/default/metrospeed-research-anchor-on-1785655255.jpeg`；布局树确认开启态 Toggle `checked=true`，实验卡片整体变色而独立定位状态条保持深色，截图后开关已恢复关闭。本轮尚未重新构建正式 APP。
+48. **定位状态保留在合并卡片内**（08-02）：用户澄清第 47 项不应把定位状态拆为独立状态条；目标是研究记录、GNSS 锚点冻结和定位状态都处于同一卡片，并由锚点冻结控制整卡背景。现将 `locationStatus` 放回研究卡片底部，开启时随整卡显示 `#3A2711`，关闭时显示 `#0F172A`；仍保留第 47 项“开关反馈不写入定位状态文字”的语义修正。57 项自动化测试、Python 编译、版本同步和差异检查通过；versionCode 1785655778 的本地签名 HAP 构建成功并覆盖安装，HAP 为 783,880 字节，SHA-256 `4F05987EC7678E168C32D8236BA57095ABC0934F622EE232F406687B24481783`。关闭/开启态真机截图分别为 `build/outputs/default/metrospeed-research-anchor-status-off-1785655778.jpeg` 和 `build/outputs/default/metrospeed-research-anchor-status-on-1785655778.jpeg`；布局树确认开启态 Toggle `checked=true`，截图后开关已恢复关闭。本轮尚未重新构建正式 APP。
+49. **实验卡片布局不变的视觉优化**（08-02）：不改变研究记录/锚点冻结/定位状态的顺序、尺寸、间距和卡片结构，只调整视觉层。开启背景由偏重的 `#3A2711` 改为 `#251E16`，增加 `#A36D22` 细描边；开启态次级文字改为 `#B8C2D0`，分隔线改为 `#8E6A35`。研究记录主标题强化，GNSS 标题降为内部控制层级；“导出”由实心橙色改为 `#172033` 深色底、`#B7791F` 描边和 `#FBBF24` 文字，避免与橙色开关争夺焦点。开启态标题/正文/开关相对背景的对比度分别为 15.73/9.14/7.66:1，边框与分隔线为 3.74/3.34:1。57 项自动化测试、Python 编译、版本同步和差异检查通过；versionCode 1785658240 的本地签名 HAP 构建成功并覆盖安装，HAP 为 783,197 字节，SHA-256 `21D3C7C841C70CC4C298647AA2C2DE4187CADBEEBE9C1A797527119E8066A09E`。关闭/开启态真机截图分别为 `build/outputs/default/metrospeed-polished-card-off-1785658240.jpeg` 和 `build/outputs/default/metrospeed-polished-card-on-1785658240.jpeg`；布局树确认开启态 Toggle `checked=true`，截图后开关已恢复关闭。本轮尚未重新构建正式 APP。
+50. **导出按钮改为中性实心次级样式**（08-02）：保持按钮尺寸、位置和交互逻辑不变，将可用态由深色底、琥珀描边和琥珀文字改为 `#334155` 石板灰实心背景与 `#E2E8F0` 文字，移除描边；禁用态继续使用已通过对比度修复路径的 `#1E293B/#94A3B8`。这样青色“开始记录”继续承担主操作，橙色仅用于锚点冻结开关。57 项自动化测试、Python 编译、版本同步和差异检查通过；versionCode 1785658857 的本地签名 HAP 构建成功并覆盖安装，保留应用数据。HAP 为 783,472 字节，SHA-256 `184B20242D74739878883E0ADDC61BEA603A3462A878E72D75A230C2A1E3E3E7`。关闭/开启态真机截图分别为 `build/outputs/default/metrospeed-neutral-export-off-1785658857.jpeg` 和 `build/outputs/default/metrospeed-neutral-export-on-1785658857.jpeg`；截图后开关已恢复关闭。本轮尚未重新构建正式 APP。
+51. **导出按钮恢复明确可点击的轮廓感**（08-02）：第 50 项石板灰实心方案真机观感接近置灰，已由当前源码淘汰。按钮尺寸、位置和交互逻辑仍不变；可用态改为 `#12383D` 深青背景、`#67E8F9` 亮青文字和 `#2A958E` 描边，禁用态继续使用 `#1E293B/#94A3B8` 与 `#334155` 描边。可用态文字对背景为 8.73:1，描边对按钮底为 3.49:1、对关闭/开启卡片背景分别为 4.92/4.54:1。57 项自动化测试、Python 编译、版本同步和差异检查通过；versionCode 1785659388 的本地签名 HAP 构建成功并覆盖安装，保留应用数据。HAP 为 464,487 字节，SHA-256 `68972107AB552E144F22780239A972D73A0F9A400A720E4A51EC168A4B336428`。设备随后自动锁屏，应用无法由开发模式远程解锁启动，待用户解锁后补真机截图。本轮尚未重新构建正式 APP。
+52. **导出按钮恢复 1.1.2 原色**（08-02）：从 `v1.1.2` 标签提交 `4289184` 的 `Index.ets` 精确核对原值，可用态为 `#F59E0B` 背景与 `#0B1020` 文字，禁用态为 `#1E293B/#94A3B8`，且原版无描边。当前实现恢复这组原色并移除第 51 项青色描边，但保留 1.2.0 的 Capsule 外形、尺寸、位置、无障碍文案和绕开系统 `.enabled(false)` 灰显的交互门禁。57 项自动化测试、Python 编译、版本同步和差异检查通过；versionCode 1785659833 的本地签名 HAP 构建成功并覆盖安装。HAP 为 464,678 字节，SHA-256 `001B1909A601DDD566585D343538C7956F0F56D54B79091439E08F3933EEA8EA`。真机截图为 `build/outputs/default/metrospeed-export-v112-inertial-1785659833.jpeg`，确认橙色导出按钮具有明确可点击感。本轮尚未重新构建正式 APP。
+53. **恢复原色后的最终正式候选**（08-02）：对最终源码执行 57 项自动化测试、Python 全量编译、版本同步和差异检查后，只执行一次工程级 release `assembleApp`，生成 versionCode 1785660666。未签名 APP 为 340,999 字节，SHA-256 `9C556D2D3A4799718FB198F53B256AD13FDC5FB01B1004B4D59313C7B4226255`；正式包 `MetroSpeed-1.2.0-1785660666-release.app` 为 354,877 字节，SHA-256 `1DCF1D428A7AFE595637F9A2E4D32B8BF00A6F89674AB31FECC550D524A1D209`；内部 HAP 为 464,625 字节，SHA-256 `470F675450F2B796B6D76DA8A83428962E91E010BA08A131ACA7472F31EBD85D`。APP 外层摘要/签名、内部 HAP 摘要/签名/代码签名及内外一致的 release/app_gallery Profile 均独立验证通过；包内确认 `com.codex.metrospeed`、1.2.0/1785660666、compatible20/target24、compile SDK 6.1.1.125、`debug=false`、`buildMode=release`、算法 r4、schema v17，以及恰好五项预期权限且不含 `LOCATION_IN_BACKGROUND`。首次验签包装器仍因可选 `outproof` 警告在 PowerShell `Stop` 模式下中断，92 字节原始警告已保留；改用不升级该警告的包装方式后全套验签通过。原始验签、Profile、解包元数据、ABC 反汇编、同源码真机截图和汇总 JSON 位于 `verify-1785660666-final`。该正式签名包不能通过 HDC 安装，只能提交应用市场。
 
 ### 技术要点
 - **时间源**：`computeDeltaSeconds` 优先 sensorTimestamp，其余用 Date.now()（墙上时间语义），双轨正确
+- **灯光打点时间源**：使用系统启动后单调时钟，避免用户调整系统时间导致间隔回拨；累计打点数与最近 5 个时间点滑动窗口分离
 - **双端一致**：估算器配置与逐帧逻辑一致，`ALGORITHM_VERSION` 由 `sync_version.py --check` 在 ArkTS、Python、README 三处验证。分析层可自由扩展
-- **LocationSourceType**：1=GNSS, 4=RTK，`tunnelState !== 'inside'` 是防系统推算冒充的唯一防护
+- **LocationSourceType**：1=GNSS, 4=RTK；公开枚举没有 VDR。`tunnelState !== 'inside'` 是当前实验中保守隔离可能融合延拓点的 gate，不是对系统内部来源的鉴别器
 - **传感器类功能开发流程**：必须遵循"先在研究记录中加字段采集数据→观察实际数据表现→再决定是否接入算法"，禁止在没有数据支撑的情况下直接修改算法
-- **UI兼容性**：API12下Button组件自定义borderRadius不生效，使用系统默认胶囊形，不要手动设置圆角数值，升级API版本后需要重新验证所有组件样式
+- **UI兼容性**：当前已升级 compatible20/target24，系统 Button 默认样式不能再作为胶囊形保证；胶囊按钮应显式固定高度并设 `borderRadius=高度/2`，入口卡片与操作按钮按语义分别实现并做真机截图验收
 - **replay_estimator.py 分析层开关**：`--use-gyro-gravity`（陀螺仪重力追踪，已验证失败）、`--use-sys-gravity`（系统重力替代自估重力，地铁 NO-GO / 驾车在偏置未修复时有效，偏置修复后增益微弱 0.72→0.66）、`--adaptive-gravity`（磁力计场景检测器，4 条新记录验证失败，已从 ArkTS 移除但分析层开关保留）
+- **JSONL 完整性口径**：`replay_estimator.py` 默认严格失败；仅显式 `--allow-truncated-tail` 时可忽略唯一的、无行终止符且 JSON 解码失败的 EOF 尾行。中间损坏、带换行的损坏末行、非对象或字段校验错误仍失败，原文件不修改；summary 必须以 `inputIntegrity.complete=false` 和被忽略行号/字节数标记输入不完整
 
 ---
 
 ## 七、签名与上架
 
-**签名文件**（`signing/` 目录，不提交 git）：`release.p12`（EC 256 位密钥库）、`release.cer`（发布证书）、`releaseRelease.p7b`（Profile）。`sign_app.ps1` 默认使用官方交互密码模式；仅显式 `-NonInteractivePassword` 时读取 `METROSPEED_KEYSTORE_PASSWORD`，且受 hap-sign-tool 接口限制会出现在 Java 进程参数中。
+**签名文件**（`signing/` 目录，不提交 git）：`release.p12`（EC 256 位密钥库）、`release.cer`（发布证书）、`releaseRelease.p7b`（Profile）。`sign_app.ps1` 默认使用官方交互密码模式；仅显式 `-NonInteractivePassword` 时分别读取 `METROSPEED_KEYSTORE_PASSWORD` 与 `METROSPEED_KEY_PASSWORD`（密钥密码缺失时兼容回退到密钥库密码），且受 hap-sign-tool 接口限制会出现在 Java 进程参数中。当前 `release.p12` 的私钥口令与密钥库口令相同；灾备清单中的“同上（与密钥库密码相同）”是对这一关系的正确说明。
 
 **debug 签名**：DevEco Studio 自动配置，直接点运行即可。`build-profile.json5` 已移出版本控制，仓库只保留 `build-profile.template.json5` 模板。首次 clone 后需复制模板再让 DevEco 填充签名。
 
 **构建与签名命令**见 `project_rules.md` 2.2 节。release 签名的包不能 hdc install 直接安装，只能通过应用市场分发。
 
-**当前状态**：AppGallery v1.1.1 已发布；v1.1.2 可靠性修复候选正在完成发布构建、正式签名与真机回归。
+**当前状态**：AppGallery 当前公开包的算法仍为 `anchor-delta-20260710-r3`。versionCode 1785602095 的 1.2.0 审核因禁用按钮对比度不合格被驳回；其本地 APP 已按用户要求移入回收站，历史哈希与验签证据保留。当前正式候选为 `MetroSpeed-1.2.0-1785660666-release.app`，354,877 字节，SHA-256 `1DCF1D428A7AFE595637F9A2E4D32B8BF00A6F89674AB31FECC550D524A1D209`，已完成同源码真机 UI 复检、正式签名和全套独立验签，并已提交 AppGallery 复审。
 
 ---
 
@@ -278,10 +345,10 @@ MetroSpeed/
 
 完整规则见 `.trae/rules/project_rules.md`。关键约束：
 - **Python-ArkTS 一致性**：`SpeedEstimator` 类 bug-for-bug 复现，分析层可自由扩展
-- **算法改动必须全量验证**：所有 JSONL 记录跑 baseline 对比，不得仅凭单条记录
+- **算法改动必须覆盖当前代主回归集**：完整回放研究记录根目录中的地铁、公交、驾车三条当前记录；`50Hz/`、`旧记录/` 等历史档案只在兼容性、缺失场景或专项复核需要时补跑，不得仅凭单条记录
 - **传感器开发流程**：先采集数据观察，再决定是否接入算法
 - **代码修改纪律**：任何修改等用户明确指令后再执行
-- **不轻易升级 SDK**：API12 稳定，升级会导致组件样式变化
+- **SDK 版本已升级并固定验证口径**：当前 compatible20/target24；升级会改变系统组件默认样式，后续变更需同步做真机 UI、权限和行为回归
 
 ---
 
@@ -296,7 +363,7 @@ MetroSpeed/
 | 06-29 09:49 | 上架通过 | AppGallery 审核通过（versionCode=1782556056），"地铁测速" 1.0.0 正式上架 |
 | 06-29 | 数据验证+阈值调整 | 首条 v13 地铁记录：rawAcc ≈ sysGravity + linearAcc 成立；地铁地板微振 rmsDeviation=0.20 超标，阈值 0.12→0.25 |
 | 06-30 | 长途驾车验证 | 第 2 条 v13 记录：苏沪伪通勤 81min/162753帧；正常段锚点 v2 MAE=0.46；3 次入隧惯性漂移至 831 km/h |
-| 07-02 | 重力传感器分析 | `--use-sys-gravity` 分析工具；分场景对比：地铁 NO-GO（中位 40.9→0.6），驾车有效（MAE 14.14→1.86，87%↓）；确认系统隧道定位为 IMU 惯性推算 |
+| 07-02 | 重力传感器分析 | `--use-sys-gravity` 分场景对比：地铁 NO-GO（中位 40.9→0.6），驾车记录改善（MAE 14.14→1.86，87%↓）；当时依据单次行程作出 IMU-DR 初判，07-26 镜像逆向已修正为多约束 HiGeo VDR 融合链 |
 | 07-02 | 隧道漂移根因验证 | 修正早期"重力估计漂移"错误根因，确认实际为纯惯性积分误差累积（重力/主轴在隧道内均稳定） |
 | 07-03 | 发布 1.0.1→1.1.0 | ①校准阈值放宽 ②传感器按需启动 ③schema v13 ④权限文案 ⑤长记录读取优化；1.0.1 上架后发现状态文本 bug，引入手持防呆后升为 1.1.0 |
 | 07-03 | 坡道偏置根因分析 | 新驾车记录 baseline MAE=156 km/h 崩溃；根因：下坡入地时 gY 偏移 0.51 m/s²，互补滤波冻结错误重力 1200 秒；校准 #7 坡道偏置 Δ=-0.35 m/s²（≈2°）；算法盲区：只验证传感器静止，不验证路面水平 |
@@ -304,7 +371,7 @@ MetroSpeed/
 | 07-04 | `--adaptive-gravity` 验证 | 分析层实现磁力计场景检测器 + 一次判定切换；地铁零劣化，苏沪高速 85%↓；逐帧切换不可行，一次判定解决 |
 | 07-04 | 辅助传感器丢失 bug 修复 | c7ab07f 引入回归：`start()` 内部 `stop()` 停掉辅助传感器后 `startMeasurement()` 漏恢复；修复：成功后若研究记录在运行则调 `startResearchSensors()` |
 | 07-04 | UI 文案优化 + 1.1.0 构建 | 状态文本去"研究"二字；灰色提示补充上下坡/姿态限制说明；构建签名 1.1.0 release 包 |
-| 07-05 | 手持检测系统 | 陀螺仪 RMS + zeroCrossingRate 双指标滑窗检测，40 帧确认触发，14 条记录零误触发。触发 stopMeasurement() + 红色不透明覆盖 SpeedPanel/StatsGrid，永不自恢复 |
+| 07-05 | 手持检测系统初版 | 陀螺仪 RMS + zeroCrossingRate 双指标滑窗检测；当日 14 条记录初筛未见误触。07-06 新公交硬质表面数据随后证伪其区分能力；07-28 改为时间窗并在触发后引导灯光打点测速 |
 | 07-05 | 置信度重写/传感器/文案 | ①置信度倍率衰减模型（基线 1.0、弯道×3/加速×2/振动×4、pureMode 双速率、3min 触底、校准不重置）；②传感器状态汇总、停止后重启 bug 修复、启动失败后 researchSensorActive 复位；③文案优化（三行引导、底部精简）；④22.9万帧标定验证 |
 | 07-06 | adaptive-gravity ArkTS 落地 | 磁力计场景检测器从 Python 分析层 → SpeedEstimator.ets；前 500 帧 mag std 中位数判定场景（阈值 2.5μT）；驾车启用 `useSysGravity=true`（系统重力不冻结、持续修正），地铁保持自估重力；`calibrateAtStop`/`refreshGravityAtEntrance` 增加 `useSysGravity` guard；SensorController 将磁力计+重力提升为核心传感器 |
 | 07-06 | 初始校准停车校准保护 | 新增 `initialCalibrationDone` 标志位；preCalBuffer 不足 75 帧时 `caribrateAtStop()` 被拒止，ArkTS 显示"请等待初始校准完成"；`applyParkingZero()` 成功后置 `initialCalibrationDone=true` |
@@ -317,25 +384,61 @@ MetroSpeed/
 | 07-08 | 发布 1.1.1 最终包 | 签名、同步 README 应用介绍、commit 规范写入项目规则、移除过时计划文档 |
 | 07-10 | 全量可靠性修复 | 停车校准改为按钮前近期静止窗 + 新重力后段重放；初始样本保护；测速/研究后台连续采集；GNSS 仅成功归零且无有效精度时回退；研究日志 schema v14/单文件覆盖与完整性标记；回放按 run 和真实回调时序隔离；诊断工具、版本同步和签名脚本系统性修复；本地 build-profile 正式解除 Git 跟踪 |
 | 07-11 | v1.1.2 发布候选 | versionName 切换至 1.1.2；算法版本 `anchor-delta-20260710-r3`；开始发布构建、正式签名与真机验收 |
+| 07-26 | HarmonyOS 隧道定位镜像逆向 | 哈希并只读解析 API 24 镜像；恢复 HiGeo mini-debug 符号和直接调用图；还原 3D VDR/NHC/LSTM AI-VDR、1106 隧道路网 PF、三轴磁 FastDTW、资产下载、消息 8234 输出和安全退出的静态链路；完成 1102a/1106 差异与静态/运行时边界文档，产品算法未改 |
+| 07-28 | 并列模式/API24/100Hz 时间化 | 打点测速与惯性测速改为首页并列入口；compatible20/target24 下重做胶囊按钮；惯性估算改为加速度计驱动请求 100Hz，滤波/主轴/校准/手持窗口改用时间语义；研究日志 schema v15 记录逐传感器实际回调节拍。当时曾使用内部临时标识 `anchor-delta-20260728-r4`，未构建发布包；该完整标识保留为历史快照，但不代表正式 r4 已公开 |
+| 07-28 | HiGeo 采样链与 Pura 70 核查 | 1102a/1106 镜像确认核心 IMU/磁场/RV 请求 10ms、气压/光照 50ms，VDR 按 acc 时间线逐样本传播，AI-VDR 为 208 行窗口/16 行步进；量产机运行 `hignss_1105_ohos` 并在 GNSS 启动时下发 XDR 控制。严格分离静态请求、应用实测、1105 实际回调与 PVT 节拍 |
+| 07-29 | 1.2.0 发布包构建 | versionName 1.2.0、versionCode 1785303081；修复灯光间距编辑后旧结果暂时残留、首屏入口底部间距和传感器状态截断；持续晃动改为不强制停测的单次提示；研究日志升级 schema v16，移除系统重力/线性加速度新采集并保留旧日志兼容；正式 APP 已完成 release Profile 内外双重签名与验签，SHA-256 `BCAAA3940E59BF83B5263EE67624AC20BEB13149EFAEEAE7C9C38A7F6EC3020E`；未完成实车、锁屏与长时验收 |
+| 07-30 | schema v17 发布包构建与手持停止恢复 | 研究日志新增独立 `device_health` 行，开始/结束各记录一次、运行中每 10 秒记录电池温度与系统热等级；versionCode 1785403808 的正式 APP 曾完成内外双重签名、代码签名、Profile 与包元数据验证，SHA-256 `9E000ADFFE32949FC08D816557453D7BCF4B8823A38AFB6D0F31F56985356C62`；随后恢复“持续晃动即停止惯性测速并引导灯光打点”，该 APP 已不含最新行为，需重新构建与验签；旧 v16 包保留 |
+| 07-31 | 研究记录导出保留 | 修正导出成功后删除应用内源日志的行为；导出现在只复制到用户选择的位置，本地最近一次记录和完整性 sidecar 继续保留，可重复导出；新会话先持久化再替换旧记录，失败时回滚 |
+| 07-31 | 1.2.0 全量发布审查与审核提交 | 并行核查算法、生命周期、记录器、UI、权限、隐私、构建与签名链；修复隧道冻结锚点可用性、融合统计、后台中断收口、日志事务化替换/异步导出、失败残片隔离、灯光累计计数/单调计时等问题，当时内部候选标识为 `anchor-delta-20260731-r5`。34/34 自动化测试和正式 ArkTS release 构建通过；versionCode 1785489243 完成 APP/HAP/Profile/代码签名验证，SHA-256 `0F148E2CA190038E3C6F878453FEEBCD3E42112985D20C51E487B041D767C06D`，并已提交 AppGallery。该包尚未公开且已被后续候选替代，因此不占正式算法代次；包、哈希、签名和提交事实保持不变 |
+| 07-31 | GitHub 提交前清理 | 确认生产 ETS 与资源均有入口；删除 4 个过时/重复临时脚本，清理纯写字段、未使用参数/import 和旧构建缓存；修正文档树、权限口径、AppGallery 提交状态与应用介绍。算法行为和版本不变，34 项测试、Python 编译、版本同步及 ArkTS release 编译通过 |
+| 08-01 | 1.2.0 r4 锚点候选与超大记录安全回放 | 移除振动状态对可靠 GNSS 的额外 gate；地铁结果不变且无可配对定位行，公交 all/moving MAE 分别改善 71.81%/80.12%，驾车旧半份导出当时报告改善 6.94%/7.15%。后续复核确认旧工具把融合显示 `anchoredSpeedKmh` 误命名为 `anchorSpeed`，“定位速度含数百至数千 km/h 异常值”的归因不成立并已撤回；当前完整记录原始可用 GNSS max 123.947 km/h。回放器新增显式 EOF 截断尾行容错，批量工具会标记 `INCOMPLETE` 并非零退出；删除 17 条旧硬编码记录 fallback；定位状态模块移至研究记录下方。成果定为当前发布候选 `anchor-delta-20260801-r4`；此前短暂使用的 r6 为未公开内部标识。47 项自动化测试通过；versionCode 1785562562 的 release `assembleApp` 成功，未签名 APP 为 337,098 字节、SHA-256 `FC9A2702F91E95FB66C2B7A33EA9E485CFF76D09CB2D4E0376254745B881D94B`。随后生成正式发布包 `MetroSpeed-1.2.0-1785562562-release.app`，APP/HAP/Profile/代码签名与包内元数据断言均通过，大小 351,066 字节，SHA-256 `909C8BD3059E41A16C9EED76EC811F031CB9330ACAC4AE217517F0123BC3E8E4`，并由用户提交 AppGallery；其后继续以更高 versionCode 推进，独立审核状态未再核实 |
+| 08-01 | GitHub 提交前第二轮核查 | 修复首次定位授权覆盖初始校准、陀螺仪失败仍进入测速、空闲退后台误报连续采集中止；回放输出拆分原始锚点与锚定显示统计，并把锚点历史、lag 扫描和估算器配对改为线性/索引路径。真机日志进一步推动传感器订阅所有权与幂等退订修复。52 项测试、三条完整当前代记录回放、module release HAP 构建和短时真机回归通过；产品融合门控未变，算法版本继续为 `anchor-delta-20260801-r4` |
+| 08-02 | 第二轮可靠性修复后的正式候选 | 基于当前源码完成 versionCode 1785602095 的工程级 release APP 构建、正式双层签名、Profile 与包内元数据独立验证；正式包为 `MetroSpeed-1.2.0-1785602095-release.app`，353,233 字节，SHA-256 `9B071F681E8831A1C6C6DC7E8F02F930E23B3C70659A155745632252E0194E2B`。包内算法 r4、schema v17、API 20/24、release/debug=false 和五项权限均符合预期；后由用户提交 AppGallery，并因禁用按钮对比度不合格被驳回 |
+| 08-02 | 规则、文档与全量代码核查 | 明确失败构建、构建后证据、正式候选保留及 commit/push 授权边界；分离 README、工作记忆和隧道逆向主记录职责。修正运行时状态数量、GNSS 锚点内部 40 ms 查询与离线 `--gnss-lag-ms` 的语义，并收紧量产机隧道机制的证据等级。修复定位退订失败后的重复回调风险、研究记录部分写入与候选扫描问题，删除 7 个采用旧事件或旧 GNSS 配对口径的诊断脚本；55 项测试、Python 全量编译和版本同步检查通过。最终源码生成并完整验证 versionCode 1785644059 正式 APP，353,881 字节，SHA-256 `8716A7C6865BC89477560E6963E29E39E69F2474EDBA6929232BEB654F87888A` |
+| 08-02 | AppGallery 对比度驳回与修复 | versionCode 1785602095 因“停车校准”和“导出”禁用态对比度仅 1.86/1.84 被驳回；确认是 ArkUI 默认 0.4 禁用透明度而非浅色主题错配。首轮 `stateStyles.opacity(1)` 真机无效后，最终改为视觉层正常渲染，并用命中测试、焦点、无障碍文案和业务 guard 保持不可用行为；56 项测试和 versionCode 1785651102 module HAP 通过，“停车校准”真机截图约 5.64:1 |
+| 08-02 | 对比度修复正式候选 | versionCode 1785651334 正式 APP 完成工程级构建与全套验签；随后又调整实验控制语义、卡片视觉和导出按钮配色，因此该包失效 |
+| 08-02 | 最终复审候选 | 恢复 1.1.2 导出原色并完成真机复检；versionCode 1785660666 正式 APP 完成工程级构建、双层发布签名和 APP/HAP/Profile/权限/版本/API/算法/schema 独立验签，354,877 字节，SHA-256 `1DCF1D428A7AFE595637F9A2E4D32B8BF00A6F89674AB31FECC550D524A1D209`，随后提交 AppGallery 复审 |
 ---
 
 ## 十、当前任务状态
 
 **最近完成的任务**（早期基建工作见时间线 06-12~25）：
-见时间线 2026-07-01 之后条目及核心发现第 15-18 条，此处不重复。以下仅列出本节独有的待执行任务备忘。
+MetroSpeed 1.2.0 的 versionCode 1785602095 审核因两个禁用按钮对比度仅 1.86/1.84 被驳回。当前源码已绕开 ArkUI 强制禁用灰显，并用命中测试、焦点、无障碍文案和业务 guard 保持不可用行为；57 项测试和同源码 module HAP 真机截图通过，“停车校准”禁用态约 5.64:1，“导出”可用态恢复 1.1.2 的 8.82:1 原色。新的 `MetroSpeed-1.2.0-1785660666-release.app` 已完成构建、双层发布签名和独立验签，并已提交 AppGallery 复审。HarmonyOS 供给镜像的采样请求、HDI 回调缓存、
+传感器时间对齐、逐样本 3D VDR 更新和 AI-VDR 窗口步进已补齐；Pura 70
+只读运行态确认 1105 进程和 XDR 控制下发，但受权限限制尚未读出内部动态库、
+配置和实际传感器节拍。完整接手入口、证据边界和镜像外待办见
+`harmonyos_tunnel_positioning_reverse_engineering.md`。
+
+**当前发布状态**：对比度、实验控制语义、三者合并方案、实验卡片视觉优化和恢复 1.1.2 原色的导出按钮均已通过自动化测试及真机 UI 复检。最终 `MetroSpeed-1.2.0-1785660666-release.app` 已完成正式签名和全套独立验签，并已提交 AppGallery 复审；`1785651334` 及更早候选均已失效。
 
 **待执行任务（按优先级）**：
-1. 🟡 重力估计可靠性修复（坡道偏置用系统重力消化，场景自适应方案待重新设计）
+1. 🔴 AppGallery 候选替换与发布收口
+   - ✅ versionCode 1785651102 已安装并截图，“停车校准”代表像素对比度约 5.64:1；“导出”复用同一禁用配色和渲染路径，未改动现有 5267 条研究记录
+   - ✅ versionCode 1785659833 已覆盖安装并截图确认 1.1.2 原色导出按钮
+   - ✅ versionCode 1785660666 正式 APP 已完成工程级构建、双层发布签名及 APP/HAP/Profile/元数据验签
+   - ✅ 已在 AppGallery 后台用 1785660666 替换被驳回候选并重新提交审核
+   - ⏳ 等待 AppGallery 复审结果；如有反馈，先核对审核所指 versionCode 与截图再处理
+2. 🟡 系统机制真机动态闭环
+   - 在支持城市从室外启动高德驾车导航并固定手机，记录入隧前/中/后的 locationhub、location_host、hignss 日志
+   - 同时保存 SensorService 前后快照和 MetroSpeed schema v17 研究记录；它们用于时间对齐，不能把应用回调当作 HiGeo 私有回调
+   - 目标是确认 1105 的实际 SetBatch/事件间隔、PVT/TimeSync cadence、VDR/PF/TMM 启停与退出原因；若普通 shell 仍不可见，需要调试签名组件、工程固件或厂商权限
+3. 🟡 量产载荷与输出 receiver
+   - 取得 1105 对应 binary/maps/Build ID 和实际 `higeo.conf`，不要用 1102a/1106 镜像值代填
+   - 继续追踪 `ReportMsgToSa(string)` transaction 1 的 receiver，优先查剥离实现、ABC 和量产机动态产品模块
+4. 🟡 100Hz 产品长时验收
+   - schema v17 已有地铁、公交、驾车三条当前代完整记录，最长单条约 1.84GB，并已记录电池温度与系统热等级；仍需逐条完成实际频率、前后台、锁屏、发热与缺帧分布分析
+   - 保持 ArkTS/Python 回放一致；算法 r4 与 schema v17 不因本轮 UI 修复变化。短时前后台已通过，但锁屏、长时后台、发热与实车风险仍未关闭
+5. 🟡 重力估计可靠性修复（不重新接入已在地铁场景判定 NO-GO 的系统重力，另找坡度或可靠静止锚约束）
    - ✅ 磁力计场景检测已移除 — 4 条新记录验证无法靠磁力计 std 可靠分离公交/驾车
    - ✅ 停车校准保护（`initialCalibrationDone`）保留
    - 坡道偏置子问题仍待解决；system gravity 在偏置已修复的新版驾车记录上增益微弱（0.72→0.66），需要找真正有效的分离信号
-2. 🟡 手持检测算法重新设计
-   - ✅ 阈值临时上调至 0.5（止血），暂不误触
+6. 🟡 手持检测算法重新设计
+   - ✅ 阈值临时上调至 0.5；触发后停止惯性测速并引导灯光打点，已测止血样本未再触发，不代表分类器可靠
    - 当前 RMS+ZCR 方案在有振动传导的硬质表面上无法区分底盘振动 vs 手持摇晃
    - 下一步：需采集真手持记录 → 分析可行指标（加速度姿态变化、ROTATION_VECTOR 角速度等）
-3. 🟢 多语言支持（英文）
-4. 🟢 后台长时采集真机稳定性测试（代码已支持测速/研究记录，仍需补充 lifecycle background/foreground 事件记录并验证系统限电策略）
-5. 🟢 历史记录管理界面
+7. 🟢 多语言支持（英文）
+8. 🟢 历史记录管理界面
 
 ---
 
@@ -347,13 +450,11 @@ MetroSpeed/
 3. **signing/ 绝对不能提交 git**；`.trae/` 要保留，随仓库提交。
 
 **功能澄清**：
-4. **隧道模式手动切换**，不是自动检测。拒绝 GNSS 锚点是刻意设计（复刻鸿蒙系统隧道定位行为）。
+4. **隧道模式手动切换**，不是自动检测。入隧冻结最后一个可靠锚点，隧道内劣质回调不改变其可用性；出隧后旧锚立即停用并等待新可靠回调。拒绝新 GNSS 锚点是隔离可能的系统融合延拓点、暴露纯惯性漂移的实验保护，不是对 HiGeo 行为的完整复刻。
 5. **refreshGravityAtEntrance() 已删除**；入隧只冻结 GNSS 锚点，不在行驶中刷新重力。
-6. **4 个辅助传感器只做数据采集**，SpeedEstimator.ets 一行都不要改。
+6. **系统 GRAVITY 与 LINEAR_ACCELEROMETER 只存在于旧 v13/v15 研究记录和离线兼容分析，自 schema v16 起不再订阅**；不要因系统私有链路存在其他传感器就直接接入 MetroSpeed 算法。任何新信号必须先采集、对齐并验证增益。
 
 **技术坑**：
 7. **GAME_ROTATION_VECTOR**：ArkTS 公开 API 不支持，不要为此写 Native C API。
-8. **API 名称坑**：线性加速度传感器是 LINEAR_ACCELEROMETER（不是 LINEAR_ACCELERATION），响应类型 LinearAccelerometerResponse。
+8. **API 名称坑（历史兼容）**：旧日志中的线性加速度传感器是 LINEAR_ACCELEROMETER（不是 LINEAR_ACCELERATION），响应类型 LinearAccelerometerResponse。
 9. **c7ab07f 回归教训**：拆分启动逻辑时必须检查所有调用方，特别是 `start()` 内部会 `stop()` 这个隐式副作用。
-
-> 核心发现第 11-14 条已包含隧道定位机制、系统重力分场景、adaptive-gravity 验证等结论，此处不再重复。

@@ -1,10 +1,11 @@
 ﻿# 签名 .app 包脚本
-# 默认交互输入密码；仅 -NonInteractivePassword 模式读取 METROSPEED_KEYSTORE_PASSWORD
+# 默认交互输入密码；仅 -NonInteractivePassword 模式读取密钥库密码，并可单独指定密钥密码
 param(
     [string]$AppPath = "",
     [string]$OutputPath = "",
     [string]$SignToolPath = "",
     [string]$JavaPath = "",
+    [int]$CompatibleApiVersion = 0,
     [switch]$InteractivePassword,
     [switch]$NonInteractivePassword
 )
@@ -42,20 +43,59 @@ if ($JavaPath) {
 $keystore = Join-Path $signingDir "release.p12"
 $cert = Join-Path $signingDir "release.cer"
 $profile = Join-Path $signingDir "releaseRelease.p7b"
-$password = $env:METROSPEED_KEYSTORE_PASSWORD
+$keystorePassword = $env:METROSPEED_KEYSTORE_PASSWORD
+$keyPassword = $env:METROSPEED_KEY_PASSWORD
+if (-not $keyPassword) {
+    $keyPassword = $keystorePassword
+}
 if ($InteractivePassword -and $NonInteractivePassword) {
     throw "-InteractivePassword 与 -NonInteractivePassword 不能同时使用"
 }
 $useInteractivePassword = -not $NonInteractivePassword
-if (-not $useInteractivePassword -and -not $password) {
-    throw "非交互模式请设置环境变量 METROSPEED_KEYSTORE_PASSWORD"
+if (-not $useInteractivePassword -and (-not $keystorePassword -or -not $keyPassword)) {
+    throw "非交互模式请设置 METROSPEED_KEYSTORE_PASSWORD；密钥密码不同时再设置 METROSPEED_KEY_PASSWORD"
 }
 if (-not $useInteractivePassword) {
     Write-Warning "Non-interactive mode exposes the password in Java process arguments; use -InteractivePassword on shared machines."
 }
 $keyAlias = "metrospeed"
 $signAlg = "SHA256withECDSA"
-$compatibleVersion = "12"
+
+function Get-ProjectCompatibleApiVersion {
+    $profilePaths = @(
+        (Join-Path $projectRoot "build-profile.json5"),
+        (Join-Path $projectRoot "build-profile.template.json5")
+    )
+    $detectedVersions = @()
+    foreach ($profilePath in $profilePaths) {
+        if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) {
+            continue
+        }
+        $profileText = Get-Content -Raw -LiteralPath $profilePath
+        $matches = [regex]::Matches(
+            $profileText,
+            '"compatibleSdkVersion"\s*:\s*"[^"]*\((\d+)\)"'
+        )
+        foreach ($match in $matches) {
+            $detectedVersions += [int]$match.Groups[1].Value
+        }
+    }
+    $uniqueVersions = @($detectedVersions | Sort-Object -Unique)
+    if ($uniqueVersions.Count -ne 1) {
+        throw "无法从构建配置唯一确定 compatible API: $($uniqueVersions -join ', ')"
+    }
+    return [int]$uniqueVersions[0]
+}
+
+$projectCompatibleApiVersion = Get-ProjectCompatibleApiVersion
+if ($CompatibleApiVersion -gt 0 -and $CompatibleApiVersion -ne $projectCompatibleApiVersion) {
+    throw "指定的 compatible API $CompatibleApiVersion 与项目配置 $projectCompatibleApiVersion 不一致"
+}
+$compatibleVersion = if ($CompatibleApiVersion -gt 0) {
+    "$CompatibleApiVersion"
+} else {
+    "$projectCompatibleApiVersion"
+}
 
 foreach ($requiredFile in @($AppPath, $signTool, $javaTool, $keystore, $cert, $profile)) {
     if (-not $requiredFile -or -not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
@@ -96,7 +136,7 @@ function Invoke-AppSign {
     if ($useInteractivePassword) {
         $signArgs += @('-pwdInputMode', '1')
     } else {
-        $signArgs += @('-keyPwd', $password, '-keystorePwd', $password)
+        $signArgs += @('-keyPwd', $keyPassword, '-keystorePwd', $keystorePassword)
     }
     if ($ZipInput) {
         $signArgs += @('-inForm', 'zip')

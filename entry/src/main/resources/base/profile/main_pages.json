@@ -1,6 +1,7 @@
 {
   "src": [
     "pages/Index",
+    "pages/InertialSpeed",
     "pages/TunnelLight"
   ]
 }

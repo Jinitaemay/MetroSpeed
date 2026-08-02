@@ -9,16 +9,9 @@
       {
         "name": "default",
         "signingConfig": "default",
-        "compatibleSdkVersion": "5.0.0(12)",
+        "compatibleSdkVersion": "6.0.0(20)",
         "runtimeOS": "HarmonyOS",
-        "targetSdkVersion": "5.0.0(12)"
-      },
-      {
-        "name": "release",
-        "signingConfig": "release",
-        "compatibleSdkVersion": "5.0.0(12)",
-        "runtimeOS": "HarmonyOS",
-        "targetSdkVersion": "5.0.0(12)"
+        "targetSdkVersion": "6.1.1(24)"
       }
     ]
   },
@@ -30,8 +23,7 @@
         {
           "name": "default",
           "applyToProducts": [
-            "default",
-            "release"
+            "default"
           ]
         }
       ]

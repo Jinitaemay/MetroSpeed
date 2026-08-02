@@ -10,6 +10,12 @@ signing/
 *.cer
 *.p7b
 *.csr
+*.pfx
+*.jks
+*.keystore
+*.pem
+*.key
+_BACKUP_MANIFEST.txt
 
 # IDE 和工具
 .hvigor/
@@ -41,3 +47,4 @@ oh_modules/
 *.tmp
 *.temp
 *.log
+*.jsonl

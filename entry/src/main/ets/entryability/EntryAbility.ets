@@ -16,6 +16,7 @@ export default class EntryAbility extends UIAbility {
   private isInBackground: boolean = false;
   private longTaskGeneration: number = 0;
   private collectionHandlerRegistered: boolean = false;
+  private continuousTaskCancelRegistered: boolean = false;
   private mainWindow?: window.Window;
   private readonly collectionEventHandler: (data: emitter.EventData) => void = (data: emitter.EventData): void => {
     const actionData: Record<string, string> = data.data as Record<string, string>;
@@ -24,17 +25,27 @@ export default class EntryAbility extends UIAbility {
       this.updateKeepScreenOn();
     }
   };
+  private readonly continuousTaskCancelHandler =
+    (info: backgroundTaskManager.ContinuousTaskCancelInfo): void => {
+      this.longTaskGeneration += 1;
+      this.isLongTaskRunning = false;
+      this.isLongTaskStartPending = false;
+      this.isLongTaskStopPending = false;
+      this.longTaskStopRetryCount = 0;
+      console.warn(`Continuous task cancelled: id=${info.id}, reason=${info.reason}`);
+      if (this.isInBackground && BackgroundState.isCollectionActive()) {
+        emitter.emit({ eventId: BG_EVENT_ID }, {
+          data: { action: 'stopSensors' }
+        });
+      }
+    };
 
   onBackground(): void {
     this.isInBackground = true;
     this.updateKeepScreenOn();
     if (BackgroundState.isCollectionActive()) {
       this.startLongTask();
-      return;
     }
-    emitter.emit({ eventId: BG_EVENT_ID }, {
-      data: { action: 'stopSensors' }
-    });
   }
 
   onForeground(): void {
@@ -173,6 +184,15 @@ export default class EntryAbility extends UIAbility {
       emitter.on({ eventId: BG_EVENT_ID }, this.collectionEventHandler);
       this.collectionHandlerRegistered = true;
     }
+    if (!this.continuousTaskCancelRegistered) {
+      try {
+        backgroundTaskManager.on('continuousTaskCancel', this.continuousTaskCancelHandler);
+        this.continuousTaskCancelRegistered = true;
+      } catch (error) {
+        const cancelError = error as BusinessError;
+        console.error(`Failed to register continuous task cancellation: ${cancelError.message}`);
+      }
+    }
     windowStage.loadContent('pages/Index', (err: BusinessError) => {
       if (err.code) {
         console.error(`Failed to load page. code=${err.code}, message=${err.message}`);
@@ -213,6 +233,15 @@ export default class EntryAbility extends UIAbility {
     if (this.collectionHandlerRegistered) {
       emitter.off(BG_EVENT_ID, this.collectionEventHandler);
       this.collectionHandlerRegistered = false;
+    }
+    if (this.continuousTaskCancelRegistered) {
+      try {
+        backgroundTaskManager.off('continuousTaskCancel', this.continuousTaskCancelHandler);
+      } catch (error) {
+        const cancelError = error as BusinessError;
+        console.warn(`Failed to unregister continuous task cancellation: ${cancelError.message}`);
+      }
+      this.continuousTaskCancelRegistered = false;
     }
   }
 }

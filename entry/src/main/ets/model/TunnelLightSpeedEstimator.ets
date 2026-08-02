@@ -5,7 +5,6 @@ export interface LightSpeedResult {
 }
 
 export interface LightTapOutcome {
-  accepted: boolean;
   message: string;
   tapCount: number;
   results: LightSpeedResult[];
@@ -22,8 +21,8 @@ export interface LightTapOutcome {
 export class TunnelLightSpeedEstimator {
   private lightDistanceM: number = 0;
   private tapTimesMs: number[] = [];
+  private totalTapCount: number = 0;
   private readonly MAX_INTERVALS: number = 4;
-  private readonly MIN_TAP_GAP_MS: number = 120;
 
   setLightDistance(distanceM: number): boolean {
     if (!Number.isFinite(distanceM) || distanceM <= 0) {
@@ -36,39 +35,34 @@ export class TunnelLightSpeedEstimator {
     return true;
   }
 
-  getLightDistance(): number {
-    return this.lightDistanceM;
-  }
-
   reset(): void {
     this.tapTimesMs = [];
+    this.totalTapCount = 0;
   }
 
   tap(timestampMs: number): LightTapOutcome {
     if (this.lightDistanceM <= 0) {
-      return this.outcome(false, '请先输入灯光间距');
+      return this.outcome('请先输入灯光间距');
     }
     if (!Number.isFinite(timestampMs) || timestampMs < 0) {
-      return this.outcome(false, '打点时间无效');
+      return this.outcome('打点时间无效');
     }
     if (this.tapTimesMs.length > 0) {
       const previous = this.tapTimesMs[this.tapTimesMs.length - 1];
       if (timestampMs <= previous) {
-        return this.outcome(false, '打点时间必须递增');
-      }
-      if (timestampMs - previous < this.MIN_TAP_GAP_MS) {
-        return this.outcome(false, '打点过快，已忽略误触');
+        return this.outcome('打点时间必须递增');
       }
     }
 
     this.tapTimesMs.push(timestampMs);
+    this.totalTapCount += 1;
     while (this.tapTimesMs.length > this.MAX_INTERVALS + 1) {
       this.tapTimesMs.shift();
     }
     if (this.tapTimesMs.length < 2) {
-      return this.outcome(true, '已记录起始灯光');
+      return this.outcome('已记录起始灯光');
     }
-    return this.outcome(true, '已更新速度区间');
+    return this.outcome('已更新速度区间');
   }
 
   results(): LightSpeedResult[] {
@@ -90,11 +84,10 @@ export class TunnelLightSpeedEstimator {
     return result;
   }
 
-  private outcome(accepted: boolean, message: string): LightTapOutcome {
+  private outcome(message: string): LightTapOutcome {
     return {
-      accepted,
       message,
-      tapCount: this.tapTimesMs.length,
+      tapCount: this.totalTapCount,
       results: this.results()
     };
   }

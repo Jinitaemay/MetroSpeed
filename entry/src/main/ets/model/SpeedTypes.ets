@@ -19,12 +19,8 @@ export enum MotionState {
 
 export interface SpeedSample {
   timestampMs: number;
-  rawAcceleration: Vector3;
   filteredAcceleration: Vector3;
-  speedMps: number;
   speedKmh: number;
-  confidence: number;
-  motionState: MotionState;
 }
 
 export interface RunStats {
@@ -55,16 +51,26 @@ export interface SensorFrame {
   timestampMs: number;
   sensorTimestamp: number | null;
   acceleration: Vector3;
-  gravity?: Vector3;
-  gravityTimestamp?: number | null;
-  linearAcceleration?: Vector3;
-  linearAccelerationTimestamp?: number | null;
   rotationVector?: Quaternion;
   rotationVectorTimestamp?: number | null;
   magneticField?: Vector3;
   magneticFieldTimestamp?: number | null;
   gyroscope?: Vector3;
   gyroscopeTimestamp?: number | null;
+}
+
+export interface SensorCallbackSample {
+  sensorType: string;
+  callbackTimestampMs: number;
+  sensorTimestamp: number | null;
+  requestedIntervalNs: number;
+  x?: number;
+  y?: number;
+  z?: number;
+  w?: number;
+  biasX?: number;
+  biasY?: number;
+  biasZ?: number;
 }
 
 export interface EstimatorFrame {

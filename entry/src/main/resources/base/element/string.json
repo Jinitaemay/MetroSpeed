@@ -2,7 +2,7 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "地铁和轨交惯性测速"
+      "value": "地铁和轨交测速工具"
     },
     {
       "name": "permission_accelerometer_reason",
@@ -14,7 +14,7 @@
     },
     {
       "name": "permission_location_reason",
-      "value": "用于获取卫星定位速度作为测速基准并融合修正惯性测速结果"
+      "value": "用于获取卫星定位速度并融合修正测速；主动开启研究记录时还会在本机保存位置和卫星数据"
     },
     {
       "name": "permission_background_running_reason",

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import statistics
+import sys
 import tempfile
 from dataclasses import dataclass
 from enum import IntEnum
@@ -13,8 +14,17 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-ALGORITHM_VERSION = "anchor-delta-20260710-r3"
+ALGORITHM_VERSION = "anchor-delta-20260801-r4"
 PHONE_GNSS_ANCHOR_LAG_MS = 40
+PHONE_INERTIAL_HISTORY_RETENTION_MS = 200
+REFERENCE_DT_SECONDS = 0.02
+MAX_CONTINUOUS_SAMPLE_SECONDS = 0.08
+PRE_CAL_BUFFER_SECONDS = 3.6
+PRE_CAL_MAX_FRAMES = 800
+PARKING_WINDOW_SECONDS = 1.5
+PARKING_WINDOW_MIN_SAMPLES = 30
+MOTION_WINDOW_MAX_FRAMES = 400
+DEPARTURE_EVIDENCE_SECONDS = 0.06
 APP_PARITY_ESTIMATOR_CONFIG = {
     "curve_positive_scale": 0.35,
     "curve_negative_scale": 0.35,
@@ -180,6 +190,22 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
     return min(max(value, minimum), maximum)
 
 
+def alpha_for_delta(reference_alpha: float, delta_seconds: float) -> float:
+    """Preserve a per-50 Hz mix response when callbacks arrive at another rate."""
+    reference_remainder = clamp(1.0 - reference_alpha, 0.0, 1.0)
+    return 1.0 - math.pow(
+        reference_remainder,
+        delta_seconds / REFERENCE_DT_SECONDS,
+    )
+
+
+def normalize_acc_step(raw_step: float, delta_seconds: float) -> float:
+    """Express a sample-to-sample acceleration change as a 20 ms equivalent."""
+    return raw_step * (
+        REFERENCE_DT_SECONDS / max(delta_seconds, 0.005)
+    )
+
+
 def clip_magnitude(a: Vector3, max_magnitude: float) -> Vector3:
     value = v_mag(a)
     if value <= max_magnitude or value < 0.0001:
@@ -207,6 +233,7 @@ class AccelWindowFrame:
     filtered: Vector3
     acc_step: float
     gravity_deviation: float
+    elapsed_seconds: float
 
 
 @dataclass
@@ -216,6 +243,8 @@ class PreCalFrame:
     gyro_magnitude: float
     acc_step: float
     delta_seconds: float
+    elapsed_seconds: float
+    continuous: bool
     distance_before_m: float
     integrated: bool
 
@@ -388,6 +417,11 @@ class SpeedEstimator:
         self.axis_window_min_frames = axis_window_min_frames
         self.axis_window_max_frames = axis_window_max_frames
         self.axis_window_max_ms = axis_window_max_ms
+        self.axis_window_min_seconds = axis_window_min_frames * REFERENCE_DT_SECONDS
+        self.axis_window_max_seconds = min(
+            axis_window_max_frames * REFERENCE_DT_SECONDS,
+            axis_window_max_ms / 1000.0,
+        )
         self.axis_stable_acc_step = axis_stable_acc_step
         self.axis_stable_gravity_dev = axis_stable_gravity_dev
         self.axis_stable_gyro = axis_stable_gyro
@@ -429,6 +463,9 @@ class SpeedEstimator:
         self.start_ms = 0
         self.last_timestamp_ms = 0
         self.last_sensor_timestamp_ns: Optional[float] = None
+        self.last_valid_delta_seconds = clamp(dt_fallback, dt_clamp_lo, dt_clamp_hi)
+        self.last_elapsed_delta_seconds = self.last_valid_delta_seconds
+        self.last_sample_continuous = True
         self.velocity_mps = 0.0
         self.distance_m = 0.0
         self.max_speed_kmh = 0.0
@@ -438,7 +475,7 @@ class SpeedEstimator:
         self.main_axis_initialized = False
         self.main_axis_locked = False
         self.main_axis_seed_magnitude = 0.0
-        self.main_axis_update_count = 0
+        self.main_axis_update_count = 0.0
         self.main_axis_last_update_ms = 0
         self.calibration_count = 0
         self.calibration_until_ms = 0
@@ -447,7 +484,6 @@ class SpeedEstimator:
         self.calibration_gyro_sum = 0.0
         self.calibration_gyro_max = 0.0
         self.calibration_max_step = 0.0
-        self.calibration_last_acceleration: Optional[Vector3] = None
         self.calibration_samples = 0
         self.calibration_first_sample_ms = 0
         self.calibration_last_sample_ms = 0
@@ -474,6 +510,11 @@ class SpeedEstimator:
         self.start_ms = timestamp_ms
         self.last_timestamp_ms = timestamp_ms
         self.last_sensor_timestamp_ns = None
+        self.last_valid_delta_seconds = clamp(
+            self.dt_fallback, self.dt_clamp_lo, self.dt_clamp_hi
+        )
+        self.last_elapsed_delta_seconds = self.last_valid_delta_seconds
+        self.last_sample_continuous = True
         self.velocity_mps = 0.0
         self.distance_m = 0.0
         self.max_speed_kmh = 0.0
@@ -483,7 +524,7 @@ class SpeedEstimator:
         self.main_axis_initialized = False
         self.main_axis_locked = False
         self.main_axis_seed_magnitude = 0.0
-        self.main_axis_update_count = 0
+        self.main_axis_update_count = 0.0
         self.main_axis_last_update_ms = 0
         self.calibration_count = 0
         self.confidence = 0.0
@@ -508,6 +549,11 @@ class SpeedEstimator:
         self.velocity_mps = 0.0
         self.last_timestamp_ms = timestamp_ms
         self.last_sensor_timestamp_ns = None
+        self.last_valid_delta_seconds = clamp(
+            self.dt_fallback, self.dt_clamp_lo, self.dt_clamp_hi
+        )
+        self.last_elapsed_delta_seconds = self.last_valid_delta_seconds
+        self.last_sample_continuous = True
         self.parking_calibration_pending = False
         self.parking_calibration_rejected_until_ms = 0
         self.parking_calibration_success_until_ms = 0
@@ -557,8 +603,20 @@ class SpeedEstimator:
             return self.make_output(frame)
 
         dt = self.compute_delta_seconds(frame)
+        elapsed_seconds = self.last_elapsed_delta_seconds
+        continuous = self.last_sample_continuous
         raw_acceleration = frame.acceleration
-        acc_step = self.compute_acc_step(raw_acceleration)
+        if not continuous:
+            self.pre_cal_buffer = []
+            self.window_frames = []
+            self.filtered_acceleration = v_empty()
+            if not self.initial_calibration_done and not self.parking_calibration_pending:
+                self.reset_calibration_evidence(frame.timestamp_ms)
+        acc_step = self.compute_acc_step(
+            raw_acceleration,
+            elapsed_seconds,
+            continuous,
+        )
 
         if (
             not self.initial_calibration_done
@@ -569,18 +627,19 @@ class SpeedEstimator:
             self.last_calibration_ms = frame.timestamp_ms
 
         pre_cal_gyro = v_mag(frame.gyroscope) if frame.gyroscope is not None else 0.0
-        if len(self.pre_cal_buffer) >= 180:
-            self.pre_cal_buffer.pop(0)
         pre_cal_frame = PreCalFrame(
             timestamp_ms=frame.timestamp_ms,
             acceleration=raw_acceleration,
             gyro_magnitude=pre_cal_gyro,
             acc_step=acc_step,
             delta_seconds=dt,
+            elapsed_seconds=elapsed_seconds,
+            continuous=continuous,
             distance_before_m=self.distance_m,
             integrated=False,
         )
         self.pre_cal_buffer.append(pre_cal_frame)
+        self.trim_pre_cal_buffer()
         if self.parking_calibration_pending:
             self.parking_post_request_frames.append(pre_cal_frame)
 
@@ -590,6 +649,7 @@ class SpeedEstimator:
                 frame.timestamp_ms,
                 raw_acceleration,
                 calibration_gyro_magnitude,
+                acc_step,
             )
             if not self.parking_calibration_pending:
                 self.motion_state = MotionState.CALIBRATING
@@ -605,12 +665,12 @@ class SpeedEstimator:
             gravity_for_motion = self.gravity_estimate
         motion_acceleration = v_sub(raw_acceleration, gravity_for_motion)
         clipped = clip_magnitude(motion_acceleration, self.accel_clip_ceiling)
-        filtered = self.low_pass(clipped, self.low_pass_alpha)
+        filtered = self.low_pass(clipped, self.low_pass_alpha, dt)
         self.filtered_acceleration = filtered
 
         self.update_main_axis_lock(frame.timestamp_ms)
         if self.should_update_main_axis(filtered, gyro_magnitude, frame.timestamp_ms):
-            self.update_main_axis(filtered, frame.timestamp_ms)
+            self.update_main_axis(filtered, frame.timestamp_ms, dt)
 
         forward_acceleration = v_dot(filtered, self.main_axis)
         lateral_vector = v_sub(filtered, v_scale(self.main_axis, forward_acceleration))
@@ -623,6 +683,8 @@ class SpeedEstimator:
             filtered,
             acc_step,
             abs(v_mag(raw_acceleration) - 9.80665),
+            elapsed_seconds,
+            continuous,
         )
 
         state = self.detect_motion_state(forward_acceleration, lateral_acceleration, gyro_magnitude, frame.timestamp_ms)
@@ -638,30 +700,33 @@ class SpeedEstimator:
         return self.make_output(frame, filtered)
 
     def begin_calibration(self, timestamp_ms: int) -> None:
+        self.reset_calibration_evidence(timestamp_ms)
+        self.calibration_count += 1
+
+    def reset_calibration_evidence(self, timestamp_ms: int) -> None:
         self.calibration_until_ms = timestamp_ms + self.calibration_duration_ms
         self.calibration_sum = v_empty()
         self.calibration_square_sum = 0.0
         self.calibration_gyro_sum = 0.0
         self.calibration_gyro_max = 0.0
         self.calibration_max_step = 0.0
-        self.calibration_last_acceleration = None
         self.calibration_samples = 0
         self.calibration_first_sample_ms = 0
         self.calibration_last_sample_ms = 0
-        self.calibration_count += 1
         self.last_calibration_ms = timestamp_ms
         self.motion_state = MotionState.CALIBRATING
 
-    def collect_calibration(self, timestamp_ms: int, acceleration: Vector3, gyro_magnitude: float) -> None:
+    def collect_calibration(
+        self,
+        timestamp_ms: int,
+        acceleration: Vector3,
+        gyro_magnitude: float,
+        acc_step: float,
+    ) -> None:
         if self.calibration_samples == 0:
             self.calibration_first_sample_ms = timestamp_ms
         self.calibration_last_sample_ms = timestamp_ms
-        if self.calibration_last_acceleration is not None:
-            self.calibration_max_step = max(
-                self.calibration_max_step,
-                v_mag(v_sub(acceleration, self.calibration_last_acceleration)),
-            )
-        self.calibration_last_acceleration = acceleration
+        self.calibration_max_step = max(self.calibration_max_step, acc_step)
         self.calibration_sum = v_add(self.calibration_sum, acceleration)
         self.calibration_square_sum += v_dot(acceleration, acceleration)
         self.calibration_gyro_sum += gyro_magnitude
@@ -698,28 +763,43 @@ class SpeedEstimator:
             else:
                 break
 
-        if was_parking_calibration and eligible_parking_frame_count >= 75:
-            window_frames = 75
+        if was_parking_calibration and eligible_parking_frame_count >= PARKING_WINDOW_MIN_SAMPLES:
             best_start = -1
+            best_end = -1
             best_rms = float("inf")
-            for i in range(eligible_parking_frame_count - window_frames + 1):
-                window_end_timestamp_ms = parking_frames[i + window_frames - 1].timestamp_ms
+            for window_start in range(eligible_parking_frame_count):
+                window_duration_seconds = 0.0
+                window_end = window_start
+                while (
+                    window_end < eligible_parking_frame_count
+                    and window_duration_seconds < PARKING_WINDOW_SECONDS
+                ):
+                    window_duration_seconds += parking_frames[window_end].elapsed_seconds
+                    window_end += 1
+                if window_duration_seconds < PARKING_WINDOW_SECONDS:
+                    break
+                end_index = window_end - 1
+                window_sample_count = end_index - window_start + 1
+                if window_sample_count < PARKING_WINDOW_MIN_SAMPLES:
+                    continue
+                window_end_timestamp_ms = parking_frames[end_index].timestamp_ms
                 window_age_ms = self.parking_calibration_request_ms - window_end_timestamp_ms
                 if window_age_ms < 0 or window_age_ms > 300:
                     continue
                 s = v_empty()
                 sq = 0.0
-                for j in range(i, i + window_frames):
+                for j in range(window_start, end_index + 1):
                     acc = parking_frames[j].acceleration
                     s = v_add(s, acc)
                     sq += v_dot(acc, acc)
-                mean = v_scale(s, 1.0 / window_frames)
-                mean_sq = sq / window_frames
+                mean = v_scale(s, 1.0 / window_sample_count)
+                mean_sq = sq / window_sample_count
                 mean_dot = v_dot(mean, mean)
                 rms = math.sqrt(max(0.0, mean_sq - mean_dot))
                 if rms < best_rms:
                     best_rms = rms
-                    best_start = i
+                    best_start = window_start
+                    best_end = end_index
 
             if best_start >= 0:
                 cal_sum = v_empty()
@@ -727,8 +807,8 @@ class SpeedEstimator:
                 cal_gyro_sum = 0.0
                 cal_gyro_max = 0.0
                 cal_max_step = 0.0
-                last_acc: Optional[Vector3] = None
-                for j in range(best_start, best_start + window_frames):
+                window_sample_count = best_end - best_start + 1
+                for j in range(best_start, best_end + 1):
                     buffered_frame = parking_frames[j]
                     acc = buffered_frame.acceleration
                     gyro = buffered_frame.gyro_magnitude
@@ -736,17 +816,16 @@ class SpeedEstimator:
                     cal_sq_sum += v_dot(acc, acc)
                     cal_gyro_sum += gyro
                     cal_gyro_max = max(cal_gyro_max, gyro)
-                    if last_acc is not None:
-                        cal_max_step = max(cal_max_step, v_mag(v_sub(acc, last_acc)))
-                    last_acc = acc
+                    if j > best_start:
+                        cal_max_step = max(cal_max_step, buffered_frame.acc_step)
 
-                gravity_candidate = v_scale(cal_sum, 1.0 / window_frames)
-                mean_square = cal_sq_sum / window_frames
+                gravity_candidate = v_scale(cal_sum, 1.0 / window_sample_count)
+                mean_square = cal_sq_sum / window_sample_count
                 gravity_square = v_dot(gravity_candidate, gravity_candidate)
                 rms_deviation = math.sqrt(max(0.0, mean_square - gravity_square))
                 gravity_magnitude = v_mag(gravity_candidate)
                 raw_gravity_error = abs(gravity_magnitude - 9.80665)
-                gyro_average = cal_gyro_sum / window_frames
+                gyro_average = cal_gyro_sum / window_sample_count
                 motion_during_calibration = (
                     gyro_average > self.calibration_motion_gyro_mean
                     or cal_gyro_max > self.calibration_motion_gyro_max
@@ -758,7 +837,7 @@ class SpeedEstimator:
                     and not motion_during_calibration
                 )
                 parking_window_start = best_start
-                parking_window_end = best_start + window_frames - 1
+                parking_window_end = best_end
         elif not was_parking_calibration:
             sample_coverage_ms = self.calibration_last_sample_ms - self.calibration_first_sample_ms
             has_enough_samples = self.calibration_samples >= 30 and sample_coverage_ms >= 1000
@@ -814,20 +893,41 @@ class SpeedEstimator:
         self.calibration_gyro_sum = 0.0
         self.calibration_gyro_max = 0.0
         self.calibration_max_step = 0.0
-        self.calibration_last_acceleration = None
         self.calibration_first_sample_ms = 0
         self.calibration_last_sample_ms = 0
 
-    def low_pass(self, acceleration: Vector3, alpha: float) -> Vector3:
+    def trim_pre_cal_buffer(self) -> None:
+        duration_seconds = sum(frame.elapsed_seconds for frame in self.pre_cal_buffer)
+        while (
+            len(self.pre_cal_buffer) > 1
+            and duration_seconds > PRE_CAL_BUFFER_SECONDS
+        ):
+            duration_seconds -= self.pre_cal_buffer[0].elapsed_seconds
+            self.pre_cal_buffer.pop(0)
+        while len(self.pre_cal_buffer) > PRE_CAL_MAX_FRAMES:
+            self.pre_cal_buffer.pop(0)
+
+    def low_pass(
+        self,
+        acceleration: Vector3,
+        reference_alpha: float,
+        delta_seconds: float,
+    ) -> Vector3:
+        alpha = alpha_for_delta(reference_alpha, delta_seconds)
         return v_mix(self.filtered_acceleration, acceleration, alpha)
 
-    def compute_acc_step(self, raw_acceleration: Vector3) -> float:
-        if self.last_raw_acceleration is None:
+    def compute_acc_step(
+        self,
+        raw_acceleration: Vector3,
+        elapsed_seconds: float,
+        continuous: bool = True,
+    ) -> float:
+        if not continuous or self.last_raw_acceleration is None:
             self.last_raw_acceleration = raw_acceleration
             return 0.0
-        value = v_mag(v_sub(raw_acceleration, self.last_raw_acceleration))
+        raw_step = v_mag(v_sub(raw_acceleration, self.last_raw_acceleration))
         self.last_raw_acceleration = raw_acceleration
-        return value
+        return normalize_acc_step(raw_step, elapsed_seconds)
 
     def update_gravity_from_gyro(
         self,
@@ -855,9 +955,19 @@ class SpeedEstimator:
             raw_dt = (timestamp_ms - self.last_timestamp_ms) / 1000.0
             self.last_sensor_timestamp_ns = None
         self.last_timestamp_ms = timestamp_ms
-        if raw_dt <= 0:
-            return self.dt_fallback
-        return clamp(raw_dt, self.dt_clamp_lo, self.dt_clamp_hi)
+        if raw_dt <= 0 or not math.isfinite(raw_dt):
+            self.last_elapsed_delta_seconds = self.last_valid_delta_seconds
+            self.last_sample_continuous = True
+            return self.last_valid_delta_seconds
+        delta_seconds = clamp(raw_dt, self.dt_clamp_lo, self.dt_clamp_hi)
+        continuous = raw_dt <= MAX_CONTINUOUS_SAMPLE_SECONDS
+        self.last_elapsed_delta_seconds = (
+            raw_dt if continuous else self.last_valid_delta_seconds
+        )
+        self.last_sample_continuous = continuous
+        if continuous:
+            self.last_valid_delta_seconds = delta_seconds
+        return delta_seconds
 
     def update_main_axis_lock(self, timestamp_ms: int) -> None:
         if not self.main_axis_initialized:
@@ -891,14 +1001,19 @@ class SpeedEstimator:
         speed_adjusted_threshold = self.axis_acc_high_speed if self.velocity_mps > self.axis_speed_threshold else self.axis_acc_low_speed
         return acceleration_magnitude > speed_adjusted_threshold and axis_update_likely_straight
 
-    def update_main_axis(self, filtered: Vector3, timestamp_ms: int) -> None:
+    def update_main_axis(
+        self,
+        filtered: Vector3,
+        timestamp_ms: int,
+        delta_seconds: float,
+    ) -> None:
         candidate_magnitude = v_mag(filtered)
         candidate = v_norm(filtered)
         if not self.main_axis_initialized:
             self.main_axis = candidate
             self.main_axis_initialized = True
             self.main_axis_seed_magnitude = candidate_magnitude
-            self.main_axis_update_count = 1
+            self.main_axis_update_count = delta_seconds / REFERENCE_DT_SECONDS
             self.main_axis_last_update_ms = timestamp_ms
             self._orthogonalize_axis()
             return
@@ -906,7 +1021,8 @@ class SpeedEstimator:
         if self.main_axis_locked:
             if v_dot(candidate, self.main_axis) < 0:
                 candidate = v_scale(candidate, -1.0)
-            self.main_axis = v_norm(v_mix(self.main_axis, candidate, self.axis_mix_locked))
+            alpha = alpha_for_delta(self.axis_mix_locked, delta_seconds)
+            self.main_axis = v_norm(v_mix(self.main_axis, candidate, alpha))
             self._orthogonalize_axis()
             return
 
@@ -918,16 +1034,17 @@ class SpeedEstimator:
         ):
             self.main_axis = candidate
             self.main_axis_seed_magnitude = candidate_magnitude
-            self.main_axis_update_count += 1
+            self.main_axis_update_count += delta_seconds / REFERENCE_DT_SECONDS
             self.main_axis_last_update_ms = timestamp_ms
             self._orthogonalize_axis()
             return
 
         if alignment < 0:
             candidate = v_scale(candidate, -1.0)
-        self.main_axis = v_norm(v_mix(self.main_axis, candidate, self.axis_mix_unlocked))
+        alpha = alpha_for_delta(self.axis_mix_unlocked, delta_seconds)
+        self.main_axis = v_norm(v_mix(self.main_axis, candidate, alpha))
         self.main_axis_seed_magnitude = max(self.main_axis_seed_magnitude, candidate_magnitude)
-        self.main_axis_update_count += 1
+        self.main_axis_update_count += delta_seconds / REFERENCE_DT_SECONDS
         self.main_axis_last_update_ms = timestamp_ms
         self._orthogonalize_axis()
 
@@ -938,7 +1055,10 @@ class SpeedEstimator:
             self.main_axis = v_norm(v_sub(self.main_axis, v_scale(grav_dir, proj)))
 
     def axis_lock_window_stable(self) -> bool:
-        if len(self.window_frames) < self.axis_window_min_frames:
+        if (
+            window_duration_seconds(self.window_frames)
+            < self.axis_window_min_seconds
+        ):
             return False
         return (
             average_acc_step(self.window_frames) < self.axis_stable_acc_step
@@ -948,7 +1068,10 @@ class SpeedEstimator:
         )
 
     def axis_lock_window_unstable(self) -> bool:
-        if len(self.window_frames) < self.axis_window_min_frames:
+        if (
+            window_duration_seconds(self.window_frames)
+            < self.axis_window_min_seconds
+        ):
             return False
         return average_acc_step(self.window_frames) > self.axis_unstable_acc_step or average_gravity_deviation(self.window_frames) > self.axis_unstable_gravity_dev
 
@@ -961,10 +1084,30 @@ class SpeedEstimator:
         filtered: Vector3,
         acc_step: float,
         gravity_deviation: float,
+        elapsed_seconds: float,
+        continuous: bool,
     ) -> None:
-        self.window_frames.append(AccelWindowFrame(timestamp_ms, forward, lateral, gyro_magnitude, filtered, acc_step, gravity_deviation))
-        while self.window_frames and (
-            len(self.window_frames) > self.axis_window_max_frames or timestamp_ms - self.window_frames[0].timestamp_ms > self.axis_window_max_ms
+        if not continuous:
+            self.window_frames = []
+        self.window_frames.append(
+            AccelWindowFrame(
+                timestamp_ms,
+                forward,
+                lateral,
+                gyro_magnitude,
+                filtered,
+                acc_step,
+                gravity_deviation,
+                elapsed_seconds,
+            )
+        )
+        while (
+            len(self.window_frames) > 1
+            and (
+                len(self.window_frames) > MOTION_WINDOW_MAX_FRAMES
+                or window_duration_seconds(self.window_frames)
+                > self.axis_window_max_seconds
+            )
         ):
             self.window_frames.pop(0)
 
@@ -1044,9 +1187,13 @@ class SpeedEstimator:
         for index in range(window_start, window_end + 1):
             frame = frames[index]
             frame.distance_before_m = anchor_distance_m
+            if not frame.continuous:
+                self.filtered_acceleration = v_empty()
             motion_acceleration = v_sub(frame.acceleration, self.gravity_estimate)
             clipped = clip_magnitude(motion_acceleration, self.accel_clip_ceiling)
-            filtered = self.low_pass(clipped, self.low_pass_alpha)
+            filtered = self.low_pass(
+                clipped, self.low_pass_alpha, frame.delta_seconds
+            )
             self.filtered_acceleration = filtered
             forward = v_dot(filtered, self.main_axis)
             lateral_vector = v_sub(filtered, v_scale(self.main_axis, forward))
@@ -1058,17 +1205,25 @@ class SpeedEstimator:
                 filtered,
                 frame.acc_step,
                 abs(v_mag(frame.acceleration) - 9.80665),
+                frame.elapsed_seconds,
+                frame.continuous,
             )
 
-        positive_acceleration_frames = 0
+        positive_acceleration_seconds = 0.0
+        positive_acceleration_samples = 0
         departure_detected = False
         replay_frame_limit = max(window_end + 1, len(frames) - 1)
         for index in range(window_end + 1, replay_frame_limit):
             frame = frames[index]
             frame.distance_before_m = self.distance_m
+            if not frame.continuous:
+                self.filtered_acceleration = v_empty()
             motion_acceleration = v_sub(frame.acceleration, self.gravity_estimate)
             clipped = clip_magnitude(motion_acceleration, self.accel_clip_ceiling)
-            filtered = self.low_pass(clipped, self.low_pass_alpha)
+            raw_forward = v_dot(clipped, self.main_axis)
+            filtered = self.low_pass(
+                clipped, self.low_pass_alpha, frame.delta_seconds
+            )
             self.filtered_acceleration = filtered
             forward = v_dot(filtered, self.main_axis)
             lateral_vector = v_sub(filtered, v_scale(self.main_axis, forward))
@@ -1081,6 +1236,8 @@ class SpeedEstimator:
                 filtered,
                 frame.acc_step,
                 abs(v_mag(frame.acceleration) - 9.80665),
+                frame.elapsed_seconds,
+                frame.continuous,
             )
             state = self.detect_motion_state(
                 forward,
@@ -1103,11 +1260,23 @@ class SpeedEstimator:
                 (previous_velocity_mps + self.velocity_mps) / 2.0
             ) * frame.delta_seconds
 
-            if forward > self.accel_forward and frame.gyro_magnitude < self.calibration_motion_gyro_max:
-                positive_acceleration_frames += 1
+            if not frame.continuous:
+                positive_acceleration_seconds = 0.0
+                positive_acceleration_samples = 0
+            if (
+                forward > self.accel_forward
+                and raw_forward > self.accel_forward
+                and frame.gyro_magnitude < self.calibration_motion_gyro_max
+            ):
+                positive_acceleration_seconds += frame.elapsed_seconds
+                positive_acceleration_samples += 1
             else:
-                positive_acceleration_frames = 0
-            if positive_acceleration_frames >= 3:
+                positive_acceleration_seconds = 0.0
+                positive_acceleration_samples = 0
+            if (
+                positive_acceleration_seconds >= DEPARTURE_EVIDENCE_SECONDS
+                and positive_acceleration_samples >= 3
+            ):
                 departure_detected = True
 
         if not departure_detected:
@@ -1174,6 +1343,10 @@ APP_PARITY_CONFIG = {
     **APP_PARITY_ESTIMATOR_CONFIG,
     **APP_PARITY_REPLAY_CONFIG,
 }
+
+
+def window_duration_seconds(frames: List[AccelWindowFrame]) -> float:
+    return sum(frame.elapsed_seconds for frame in frames)
 
 
 def average_lateral(frames: List[AccelWindowFrame]) -> float:
@@ -1257,15 +1430,51 @@ def make_sensor_frame(row: Dict[str, Any]) -> Optional[SensorFrame]:
     )
 
 
-def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+@dataclass(frozen=True)
+class JsonlReadInfo:
+    complete: bool
+    ignored_tail_line_number: Optional[int] = None
+    ignored_tail_byte_count: int = 0
+
+    def summary(self, allow_truncated_tail: bool) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "status": "complete" if self.complete else "incomplete_truncated_tail_ignored",
+            "complete": self.complete,
+            "allowTruncatedTail": allow_truncated_tail,
+            "truncatedTailIgnored": not self.complete,
+        }
+        if not self.complete:
+            result["ignoredTail"] = {
+                "lineNumber": self.ignored_tail_line_number,
+                "byteCount": self.ignored_tail_byte_count,
+            }
+        return result
+
+
+def read_jsonl_with_info(
+    path: Path,
+    allow_truncated_tail: bool = False,
+) -> Tuple[List[Dict[str, Any]], JsonlReadInfo]:
     rows: List[Dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
-            line = line.strip()
-            if line:
+            has_line_terminator = line.endswith("\n")
+            stripped_line = line.strip()
+            if stripped_line:
+                # Schema 15+ records raw callbacks for cadence research.
+                # Estimator replay consumes the composite `sensor` rows instead,
+                # so callback rows do not change replay order or results. Decode
+                # them first so malformed callback rows cannot bypass strict
+                # JSONL integrity checks.
                 try:
-                    row = json.loads(line)
+                    row = json.loads(stripped_line)
                 except json.JSONDecodeError as error:
+                    if allow_truncated_tail and not has_line_terminator:
+                        return rows, JsonlReadInfo(
+                            complete=False,
+                            ignored_tail_line_number=line_number,
+                            ignored_tail_byte_count=len(line.encode("utf-8")),
+                        )
                     raise ValueError(
                         f"{path}:{line_number}: invalid JSONL: {error.msg} "
                         f"(column {error.colno})"
@@ -1292,10 +1501,21 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
                             f"{path}:{line_number}: recordSeq must be a non-negative integer"
                         )
                     row["recordSeq"] = int(parsed_record_seq)
+                if row.get("recordType") == "sensor_callback":
+                    continue
                 rows.append(row)
     # JSONL append order (and recordSeq within a session) is the callback execution
     # order. Wall-clock timestampMs can move backwards, so globally sorting here can
     # invert stop/start and parking events across measurement runs.
+    return rows, JsonlReadInfo(complete=True)
+
+
+def read_jsonl(
+    path: Path,
+    allow_truncated_tail: bool = False,
+) -> List[Dict[str, Any]]:
+    """Read validated JSONL rows while preserving the historical list return type."""
+    rows, _ = read_jsonl_with_info(path, allow_truncated_tail=allow_truncated_tail)
     return rows
 
 
@@ -1340,8 +1560,7 @@ def replay(
     running = False
     tunnel_inside = False
     has_gnss_anchor = False
-    latest_gnss_speed_mps = 0.0
-    latest_gnss_speed_accuracy_mps = -1.0
+    gnss_anchor_usable = False
     first_timestamp = int(rows[0]["timestampMs"]) if rows else 0
     current_run_id: Optional[str] = None
     replay_run_count = 0
@@ -1360,11 +1579,12 @@ def replay(
         row: Dict[str, Any],
         event_name: str,
     ) -> None:
-        nonlocal running, has_gnss_anchor, replay_run_count, current_run_id
+        nonlocal running, has_gnss_anchor, gnss_anchor_usable, replay_run_count, current_run_id
         nonlocal scenario_decided, scenario_is_subway
         estimator.start(timestamp_ms)
         running = True
         has_gnss_anchor = False
+        gnss_anchor_usable = False
         replay_run_count += 1
         recorded_run_id = row.get("measurementRunId")
         current_run_id = (
@@ -1468,11 +1688,11 @@ def replay(
             })
             if parking_kind == "legacy":
                 has_gnss_anchor = True
-                latest_gnss_speed_mps = 0.0
+                gnss_anchor_usable = True
             continue
         if running and parking_kind == "success":
             has_gnss_anchor = True
-            latest_gnss_speed_mps = 0.0
+            gnss_anchor_usable = True
             replay_events.append({"t": timestamp_ms, "event": "parking_calibration_success"})
             continue
         if running and parking_kind == "rejected":
@@ -1485,6 +1705,7 @@ def replay(
             continue
         if event_matches(event, "\u51fa\u96a7"):
             tunnel_inside = False
+            gnss_anchor_usable = False
             if running:
                 replay_events.append({"t": timestamp_ms, "event": "tunnel_exit"})
             continue
@@ -1496,13 +1717,6 @@ def replay(
             speed = parse_number(row, "locationSpeedMps")
             speed_accuracy = parse_number(row, "locationSpeedAccuracyMps")
             source_type = row.get("locationSourceType")
-            if speed is not None:
-                latest_gnss_speed_mps = max(0.0, speed)
-            latest_gnss_speed_accuracy_mps = speed_accuracy if speed_accuracy is not None else -1.0
-            in_vibration = estimator.motion_state in (
-                MotionState.STRONG_VIBRATION,
-                MotionState.CONDUCTION_VIBRATION,
-            )
             try:
                 source_is_phone_anchor = source_type is not None and int(source_type) in (1, 4)
             except (TypeError, ValueError):
@@ -1511,11 +1725,14 @@ def replay(
                 speed is not None
                 and speed_accuracy is not None
                 and speed_accuracy > 0
+                and speed >= speed_accuracy
                 and source_is_phone_anchor
                 and not tunnel_inside
-                and not in_vibration
             ):
                 has_gnss_anchor = True
+                gnss_anchor_usable = True
+            elif not tunnel_inside:
+                gnss_anchor_usable = False
             continue
 
         if not running or row.get("recordType") != "sensor":
@@ -1563,7 +1780,7 @@ def replay(
         parking_result = estimator.consume_parking_calibration_result()
         if parking_result > 0:
             has_gnss_anchor = True
-            latest_gnss_speed_mps = 0.0
+            gnss_anchor_usable = True
             replay_events.append({
                 "t": timestamp_ms,
                 "event": "parking_calibration_replay_success",
@@ -1599,11 +1816,7 @@ def replay(
             "secondsSinceCalibration": (output.timestamp_ms - estimator.last_calibration_ms) / 1000.0,
         })
         estimator.set_pure_mode(
-            1 if (
-                not has_gnss_anchor
-                or latest_gnss_speed_accuracy_mps <= 0
-                or latest_gnss_speed_mps < latest_gnss_speed_accuracy_mps
-            ) else 0
+            0 if has_gnss_anchor and gnss_anchor_usable else 1
         )
 
     return outputs, replay_events
@@ -1705,10 +1918,17 @@ def location_row_is_comparable(row: Dict[str, Any]) -> bool:
     return speed_accuracy is None or speed_accuracy > 0
 
 
-def compare_with_location(rows: List[Dict[str, Any]], outputs: List[Dict[str, Any]], lag_ms: int = 0, speed_key: str = "speedKmh") -> Dict[str, Any]:
+def compare_with_location(
+    rows: List[Dict[str, Any]],
+    outputs: List[Dict[str, Any]],
+    lag_ms: int = 0,
+    speed_key: str = "speedKmh",
+    output_runs: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     if not outputs:
         return {}
-    output_runs = build_output_runs(outputs, speed_key)
+    if output_runs is None:
+        output_runs = build_output_runs(outputs, speed_key)
     diffs: List[float] = []
     moving_diffs: List[float] = []
     paired = 0
@@ -1751,6 +1971,46 @@ def interpolate_output_speed_from_series(timestamps: List[int], speeds: List[flo
         return speeds[index]
     fraction = (timestamp_ms - before_timestamp) / (after_timestamp - before_timestamp)
     return speeds[index - 1] + (speeds[index] - speeds[index - 1]) * fraction
+
+
+def interpolate_phone_inertial_history(
+    available: List[Dict[str, Any]],
+    callback_ms: int,
+) -> float:
+    """Mirror InertialSpeed.ets' 200 ms history and -40 ms interpolation."""
+    if not available:
+        return 0.0
+
+    latest_timestamp_ms = int(available[-1]["timestampMs"])
+    cutoff_ms = latest_timestamp_ms - PHONE_INERTIAL_HISTORY_RETENTION_MS
+    history_start = 0
+    while (
+        history_start + 1 < len(available)
+        and int(available[history_start + 1]["timestampMs"]) <= cutoff_ms
+    ):
+        history_start += 1
+    history = available[history_start:]
+
+    target_ms = callback_ms - PHONE_GNSS_ANCHOR_LAG_MS
+    first = history[0]
+    if target_ms <= int(first["timestampMs"]):
+        return float(first["speedKmh"]) / 3.6
+
+    for index in range(1, len(history)):
+        previous = history[index - 1]
+        current = history[index]
+        current_timestamp_ms = int(current["timestampMs"])
+        if target_ms <= current_timestamp_ms:
+            previous_timestamp_ms = int(previous["timestampMs"])
+            duration_ms = current_timestamp_ms - previous_timestamp_ms
+            if duration_ms <= 0:
+                return float(current["speedKmh"]) / 3.6
+            ratio = (target_ms - previous_timestamp_ms) / duration_ms
+            previous_mps = float(previous["speedKmh"]) / 3.6
+            current_mps = float(current["speedKmh"]) / 3.6
+            return previous_mps + (current_mps - previous_mps) * ratio
+
+    return float(history[-1]["speedKmh"]) / 3.6
 
 
 def diff_stats(values: List[float]) -> Dict[str, float]:
@@ -1853,9 +2113,16 @@ def scan_location_lag(
 ) -> Dict[str, Any]:
     if not outputs:
         return {}
+    output_runs = build_output_runs(outputs, speed_key)
     scans: List[Dict[str, Any]] = []
     for lag_ms in range(min_lag_ms, max_lag_ms + 1, step_ms):
-        comparison = compare_with_location(rows, outputs, lag_ms, speed_key)
+        comparison = compare_with_location(
+            rows,
+            outputs,
+            lag_ms,
+            speed_key,
+            output_runs,
+        )
         moving = comparison.get("moving", {})
         if moving.get("count"):
             scans.append({
@@ -1895,8 +2162,9 @@ def build_anchored_outputs_v2(
     anchor_power: float = 1.0,
     pure_zero: bool = False,
     anchor_interval_ms: int = 0,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """ArkTS anchor logic v2: vibration freeze + tunnel lockout + confidence blend.
+    """ArkTS anchor logic v2: GNSS reliability + tunnel lockout + confidence blend.
     anchor_power: exponent applied to confidence before blend. >1.0 gives more anchor weight.
     pure_zero: skip blend entirely, output anchor+delta directly (matches phone).
     anchor_interval_ms: minimum ms between anchors. 0 = every valid GNSS point (phone behavior)."""
@@ -1913,8 +2181,6 @@ def build_anchored_outputs_v2(
         return row_index if uses_source_order else timestamp_ms
 
     tunnel_inside = False
-    latest_gnss_speed_mps = 0.0
-    latest_gnss_accuracy_mps = -1.0
     active_run_id: Optional[str] = None
     anchors_by_run: Dict[str, List[Tuple[int, float, float]]] = {
         run_id: [] for run_id in output_runs
@@ -1929,6 +2195,15 @@ def build_anchored_outputs_v2(
     history_resets_by_run: Dict[str, List[Tuple[int, int]]] = {
         run_id: [] for run_id in output_runs
     }
+    history_by_run: Dict[str, List[Dict[str, Any]]] = {
+        run_id: [] for run_id in output_runs
+    }
+    output_by_source_order: Dict[int, Dict[str, Any]] = (
+        {int(item["sourceRowIndex"]): item for item in outputs}
+        if uses_source_order
+        else {}
+    )
+    raw_eligible_anchor_speeds_kmh: List[float] = []
 
     def resolve_run_id(
         row: Dict[str, Any],
@@ -1966,6 +2241,7 @@ def build_anchored_outputs_v2(
             return
         active_run_id = run_id
         has_anchor_by_run[run_id] = False
+        history_by_run[run_id] = []
         reliability_by_run[run_id].append((callback_order, False))
 
     def inertial_history_value(
@@ -1973,8 +2249,16 @@ def build_anchored_outputs_v2(
         callback_ms: int,
         callback_order: int,
     ) -> float:
-        # Index.ets keeps only the five most recent sensor callbacks and chooses the
-        # one nearest callbackTime-40 ms. Future sensor rows must never participate.
+        # The normal replay path carries sourceRowIndex. Mirror the app's rolling
+        # 200 ms history while rows are traversed, so every location callback only
+        # scans the small live window instead of all outputs in the run.
+        if uses_source_order:
+            history = history_by_run[run_id]
+            if not history:
+                return 0.0
+            return interpolate_phone_inertial_history(history, callback_ms)
+
+        # Legacy callers without source order keep the timestamp-based fallback.
         items = output_runs[run_id]["items"]
         reset_candidates = [
             reset for reset in history_resets_by_run[run_id]
@@ -2012,10 +2296,7 @@ def build_anchored_outputs_v2(
         ]
         if not available:
             return 0.0
-        recent = available[-5:]
-        target_ms = callback_ms - PHONE_GNSS_ANCHOR_LAG_MS
-        best = min(recent, key=lambda item: abs(int(item["timestampMs"]) - target_ms))
-        return float(best["speedKmh"]) / 3.6
+        return interpolate_phone_inertial_history(available, callback_ms)
 
     for source_row_index, row in enumerate(rows):
         t = int(row.get("timestampMs", 0))
@@ -2061,10 +2342,31 @@ def build_anchored_outputs_v2(
                     resolve_run_id(row, t, source_row_index, prefer_active=False),
                     callback_order,
                 )
+            if uses_source_order:
+                replay_item = output_by_source_order.get(source_row_index)
+                if replay_item is not None:
+                    replay_run_value = replay_item.get("measurementRunId")
+                    replay_run_id = (
+                        str(replay_run_value)
+                        if replay_run_value not in (None, "")
+                        else "__legacy_single_run__"
+                    )
+                    if replay_run_id in history_by_run:
+                        history = history_by_run[replay_run_id]
+                        history.append(replay_item)
+                        cutoff_ms = int(replay_item["timestampMs"]) - PHONE_INERTIAL_HISTORY_RETENTION_MS
+                        while (
+                            len(history) > 1
+                            and int(history[1]["timestampMs"]) <= cutoff_ms
+                        ):
+                            history.pop(0)
         if "\u5165\u96a7" in evt or "\u5165\u96a7" in notes:
             tunnel_inside = True
         elif "\u51fa\u96a7" in evt or "\u51fa\u96a7" in notes:
             tunnel_inside = False
+            run_id = resolve_run_id(row, t, source_row_index)
+            if run_id is not None:
+                reliability_by_run[run_id].append((callback_order, False))
         if parking_kind in ("success", "legacy"):
             run_id = resolve_run_id(row, t, source_row_index)
             if run_id is not None:
@@ -2072,13 +2374,18 @@ def build_anchored_outputs_v2(
                 # result callback, not at the earlier request time.
                 anchors_by_run[run_id].append((callback_order, 0.0, 0.0))
                 history_resets_by_run[run_id].append((callback_order, t))
+                if uses_source_order:
+                    history = history_by_run[run_id]
+                    reset_frame = next(
+                        (
+                            item for item in reversed(history)
+                            if int(item["timestampMs"]) == t
+                        ),
+                        None,
+                    )
+                    history_by_run[run_id] = [reset_frame] if reset_frame is not None else []
                 has_anchor_by_run[run_id] = True
-                latest_gnss_speed_mps = 0.0
-                reliability_by_run[run_id].append((
-                    callback_order,
-                    latest_gnss_accuracy_mps > 0
-                    and latest_gnss_speed_mps >= latest_gnss_accuracy_mps,
-                ))
+                reliability_by_run[run_id].append((callback_order, True))
         if event_matches(evt, "\u505c\u6b62\u6d4b\u901f"):
             active_run_id = None
         if row.get("recordType") == "event" or parking_kind is not None:
@@ -2092,32 +2399,31 @@ def build_anchored_outputs_v2(
         acc = parse_number(row, "locationSpeedAccuracyMps")
         if spd_mps is None:
             continue
-        latest_gnss_speed_mps = max(0.0, spd_mps)
-        latest_gnss_accuracy_mps = acc if acc is not None else -1.0
         run_id = resolve_run_id(row, t, source_row_index)
         if run_id is None or row.get("measurementActive") is False:
             continue
+        if tunnel_inside:
+            continue
+        source_type: Optional[int] = None
+        if src is not None:
+            try:
+                source_type = int(src)
+            except (TypeError, ValueError):
+                source_type = None
+        anchor_eligible = (
+            acc is not None
+            and acc > 0
+            and spd_mps >= acc
+            and source_type in (1, 4)
+        )
         reliability_by_run[run_id].append((
             callback_order,
-            has_anchor_by_run[run_id]
-            and latest_gnss_accuracy_mps > 0
-            and latest_gnss_speed_mps >= latest_gnss_accuracy_mps,
+            has_anchor_by_run[run_id] and anchor_eligible,
         ))
-
-        if tunnel_inside or acc is None or acc <= 0 or src is None:
-            continue
-        try:
-            source_type = int(src)
-        except (TypeError, ValueError):
-            continue
-        if source_type not in (1, 4):
+        if not anchor_eligible:
             continue
 
-        ms = motion_state_at_or_before(
-            output_runs[run_id]["items"], callback_order, uses_source_order
-        )
-        if ms in ("strong_vibration", "conduction_vibration"):
-            continue
+        raw_eligible_anchor_speeds_kmh.append(spd_mps * 3.6)
 
         if anchor_interval_ms > 0 and t - last_anchor_ts_by_run[run_id] < anchor_interval_ms:
             continue
@@ -2128,9 +2434,7 @@ def build_anchored_outputs_v2(
         has_anchor_by_run[run_id] = True
         reliability_by_run[run_id].append((
             callback_order,
-            latest_gnss_accuracy_mps > 0
-            and
-            latest_gnss_speed_mps >= latest_gnss_accuracy_mps,
+            True,
         ))
 
     result: List[Dict[str, Any]] = []
@@ -2144,6 +2448,11 @@ def build_anchored_outputs_v2(
         last_anchor_spd = 0.0
         last_anchor_inertial = 0.0
         gnss_reliable = False
+        display_distance_m = 0.0
+        display_elapsed_ms = 0.0
+        display_max_speed_kmh = 0.0
+        last_display_speed_mps = 0.0
+        last_display_timestamp_ms: Optional[float] = None
         for item in series["items"]:
             t = int(item["timestampMs"])
             output_order = item_order(item)
@@ -2173,6 +2482,31 @@ def build_anchored_outputs_v2(
                     conf * pure_speed_kmh
                     + (1.0 - conf) * anchored_raw_mps * 3.6
                 )
+            sensor_timestamp = parse_number(item, "sensorTimestamp")
+            display_timestamp_ms = (
+                sensor_timestamp / 1_000_000.0
+                if sensor_timestamp is not None
+                else float(item["timestampMs"])
+            )
+            current_display_speed_mps = max(0.0, anchored_speed_kmh / 3.6)
+            if (
+                last_display_timestamp_ms is not None
+                and display_timestamp_ms > last_display_timestamp_ms
+            ):
+                elapsed_ms = display_timestamp_ms - last_display_timestamp_ms
+                if elapsed_ms <= 80.0:
+                    display_distance_m += (
+                        (last_display_speed_mps + current_display_speed_mps) / 2.0
+                    ) * (elapsed_ms / 1000.0)
+                    display_elapsed_ms += elapsed_ms
+            last_display_timestamp_ms = display_timestamp_ms
+            last_display_speed_mps = current_display_speed_mps
+            display_max_speed_kmh = max(display_max_speed_kmh, anchored_speed_kmh)
+            display_average_speed_kmh = (
+                display_distance_m / (display_elapsed_ms / 1000.0) * 3.6
+                if display_elapsed_ms > 0
+                else 0.0
+            )
             result.append({
                 **item,
                 "anchoredSpeedKmh": anchored_speed_kmh,
@@ -2180,26 +2514,12 @@ def build_anchored_outputs_v2(
                 "inertialDeltaKmh": (inertial_mps - last_anchor_inertial) * 3.6,
                 "anchorApplied": gnss_reliable,
                 "gnssReliable": gnss_reliable,
+                "displayMaxSpeedKmh": display_max_speed_kmh,
+                "displayAverageSpeedKmh": display_average_speed_kmh,
             })
+    if diagnostics is not None:
+        diagnostics["rawEligibleAnchorSpeedsKmh"] = raw_eligible_anchor_speeds_kmh
     return sorted(result, key=item_order)
-
-
-def motion_state_at_or_before(
-    output_items: List[Dict[str, Any]],
-    target_order: int,
-    uses_source_order: bool = False,
-) -> str:
-    if not output_items:
-        return "unknown"
-    eligible = [
-        item for item in output_items
-        if int(item.get("sourceRowIndex", item["timestampMs"])) <= target_order
-    ] if uses_source_order else [
-        item for item in output_items if int(item["timestampMs"]) <= target_order
-    ]
-    if not eligible:
-        return "calibrating"
-    return str(eligible[-1].get("motionState", "unknown"))
 
 
 def recorded_estimator_abs_diffs(
@@ -2223,6 +2543,20 @@ def recorded_estimator_abs_diffs(
         if parse_number(row, "pureInertialSpeedKmh") is not None
     ]
     if pure_estimator_rows:
+        samples_by_run_and_seq: Dict[str, Dict[Tuple[float, int], Dict[str, Any]]] = {}
+        samples_by_run_and_time: Dict[str, Dict[int, List[Dict[str, Any]]]] = {}
+        for run_id, series in output_runs.items():
+            by_seq: Dict[Tuple[float, int], Dict[str, Any]] = {}
+            by_time: Dict[int, List[Dict[str, Any]]] = {}
+            for item in series["items"]:
+                item_timestamp_ms = int(item["timestampMs"])
+                by_time.setdefault(item_timestamp_ms, []).append(item)
+                item_record_seq = parse_number(item, "recordSeq")
+                if item_record_seq is not None:
+                    by_seq[(item_record_seq, item_timestamp_ms)] = item
+            samples_by_run_and_seq[run_id] = by_seq
+            samples_by_run_and_time[run_id] = by_time
+
         differences: List[float] = []
         for row in pure_estimator_rows:
             recorded = parse_number(row, "pureInertialSpeedKmh")
@@ -2237,23 +2571,17 @@ def recorded_estimator_abs_diffs(
                 continue
             replayed: Optional[float] = None
             estimator_record_seq = parse_number(row, "recordSeq")
+            run_id = str(series["runId"])
             if estimator_record_seq is not None:
-                preceding = [
-                    item for item in series["items"]
-                    if parse_number(item, "recordSeq") is not None
-                    and float(item["recordSeq"]) + 1 == estimator_record_seq
-                    and int(item["timestampMs"]) == timestamp_ms
-                ]
-                if preceding:
-                    matched = max(preceding, key=lambda item: float(item["recordSeq"]))
+                matched = samples_by_run_and_seq[run_id].get(
+                    (estimator_record_seq - 1.0, timestamp_ms)
+                )
+                if matched is not None:
                     replayed = float(matched["speedKmh"])
             if replayed is None and estimator_record_seq is None:
-                exact_indices = [
-                    index for index, sample_timestamp in enumerate(series["timestamps"])
-                    if sample_timestamp == timestamp_ms
-                ]
-                if len(exact_indices) == 1:
-                    replayed = float(series["speeds"][exact_indices[0]])
+                exact_samples = samples_by_run_and_time[run_id].get(timestamp_ms, [])
+                if len(exact_samples) == 1:
+                    replayed = float(exact_samples[0]["speedKmh"])
             if replayed is not None:
                 differences.append(abs(replayed - recorded))
         return (
@@ -2357,18 +2685,43 @@ def summarize(
             ),
         }
     if use_anchor_v2:
-        anchored = build_anchored_outputs_v2(rows, outputs, anchor_power, pure_zero, anchor_interval_ms)
+        anchor_diagnostics: Dict[str, Any] = {}
+        anchored = build_anchored_outputs_v2(
+            rows,
+            outputs,
+            anchor_power,
+            pure_zero,
+            anchor_interval_ms,
+            anchor_diagnostics,
+        )
         if anchored:
             anchored_speeds = [float(item["anchoredSpeedKmh"]) for item in anchored]
-            summary["anchorSpeed"] = {
+            anchored_display_speed = {
                 "minKmh": min(anchored_speeds),
                 "medianKmh": statistics.median(anchored_speeds),
                 "p90Kmh": quantile(anchored_speeds, 0.9),
                 "maxKmh": max(anchored_speeds),
                 "appliedSamples": sum(1 for item in anchored if item.get("anchorApplied") is True),
             }
+            summary["anchoredDisplaySpeed"] = anchored_display_speed
+            summary["anchorSpeed"] = {
+                **anchored_display_speed,
+                "deprecatedAliasFor": "anchoredDisplaySpeed",
+            }
         else:
+            summary["anchoredDisplaySpeed"] = {}
             summary["anchorSpeed"] = {}
+        raw_anchor_speeds = anchor_diagnostics.get("rawEligibleAnchorSpeedsKmh", [])
+        if raw_anchor_speeds:
+            summary["rawEligibleAnchorSpeed"] = {
+                "count": len(raw_anchor_speeds),
+                "minKmh": min(raw_anchor_speeds),
+                "medianKmh": statistics.median(raw_anchor_speeds),
+                "p90Kmh": quantile(raw_anchor_speeds, 0.9),
+                "maxKmh": max(raw_anchor_speeds),
+            }
+        else:
+            summary["rawEligibleAnchorSpeed"] = {}
         summary["locationComparison"] = compare_with_location(rows, outputs, lag_ms=gnss_lag_ms)
         summary["anchoredComparison"] = compare_with_location(rows, anchored, lag_ms=gnss_lag_ms, speed_key="anchoredSpeedKmh")
         summary["anchoredLagScan"] = scan_location_lag(rows, anchored, speed_key="anchoredSpeedKmh")
@@ -2493,6 +2846,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Replay MetroSpeed estimator against exported JSONL logs.")
     parser.add_argument("jsonl", type=Path)
     parser.add_argument("--out", type=Path, default=None, help="Optional replay JSONL output path.")
+    parser.add_argument(
+        "--allow-truncated-tail",
+        action="store_true",
+        help=(
+            "Allow only one malformed final JSON fragment when it has no line "
+            "terminator; the summary is marked as incomplete."
+        ),
+    )
     parser.add_argument("--no-strict-start", action="store_true", help="Do not abort when current app would reject initial calibration.")
     parser.add_argument("--curve-positive-scale", type=float, default=0.35, help="Scale positive acceleration while in curve state.")
     parser.add_argument("--curve-negative-scale", type=float, default=0.35, help="Scale negative acceleration while in curve state.")
@@ -2501,8 +2862,8 @@ def main() -> int:
     parser.add_argument("--braking-negative-scale", type=float, default=1.0, help="Scale negative acceleration while in braking state.")
     parser.add_argument("--no-infer-start", action="store_true", help="Do not infer measurement start from estimator-bearing sensor rows.")
     parser.add_argument("--use-gyro-gravity", action="store_true", help="Experimental only: not implemented in the ArkTS app.")
-    parser.add_argument("--use-sys-gravity", action="store_true", help="Experimental only: use system gravity sensor instead of estimated gravity when available.")
-    parser.add_argument("--adaptive-gravity", action="store_true", help="Analysis only: magnetometer scenario detector switches gravity source per-frame (driving=system gravity, subway=self-estimated).")
+    parser.add_argument("--use-sys-gravity", action="store_true", help="Legacy-log analysis only: use system gravity when old records contain it.")
+    parser.add_argument("--adaptive-gravity", action="store_true", help="Legacy-log analysis only: switch gravity source when old records contain system gravity.")
     parser.add_argument("--gyro-gravity-sign", type=float, default=-1.0, help="Sign for gyro gravity propagation. Use -1 for body-frame inertial vector update.")
     parser.add_argument("--no-vibration-guard", action="store_true", help="Disable high acceleration-step vibration guarding.")
     parser.add_argument("--vibration-threshold", type=float, default=0.85, help="Mean acceleration-step threshold for vibration low-confidence handling.")
@@ -2598,7 +2959,10 @@ def main() -> int:
     low_confidence_negative_scale = args.low_confidence_negative_scale
 
     try:
-        rows = read_jsonl(args.jsonl)
+        rows, read_info = read_jsonl_with_info(
+            args.jsonl,
+            allow_truncated_tail=args.allow_truncated_tail,
+        )
     except (OSError, ValueError) as error:
         parser.error(str(error))
     if not rows:
@@ -2633,6 +2997,14 @@ def main() -> int:
     if not outputs:
         parser.error("replay produced no sensor samples")
     summary = summarize(rows, outputs, events, replay_config, use_anchor_v2=getattr(args, "anchor_v2", False), anchor_power=args.anchor_power, pure_zero=args.pure_zero, gnss_lag_ms=args.gnss_lag_ms, anchor_interval_ms=args.anchor_interval_ms)
+    summary["inputIntegrity"] = read_info.summary(args.allow_truncated_tail)
+
+    if not read_info.complete:
+        print(
+            f"warning: input JSONL is incomplete; ignored unterminated malformed "
+            f"tail at line {read_info.ignored_tail_line_number}",
+            file=sys.stderr,
+        )
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if args.out is not None:

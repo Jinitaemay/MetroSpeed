@@ -11,12 +11,12 @@ import {
 } from './SpeedTypes';
 
 interface AccelWindowFrame {
-  timestampMs: number;
   forward: number;
   lateral: number;
   gyroMagnitude: number;
   accStep: number;
   gravityDeviation: number;
+  elapsedSeconds: number;
 }
 
 interface PreCalFrame {
@@ -25,9 +25,28 @@ interface PreCalFrame {
   gyroMagnitude: number;
   accStep: number;
   deltaSeconds: number;
+  elapsedSeconds: number;
+  continuous: boolean;
   distanceBeforeM: number;
   integrated: boolean;
 }
+
+interface FrameTiming {
+  deltaSeconds: number;
+  elapsedSeconds: number;
+  continuous: boolean;
+}
+
+const REFERENCE_SAMPLE_SECONDS = 0.02;
+const MAX_CONTINUOUS_SAMPLE_SECONDS = 0.08;
+const PRE_CAL_BUFFER_SECONDS = 3.6;
+const PRE_CAL_MAX_FRAMES = 800;
+const PARKING_WINDOW_SECONDS = 1.5;
+const PARKING_WINDOW_MIN_SAMPLES = 30;
+const MOTION_WINDOW_MIN_SECONDS = 0.4;
+const MOTION_WINDOW_MAX_SECONDS = 1.6;
+const MOTION_WINDOW_MAX_FRAMES = 400;
+const DEPARTURE_EVIDENCE_SECONDS = 0.06;
 
 export class SpeedEstimator {
   private running: boolean = false;
@@ -44,7 +63,6 @@ export class SpeedEstimator {
   private mainAxisLocked: boolean = false;
   private mainAxisSeedMagnitude: number = 0;
   private mainAxisUpdateCount: number = 0;
-  private mainAxisLastUpdateMs: number = 0;
   private calibrationCount: number = 0;
   private calibrationUntilMs: number = 0;
   private calibrationSum: Vector3 = emptyVector();
@@ -52,7 +70,6 @@ export class SpeedEstimator {
   private calibrationGyroSum: number = 0;
   private calibrationGyroMax: number = 0;
   private calibrationMaxStep: number = 0;
-  private calibrationLastAcceleration?: Vector3;
   private calibrationSamples: number = 0;
   private calibrationFirstSampleMs: number = 0;
   private calibrationLastSampleMs: number = 0;
@@ -72,15 +89,12 @@ export class SpeedEstimator {
   private parkingCalibrationSnapshot: PreCalFrame[] = [];
   private parkingPostRequestFrames: PreCalFrame[] = [];
   private lastRawAcceleration?: Vector3;
+  private lastValidDeltaSeconds: number = REFERENCE_SAMPLE_SECONDS;
 
   private initialCalibrationDone: boolean = false;
 
   getVelocityMps(): number {
     return this.velocityMps;
-  }
-
-  getMotionState(): MotionState {
-    return this.motionState;
   }
 
   setPureMode(pure: number): void {
@@ -98,6 +112,7 @@ export class SpeedEstimator {
     this.startMs = timestampMs;
     this.lastTimestampMs = timestampMs;
     this.lastSensorTimestampNs = null;
+    this.lastValidDeltaSeconds = REFERENCE_SAMPLE_SECONDS;
     this.velocityMps = 0;
     this.distanceM = 0;
     this.maxSpeedKmh = 0;
@@ -108,7 +123,6 @@ export class SpeedEstimator {
     this.mainAxisLocked = false;
     this.mainAxisSeedMagnitude = 0;
     this.mainAxisUpdateCount = 0;
-    this.mainAxisLastUpdateMs = 0;
     this.calibrationCount = 0;
     this.confidence = 0;
     this.windowFrames = [];
@@ -135,6 +149,7 @@ export class SpeedEstimator {
     this.velocityMps = 0;
     this.lastTimestampMs = timestampMs;
     this.lastSensorTimestampNs = null;
+    this.lastValidDeltaSeconds = REFERENCE_SAMPLE_SECONDS;
     this.parkingCalibrationPending = false;
     this.parkingCalibrationRejectedUntilMs = 0;
     this.parkingCalibrationSuccessUntilMs = 0;
@@ -163,6 +178,7 @@ export class SpeedEstimator {
     this.startMs = timestampMs;
     this.lastTimestampMs = timestampMs;
     this.lastSensorTimestampNs = null;
+    this.lastValidDeltaSeconds = REFERENCE_SAMPLE_SECONDS;
     this.velocityMps = 0;
     this.distanceM = 0;
     this.maxSpeedKmh = 0;
@@ -175,7 +191,6 @@ export class SpeedEstimator {
     this.mainAxisLocked = false;
     this.mainAxisSeedMagnitude = 0;
     this.mainAxisUpdateCount = 0;
-    this.mainAxisLastUpdateMs = 0;
     this.calibrationCount = 0;
     this.confidence = 0;
     this.windowFrames = [];
@@ -185,7 +200,6 @@ export class SpeedEstimator {
     this.calibrationGyroSum = 0;
     this.calibrationGyroMax = 0;
     this.calibrationMaxStep = 0;
-    this.calibrationLastAcceleration = undefined;
     this.calibrationFirstSampleMs = 0;
     this.calibrationLastSampleMs = 0;
     this.calibrationRejectedUntilMs = 0;
@@ -232,9 +246,22 @@ export class SpeedEstimator {
       return this.makeFrame(frame, this.currentStats(frame.timestampMs, '等待开始'));
     }
 
-    const dt = this.computeDeltaSeconds(frame);
+    const timing = this.computeFrameTiming(frame);
+    const dt = timing.deltaSeconds;
     const rawAcceleration = frame.acceleration;
-    const accStep = this.computeAccStep(rawAcceleration);
+    if (!timing.continuous) {
+      // Integration is deliberately clamped across callback stalls, but short
+      // evidence windows must restart instead of spanning an unobserved gap.
+      this.preCalBuffer = [];
+      this.windowFrames = [];
+      this.filteredAcceleration = emptyVector();
+      if (!this.initialCalibrationDone && !this.parkingCalibrationPending) {
+        // A partially collected initial calibration is not continuous evidence.
+        // Restart its timer and statistics without counting a second calibration.
+        this.resetCalibrationEvidence(frame.timestampMs);
+      }
+    }
+    const accStep = this.computeAccStep(rawAcceleration, timing.elapsedSeconds, timing.continuous);
 
     // Initial calibration duration is measured from the first real sensor sample.
     // This keeps calibrationCount at one and also handles a delayed first callback.
@@ -244,29 +271,29 @@ export class SpeedEstimator {
     }
 
     const preCalGyro = frame.gyroscope ? magnitude(frame.gyroscope) : 0;
-    if (this.preCalBuffer.length >= 180) {
-      this.preCalBuffer.shift();
-    }
     const preCalFrame: PreCalFrame = {
       timestampMs: frame.timestampMs,
       acceleration: rawAcceleration,
       gyroMagnitude: preCalGyro,
       accStep,
       deltaSeconds: dt,
+      elapsedSeconds: timing.elapsedSeconds,
+      continuous: timing.continuous,
       distanceBeforeM: this.distanceM,
       integrated: false
     };
     this.preCalBuffer.push(preCalFrame);
+    this.trimPreCalBuffer();
     if (this.parkingCalibrationPending) {
       this.parkingPostRequestFrames.push(preCalFrame);
     }
 
     if (frame.timestampMs <= this.calibrationUntilMs) {
       const calibrationGyroMagnitude = frame.gyroscope ? magnitude(frame.gyroscope) : 0;
-      this.collectCalibration(frame.timestampMs, rawAcceleration, calibrationGyroMagnitude);
+      this.collectCalibration(frame.timestampMs, rawAcceleration, calibrationGyroMagnitude, accStep);
       if (!this.parkingCalibrationPending) {
         return {
-          sample: this.makeSample(frame.timestampMs, rawAcceleration, emptyVector(), MotionState.Calibrating, 0.35),
+          sample: this.makeSample(frame.timestampMs, emptyVector()),
           stats: this.currentStats(frame.timestampMs, '校准中，请保持设备静止'),
           calibration: this.currentCalibration()
         };
@@ -277,29 +304,30 @@ export class SpeedEstimator {
 
     const motionAcceleration = subtract(rawAcceleration, this.gravityEstimate);
     const clipped = clipMagnitude(motionAcceleration, 3.5);
-    const filtered = this.lowPass(clipped, 0.22);
+    const filtered = this.lowPass(clipped, 0.22, dt);
     this.filteredAcceleration = filtered;
 
     const gyroMagnitude = frame.gyroscope ? magnitude(frame.gyroscope) : 0;
     this.updateMainAxisLock(frame.timestampMs);
-    const axisAllowed = this.shouldUpdateMainAxis(filtered, gyroMagnitude, frame.timestampMs);
+    const axisAllowed = this.shouldUpdateMainAxis(filtered, gyroMagnitude);
     if (axisAllowed) {
-      this.updateMainAxis(filtered, frame.timestampMs);
+      this.updateMainAxis(filtered, dt);
     }
 
     const forwardAcceleration = dot(filtered, this.mainAxis);
     const lateralVector = subtract(filtered, scale(this.mainAxis, forwardAcceleration));
     const lateralAcceleration = magnitude(lateralVector);
     this.pushWindowFrame(
-      frame.timestampMs,
       forwardAcceleration,
       lateralAcceleration,
       gyroMagnitude,
       accStep,
-      Math.abs(magnitude(rawAcceleration) - 9.80665)
+      Math.abs(magnitude(rawAcceleration) - 9.80665),
+      timing.elapsedSeconds,
+      timing.continuous
     );
 
-    const state = this.detectMotionState(forwardAcceleration, lateralAcceleration, gyroMagnitude, frame.timestampMs);
+    const state = this.detectMotionState(forwardAcceleration, gyroMagnitude, frame.timestampMs);
     const effectiveAcceleration = this.effectiveForwardAcceleration(forwardAcceleration, state);
     const previousVelocityMps = this.velocityMps;
     this.velocityMps = Math.max(0, this.velocityMps + effectiveAcceleration * dt);
@@ -311,7 +339,7 @@ export class SpeedEstimator {
     this.motionState = state;
     preCalFrame.integrated = true;
 
-    const sample = this.makeSample(frame.timestampMs, rawAcceleration, filtered, state, this.confidence);
+    const sample = this.makeSample(frame.timestampMs, filtered);
 
     return {
       sample,
@@ -321,35 +349,49 @@ export class SpeedEstimator {
   }
 
   private beginCalibration(timestampMs: number): void {
+    this.resetCalibrationEvidence(timestampMs);
+    this.calibrationCount += 1;
+  }
+
+  private resetCalibrationEvidence(timestampMs: number): void {
     this.calibrationUntilMs = timestampMs + 1500;
     this.calibrationSum = emptyVector();
     this.calibrationSquareSum = 0;
     this.calibrationGyroSum = 0;
     this.calibrationGyroMax = 0;
     this.calibrationMaxStep = 0;
-    this.calibrationLastAcceleration = undefined;
     this.calibrationSamples = 0;
     this.calibrationFirstSampleMs = 0;
     this.calibrationLastSampleMs = 0;
-    this.calibrationCount += 1;
     this.lastCalibrationMs = timestampMs;
     this.motionState = MotionState.Calibrating;
   }
 
-  private collectCalibration(timestampMs: number, acceleration: Vector3, gyroMagnitude: number): void {
+  private collectCalibration(timestampMs: number, acceleration: Vector3, gyroMagnitude: number, accStep: number): void {
     if (this.calibrationSamples === 0) {
       this.calibrationFirstSampleMs = timestampMs;
     }
     this.calibrationLastSampleMs = timestampMs;
-    if (this.calibrationLastAcceleration) {
-      this.calibrationMaxStep = Math.max(this.calibrationMaxStep, magnitude(subtract(acceleration, this.calibrationLastAcceleration)));
-    }
-    this.calibrationLastAcceleration = acceleration;
+    this.calibrationMaxStep = Math.max(this.calibrationMaxStep, accStep);
     this.calibrationSum = add(this.calibrationSum, acceleration);
     this.calibrationSquareSum += dot(acceleration, acceleration);
     this.calibrationGyroSum += gyroMagnitude;
     this.calibrationGyroMax = Math.max(this.calibrationGyroMax, gyroMagnitude);
     this.calibrationSamples += 1;
+  }
+
+  private trimPreCalBuffer(): void {
+    let durationSeconds = 0;
+    for (let i = 0; i < this.preCalBuffer.length; i++) {
+      durationSeconds += this.preCalBuffer[i].elapsedSeconds;
+    }
+    while (this.preCalBuffer.length > 1 && durationSeconds > PRE_CAL_BUFFER_SECONDS) {
+      durationSeconds -= this.preCalBuffer[0].elapsedSeconds;
+      this.preCalBuffer.shift();
+    }
+    while (this.preCalBuffer.length > PRE_CAL_MAX_FRAMES) {
+      this.preCalBuffer.shift();
+    }
   }
 
   private finishCalibrationIfNeeded(timestampMs: number): void {
@@ -374,63 +416,77 @@ export class SpeedEstimator {
           break;
         }
       }
-      if (wasParkingCalibration && eligibleParkingFrameCount >= 75) {
-        const windowFrames = 75;
+      if (wasParkingCalibration && eligibleParkingFrameCount >= PARKING_WINDOW_MIN_SAMPLES) {
         let bestStart = -1;
+        let bestEnd = -1;
         let bestRms = Infinity;
-        for (let i = 0; i <= eligibleParkingFrameCount - windowFrames; i++) {
-          const windowEndTimestampMs = parkingFrames[i + windowFrames - 1].timestampMs;
+        for (let i = 0; i < eligibleParkingFrameCount; i++) {
+          let windowDurationSeconds = 0;
+          let windowEnd = i;
+          while (windowEnd < eligibleParkingFrameCount && windowDurationSeconds < PARKING_WINDOW_SECONDS) {
+            windowDurationSeconds += parkingFrames[windowEnd].elapsedSeconds;
+            windowEnd += 1;
+          }
+          if (windowDurationSeconds < PARKING_WINDOW_SECONDS) {
+            break;
+          }
+          const endIndex = windowEnd - 1;
+          const windowFrameCount = endIndex - i + 1;
+          if (windowFrameCount < PARKING_WINDOW_MIN_SAMPLES) {
+            continue;
+          }
+          const windowEndTimestampMs = parkingFrames[endIndex].timestampMs;
           const windowAgeMs = this.parkingCalibrationRequestMs - windowEndTimestampMs;
           if (windowAgeMs < 0 || windowAgeMs > 300) {
             continue;
           }
           let sum = emptyVector();
           let sqSum = 0;
-          for (let j = i; j < i + windowFrames; j++) {
+          for (let j = i; j <= endIndex; j++) {
             const f = parkingFrames[j];
             sum = add(sum, f.acceleration);
             sqSum += dot(f.acceleration, f.acceleration);
           }
-          const mean = scale(sum, 1 / windowFrames);
-          const meanSq = sqSum / windowFrames;
+          const mean = scale(sum, 1 / windowFrameCount);
+          const meanSq = sqSum / windowFrameCount;
           const meanDot = dot(mean, mean);
           const rms = Math.sqrt(Math.max(0, meanSq - meanDot));
           if (rms < bestRms) {
             bestRms = rms;
             bestStart = i;
+            bestEnd = endIndex;
           }
         }
 
-        if (bestStart >= 0) {
+        if (bestStart >= 0 && bestEnd >= bestStart) {
+          const windowFrameCount = bestEnd - bestStart + 1;
           let calSum = emptyVector();
           let calSqSum = 0;
           let calGyroSum = 0;
           let calGyroMax = 0;
           let calMaxStep = 0;
-          let lastAcc: Vector3 | undefined = undefined;
-          for (let j = bestStart; j < bestStart + windowFrames; j++) {
+          for (let j = bestStart; j <= bestEnd; j++) {
             const f = parkingFrames[j];
             calSum = add(calSum, f.acceleration);
             calSqSum += dot(f.acceleration, f.acceleration);
             calGyroSum += f.gyroMagnitude;
             calGyroMax = Math.max(calGyroMax, f.gyroMagnitude);
-            if (lastAcc) {
-              calMaxStep = Math.max(calMaxStep, magnitude(subtract(f.acceleration, lastAcc)));
+            if (j > bestStart) {
+              calMaxStep = Math.max(calMaxStep, f.accStep);
             }
-            lastAcc = f.acceleration;
           }
 
-          gravityCandidate = scale(calSum, 1 / windowFrames);
-          const meanSquare = calSqSum / windowFrames;
+          gravityCandidate = scale(calSum, 1 / windowFrameCount);
+          const meanSquare = calSqSum / windowFrameCount;
           const gravitySquare = dot(gravityCandidate, gravityCandidate);
           const rmsDeviation = Math.sqrt(Math.max(0, meanSquare - gravitySquare));
           const gravityMagnitude = magnitude(gravityCandidate);
           const rawGravityError = Math.abs(gravityMagnitude - 9.80665);
-          const gyroAverage = calGyroSum / windowFrames;
+          const gyroAverage = calGyroSum / windowFrameCount;
           const motionDuringCalibration = gyroAverage > 0.08 || calGyroMax > 0.25 || calMaxStep > 0.65;
           stableResult = rmsDeviation < 0.25 && rawGravityError < 0.25 && !motionDuringCalibration;
           parkingWindowStart = bestStart;
-          parkingWindowEnd = bestStart + windowFrames - 1;
+          parkingWindowEnd = bestEnd;
         }
       } else if (!wasParkingCalibration) {
         const sampleCoverageMs = this.calibrationLastSampleMs - this.calibrationFirstSampleMs;
@@ -480,13 +536,13 @@ export class SpeedEstimator {
       this.calibrationGyroSum = 0;
       this.calibrationGyroMax = 0;
       this.calibrationMaxStep = 0;
-      this.calibrationLastAcceleration = undefined;
       this.calibrationFirstSampleMs = 0;
       this.calibrationLastSampleMs = 0;
     }
   }
 
-  private lowPass(acceleration: Vector3, alpha: number): Vector3 {
+  private lowPass(acceleration: Vector3, referenceAlpha: number, deltaSeconds: number): Vector3 {
+    const alpha = alphaForDelta(referenceAlpha, deltaSeconds);
     return {
       x: this.filteredAcceleration.x + alpha * (acceleration.x - this.filteredAcceleration.x),
       y: this.filteredAcceleration.y + alpha * (acceleration.y - this.filteredAcceleration.y),
@@ -494,17 +550,17 @@ export class SpeedEstimator {
     };
   }
 
-  private computeAccStep(rawAcceleration: Vector3): number {
-    if (!this.lastRawAcceleration) {
+  private computeAccStep(rawAcceleration: Vector3, elapsedSeconds: number, continuous: boolean): number {
+    if (!continuous || !this.lastRawAcceleration) {
       this.lastRawAcceleration = rawAcceleration;
       return 0;
     }
-    const value = magnitude(subtract(rawAcceleration, this.lastRawAcceleration));
+    const rawStep = magnitude(subtract(rawAcceleration, this.lastRawAcceleration));
     this.lastRawAcceleration = rawAcceleration;
-    return value;
+    return rawStep * (REFERENCE_SAMPLE_SECONDS / Math.max(elapsedSeconds, 0.005));
   }
 
-  private computeDeltaSeconds(frame: SensorFrame): number {
+  private computeFrameTiming(frame: SensorFrame): FrameTiming {
     const timestampMs = frame.timestampMs;
     let rawDt = 0;
     if (frame.sensorTimestamp !== null && frame.sensorTimestamp !== undefined) {
@@ -519,10 +575,20 @@ export class SpeedEstimator {
       this.lastSensorTimestampNs = null;
     }
     this.lastTimestampMs = timestampMs;
-    if (rawDt <= 0) {
-      return 0.02;
+    if (!Number.isFinite(rawDt) || rawDt <= 0) {
+      return {
+        deltaSeconds: this.lastValidDeltaSeconds,
+        elapsedSeconds: this.lastValidDeltaSeconds,
+        continuous: true
+      };
     }
-    return clamp(rawDt, 0.005, 0.08);
+    const deltaSeconds = clamp(rawDt, 0.005, 0.08);
+    const continuous = rawDt <= MAX_CONTINUOUS_SAMPLE_SECONDS;
+    const elapsedSeconds = continuous ? rawDt : this.lastValidDeltaSeconds;
+    if (continuous) {
+      this.lastValidDeltaSeconds = deltaSeconds;
+    }
+    return { deltaSeconds, elapsedSeconds, continuous };
   }
 
   private updateMainAxisLock(timestampMs: number): void {
@@ -543,7 +609,7 @@ export class SpeedEstimator {
     }
   }
 
-  private shouldUpdateMainAxis(filtered: Vector3, gyroMagnitude: number, timestampMs: number): boolean {
+  private shouldUpdateMainAxis(filtered: Vector3, gyroMagnitude: number): boolean {
     const accelerationMagnitude = magnitude(filtered);
     if (!this.mainAxisInitialized) {
       return accelerationMagnitude > 0.18 && gyroMagnitude < 0.18;
@@ -568,15 +634,15 @@ export class SpeedEstimator {
     return accelerationMagnitude > speedAdjustedThreshold && axisUpdateLikelyStraight;
   }
 
-  private updateMainAxis(filtered: Vector3, timestampMs: number): void {
+  private updateMainAxis(filtered: Vector3, deltaSeconds: number): void {
     const candidateMagnitude = magnitude(filtered);
+    const updateWeight = deltaSeconds / REFERENCE_SAMPLE_SECONDS;
     let candidate = normalize(filtered);
     if (!this.mainAxisInitialized) {
       this.mainAxis = candidate;
       this.mainAxisInitialized = true;
       this.mainAxisSeedMagnitude = candidateMagnitude;
-      this.mainAxisUpdateCount = 1;
-      this.mainAxisLastUpdateMs = timestampMs;
+      this.mainAxisUpdateCount = updateWeight;
       this.orthogonalizeAxis();
       return;
     }
@@ -585,7 +651,7 @@ export class SpeedEstimator {
       if (dot(candidate, this.mainAxis) < 0) {
         candidate = scale(candidate, -1);
       }
-      this.mainAxis = normalize(mix(this.mainAxis, candidate, 0.003));
+      this.mainAxis = normalize(mix(this.mainAxis, candidate, alphaForDelta(0.003, deltaSeconds)));
       this.orthogonalizeAxis();
       return;
     }
@@ -594,8 +660,7 @@ export class SpeedEstimator {
     if (Math.abs(alignment) < 0.35 && this.velocityMps < 2 && candidateMagnitude > Math.max(0.18, this.mainAxisSeedMagnitude * 1.8)) {
       this.mainAxis = candidate;
       this.mainAxisSeedMagnitude = candidateMagnitude;
-      this.mainAxisUpdateCount += 1;
-      this.mainAxisLastUpdateMs = timestampMs;
+      this.mainAxisUpdateCount += updateWeight;
       this.orthogonalizeAxis();
       return;
     }
@@ -603,10 +668,9 @@ export class SpeedEstimator {
     if (alignment < 0) {
       candidate = scale(candidate, -1);
     }
-    this.mainAxis = normalize(mix(this.mainAxis, candidate, 0.025));
+    this.mainAxis = normalize(mix(this.mainAxis, candidate, alphaForDelta(0.025, deltaSeconds)));
     this.mainAxisSeedMagnitude = Math.max(this.mainAxisSeedMagnitude, candidateMagnitude);
-    this.mainAxisUpdateCount += 1;
-    this.mainAxisLastUpdateMs = timestampMs;
+    this.mainAxisUpdateCount += updateWeight;
     this.orthogonalizeAxis();
   }
 
@@ -619,7 +683,7 @@ export class SpeedEstimator {
   }
 
   private axisLockWindowStable(): boolean {
-    if (this.windowFrames.length < 20) {
+    if (windowDurationSeconds(this.windowFrames) < MOTION_WINDOW_MIN_SECONDS) {
       return false;
     }
     return averageAccStep(this.windowFrames) < 0.35 &&
@@ -629,27 +693,42 @@ export class SpeedEstimator {
   }
 
   private axisLockWindowUnstable(): boolean {
-    if (this.windowFrames.length < 20) {
+    if (windowDurationSeconds(this.windowFrames) < MOTION_WINDOW_MIN_SECONDS) {
       return false;
     }
     return averageAccStep(this.windowFrames) > 0.85 || averageGravityDeviation(this.windowFrames) > 1.2;
   }
 
   private pushWindowFrame(
-    timestampMs: number,
     forward: number,
     lateral: number,
     gyroMagnitude: number,
     accStep: number,
-    gravityDeviation: number
+    gravityDeviation: number,
+    elapsedSeconds: number,
+    continuous: boolean
   ): void {
-    this.windowFrames.push({ timestampMs, forward, lateral, gyroMagnitude, accStep, gravityDeviation });
-    while (this.windowFrames.length > 80 || (this.windowFrames.length > 0 && timestampMs - this.windowFrames[0].timestampMs > 1800)) {
+    if (!continuous) {
+      this.windowFrames = [];
+    }
+    this.windowFrames.push({
+      forward,
+      lateral,
+      gyroMagnitude,
+      accStep,
+      gravityDeviation,
+      elapsedSeconds
+    });
+    while (
+      this.windowFrames.length > 1 &&
+      (this.windowFrames.length > MOTION_WINDOW_MAX_FRAMES ||
+        windowDurationSeconds(this.windowFrames) > MOTION_WINDOW_MAX_SECONDS)
+    ) {
       this.windowFrames.shift();
     }
   }
 
-  private detectMotionState(forward: number, lateral: number, gyroMagnitude: number, timestampMs: number): MotionState {
+  private detectMotionState(forward: number, gyroMagnitude: number, timestampMs: number): MotionState {
     const lateralAverage = averageLateral(this.windowFrames);
     const gyroAverage = averageGyro(this.windowFrames);
     const gyroVarianceValue = varianceGyro(this.windowFrames);
@@ -727,23 +806,28 @@ export class SpeedEstimator {
     for (let i = windowStart; i <= windowEnd; i++) {
       const frame = frames[i];
       frame.distanceBeforeM = anchorDistanceM;
+      if (!frame.continuous) {
+        this.filteredAcceleration = emptyVector();
+      }
       const motionAcceleration = subtract(frame.acceleration, this.gravityEstimate);
       const clipped = clipMagnitude(motionAcceleration, 3.5);
-      const filtered = this.lowPass(clipped, 0.22);
+      const filtered = this.lowPass(clipped, 0.22, frame.deltaSeconds);
       this.filteredAcceleration = filtered;
       const forward = dot(filtered, this.mainAxis);
       const lateralVector = subtract(filtered, scale(this.mainAxis, forward));
       this.pushWindowFrame(
-        frame.timestampMs,
         forward,
         magnitude(lateralVector),
         frame.gyroMagnitude,
         frame.accStep,
-        Math.abs(magnitude(frame.acceleration) - 9.80665)
+        Math.abs(magnitude(frame.acceleration) - 9.80665),
+        frame.elapsedSeconds,
+        frame.continuous
       );
     }
 
-    let positiveAccelerationFrames = 0;
+    let positiveAccelerationSeconds = 0;
+    let positiveAccelerationSamples = 0;
     let departureDetected = false;
     // The final buffer element is the current, not-yet-integrated sensor frame.
     // Leave it to the normal ingest path so every frame contributes exactly once.
@@ -751,22 +835,29 @@ export class SpeedEstimator {
     for (let j = windowEnd + 1; j < replayFrameLimit; j++) {
       const frame = frames[j];
       frame.distanceBeforeM = this.distanceM;
+      if (!frame.continuous) {
+        // Do not let a pre-gap low-pass tail turn post-gap stationary samples
+        // into false sustained departure evidence.
+        this.filteredAcceleration = emptyVector();
+      }
       const motionAcceleration = subtract(frame.acceleration, this.gravityEstimate);
       const clipped = clipMagnitude(motionAcceleration, 3.5);
-      const filtered = this.lowPass(clipped, 0.22);
+      const rawForward = dot(clipped, this.mainAxis);
+      const filtered = this.lowPass(clipped, 0.22, frame.deltaSeconds);
       this.filteredAcceleration = filtered;
       const forward = dot(filtered, this.mainAxis);
       const lateralVector = subtract(filtered, scale(this.mainAxis, forward));
       const lateral = magnitude(lateralVector);
       this.pushWindowFrame(
-        frame.timestampMs,
         forward,
         lateral,
         frame.gyroMagnitude,
         frame.accStep,
-        Math.abs(magnitude(frame.acceleration) - 9.80665)
+        Math.abs(magnitude(frame.acceleration) - 9.80665),
+        frame.elapsedSeconds,
+        frame.continuous
       );
-      const state = this.detectMotionState(forward, lateral, frame.gyroMagnitude, frame.timestampMs);
+      const state = this.detectMotionState(forward, frame.gyroMagnitude, frame.timestampMs);
       this.motionState = state;
 
       if (!frame.integrated) {
@@ -778,12 +869,18 @@ export class SpeedEstimator {
       this.velocityMps = Math.max(0, this.velocityMps + effectiveAcceleration * frame.deltaSeconds);
       this.distanceM += ((previousVelocityMps + this.velocityMps) / 2) * frame.deltaSeconds;
 
-      if (forward > 0.055 && frame.gyroMagnitude < 0.25) {
-        positiveAccelerationFrames += 1;
-      } else {
-        positiveAccelerationFrames = 0;
+      if (!frame.continuous) {
+        positiveAccelerationSeconds = 0;
+        positiveAccelerationSamples = 0;
       }
-      if (positiveAccelerationFrames >= 3) {
+      if (forward > 0.055 && rawForward > 0.055 && frame.gyroMagnitude < 0.25) {
+        positiveAccelerationSeconds += frame.elapsedSeconds;
+        positiveAccelerationSamples += 1;
+      } else {
+        positiveAccelerationSeconds = 0;
+        positiveAccelerationSamples = 0;
+      }
+      if (positiveAccelerationSeconds >= DEPARTURE_EVIDENCE_SECONDS && positiveAccelerationSamples >= 3) {
         departureDetected = true;
       }
     }
@@ -828,22 +925,12 @@ export class SpeedEstimator {
     return clamp(value, 0.05, 0.95);
   }
 
-  private makeSample(
-    timestampMs: number,
-    raw: Vector3,
-    filtered: Vector3,
-    state: MotionState,
-    confidence: number
-  ): SpeedSample {
+  private makeSample(timestampMs: number, filtered: Vector3): SpeedSample {
     const speedKmh = this.velocityMps * 3.6;
     return {
       timestampMs,
-      rawAcceleration: raw,
       filteredAcceleration: filtered,
-      speedMps: this.velocityMps,
-      speedKmh,
-      confidence,
-      motionState: state
+      speedKmh
     };
   }
 
@@ -873,10 +960,7 @@ export class SpeedEstimator {
   private makeFrame(frame: SensorFrame, stats: RunStats): EstimatorFrame {
     const sample = this.makeSample(
       frame.timestampMs,
-      frame.acceleration,
-      this.filteredAcceleration,
-      stats.motionState,
-      stats.confidence
+      this.filteredAcceleration
     );
     return {
       sample,
@@ -922,6 +1006,19 @@ export class SpeedEstimator {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function alphaForDelta(referenceAlpha: number, deltaSeconds: number): number {
+  const referenceRemainder = clamp(1 - referenceAlpha, 0, 1);
+  return 1 - Math.pow(referenceRemainder, deltaSeconds / REFERENCE_SAMPLE_SECONDS);
+}
+
+function windowDurationSeconds(frames: AccelWindowFrame[]): number {
+  let durationSeconds = 0;
+  for (let i = 0; i < frames.length; i++) {
+    durationSeconds += frames[i].elapsedSeconds;
+  }
+  return durationSeconds;
 }
 
 function add(a: Vector3, b: Vector3): Vector3 {

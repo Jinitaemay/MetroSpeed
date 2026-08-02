@@ -1,24 +1,32 @@
 import fs from '@ohos.file.fs';
 import picker from '@ohos.file.picker';
 import common from '@ohos.app.ability.common';
+import util from '@ohos.util';
+import { batteryInfo, thermal } from '@kit.BasicServicesKit';
 import { LocationSnapshot, SatelliteSnapshot } from './LocationController';
 import {
   CalibrationState,
   RunStats,
+  SensorCallbackSample,
   SensorFrame,
   SpeedSample,
   motionStateText
 } from './SpeedTypes';
 
 const ESTIMATOR_RECORD_INTERVAL_MS = 500;
-const RECORD_SCHEMA_VERSION = 14;
-const APP_VERSION_CODE = 1783749567;
-const ALGORITHM_VERSION = 'anchor-delta-20260710-r3';
+const DEVICE_HEALTH_RECORD_INTERVAL_MS = 10000;
+const RECORD_SCHEMA_VERSION = 17;
+const APP_VERSION_CODE = 1785660666;
+const ALGORITHM_VERSION = 'anchor-delta-20260801-r4';
 const LEGACY_TEMP_LOG_FILE_NAME = 'research-current.jsonl';
 const SESSION_LOG_PREFIX = 'research-session-';
 const SESSION_LOG_SUFFIX = '.jsonl';
-const WRITE_BUFFER_LIMIT = 16;
+const DISCARDED_LOG_MARKER_SUFFIX = '.discarded';
+const WRITE_BUFFER_LIMIT = 512;
+const WRITE_BUFFER_MAX_AGE_MS = 1000;
 const EXPORT_COPY_BUFFER_BYTES = 64 * 1024;
+const EXPORT_YIELD_EVERY_CHUNKS = 8;
+const UTF8_ENCODER = new util.TextEncoder();
 
 export interface ResearchRecorderStatus {
   running: boolean;
@@ -106,14 +114,6 @@ interface SensorResearchRecord {
   gyroY: number | null;
   gyroZ: number | null;
   gyroscopeTimestamp: number | null;
-  sysGravityX: number | null;
-  sysGravityY: number | null;
-  sysGravityZ: number | null;
-  sysGravityTimestamp: number | null;
-  linearAccX: number | null;
-  linearAccY: number | null;
-  linearAccZ: number | null;
-  linearAccTimestamp: number | null;
   rotVecX: number | null;
   rotVecY: number | null;
   rotVecZ: number | null;
@@ -123,6 +123,49 @@ interface SensorResearchRecord {
   magY: number | null;
   magZ: number | null;
   magTimestamp: number | null;
+}
+
+interface SensorCallbackResearchRecord {
+  timestampMs: number;
+  sessionId: string;
+  recordSchemaVersion: number;
+  appVersionCode: number;
+  algorithmVersion: string;
+  recordSeq: number;
+  recordType: string;
+  measurementRunId: string | null;
+  measurementActive: boolean;
+  measurementStartMs: number | null;
+  measurementElapsedMs: number | null;
+  sensorType: string;
+  sensorTimestamp: number | null;
+  sensorIntervalMs: number | null;
+  callbackIntervalMs: number | null;
+  requestedIntervalNs: number;
+  x?: number;
+  y?: number;
+  z?: number;
+  w?: number;
+  biasX?: number;
+  biasY?: number;
+  biasZ?: number;
+}
+
+interface DeviceHealthResearchRecord {
+  timestampMs: number;
+  sessionId: string;
+  recordSchemaVersion: number;
+  appVersionCode: number;
+  algorithmVersion: string;
+  recordSeq: number;
+  recordType: string;
+  measurementRunId: string | null;
+  measurementActive: boolean;
+  measurementStartMs: number | null;
+  measurementElapsedMs: number | null;
+  deviceHealthReason: string;
+  batteryTemperatureC: number | null;
+  thermalLevel: number | null;
 }
 
 interface SessionTarget {
@@ -138,6 +181,7 @@ export class ResearchRecorder {
   private tempLogPath: string = '';
   private tempLogFile?: fs.File;
   private writeBuffer: string[] = [];
+  private writeBufferStartMs: number = 0;
   private hasExportableLog: boolean = false;
   private exportInProgress: boolean = false;
   private lastEvent: string = '';
@@ -147,11 +191,13 @@ export class ResearchRecorder {
   private lastCalibration?: CalibrationState;
   private lastLocation?: LocationSnapshot;
   private lastSatellite?: SatelliteSnapshot;
-  private lastSensorRecordMs: number = 0;
   private lastEstimatorRecordMs: number = 0;
+  private lastDeviceHealthRecordMs: number = 0;
   private recordSeq: number = 0;
   private previousSensorFrameMs: number = 0;
   private previousSensorTimestampNs: number | null = null;
+  private previousCallbackMsByType: Map<string, number> = new Map<string, number>();
+  private previousSensorTimestampByType: Map<string, number> = new Map<string, number>();
   private previousLocationMs: number = 0;
   private previousSatelliteMs: number = 0;
   private lastSensorIntervalMs: number | null = null;
@@ -181,12 +227,12 @@ export class ResearchRecorder {
     const preservedMeasurementStartMs = this.measurementStartMs;
     this.filesDir = context.filesDir;
     this.running = true;
-    this.clearPendingLogsForOverwrite();
-    const sessionTarget = this.overwriteSessionTarget(timestampMs);
+    const sessionTarget = this.newSessionTarget(timestampMs);
     this.sessionId = sessionTarget.sessionId;
     this.tempLogPath = sessionTarget.path;
     this.recordCount = 0;
     this.writeBuffer = [];
+    this.writeBufferStartMs = 0;
     this.hasExportableLog = false;
     this.lastEvent = 'start_record';
     this.lastExportPath = '';
@@ -195,11 +241,13 @@ export class ResearchRecorder {
     this.lastCalibration = undefined;
     this.lastLocation = undefined;
     this.lastSatellite = undefined;
-    this.lastSensorRecordMs = 0;
     this.lastEstimatorRecordMs = 0;
+    this.lastDeviceHealthRecordMs = 0;
     this.recordSeq = 0;
     this.previousSensorFrameMs = 0;
     this.previousSensorTimestampNs = null;
+    this.previousCallbackMsByType.clear();
+    this.previousSensorTimestampByType.clear();
     this.previousLocationMs = 0;
     this.previousSatelliteMs = 0;
     this.lastSensorIntervalMs = null;
@@ -210,21 +258,25 @@ export class ResearchRecorder {
     this.measurementStartMs = preservedMeasurementActive ? preservedMeasurementStartMs : 0;
     this.writeFailed = false;
     if (!this.openTempLogForNewSession()) {
-      this.running = false;
-      this.tempLogPath = '';
-      this.selectNewestPendingLog();
-      this.refreshExportableLogState();
-      this.restoreExportableLogSummary();
-      this.lastEvent = 'start_record_failed';
-      this.lastExportPath = 'record file open failed';
-      return this.status();
+      return this.rollbackFailedSessionStart(sessionTarget.path, '记录文件创建失败，旧记录已保留');
     }
     this.appendRecord(timestampMs, 'start_record', 'research recording started');
+    this.appendDeviceHealthRecord(timestampMs, 'start');
+    // Persist the session header once so a crash before the first large-buffer
+    // flush is still recoverable and will be marked incomplete on next launch.
+    this.flushTempLogFile();
+    this.refreshExportableLogState();
+    if (!this.running || !this.tempLogFile || this.writeFailed || !this.hasExportableLog) {
+      return this.rollbackFailedSessionStart(sessionTarget.path, '记录文件写入失败，旧记录已保留');
+    }
+    // Only retire the preceding session after the new header is durably stored.
+    this.clearSupersededPendingLogs(sessionTarget.path);
     return this.status();
   }
 
   stop(timestampMs: number): ResearchRecorderStatus {
     if (this.running) {
+      this.appendDeviceHealthRecord(timestampMs, 'stop');
       this.appendRecord(timestampMs, 'stop_record', 'research recording stopped');
     }
     this.running = false;
@@ -300,8 +352,30 @@ export class ResearchRecorder {
     if (!this.running) {
       return;
     }
-    this.lastSensorRecordMs = frame.timestampMs;
+    this.maybeAppendDeviceHealthRecord(frame.timestampMs);
     this.appendSensorRecord(frame);
+  }
+
+  recordSensorCallback(sample: SensorCallbackSample): void {
+    if (!this.running) {
+      return;
+    }
+
+    const previousCallbackMs = this.previousCallbackMsByType.get(sample.sensorType);
+    const callbackIntervalMs = previousCallbackMs === undefined
+      ? null
+      : Math.max(0, sample.callbackTimestampMs - previousCallbackMs);
+    this.previousCallbackMsByType.set(sample.sensorType, sample.callbackTimestampMs);
+
+    const previousSensorTimestamp = this.previousSensorTimestampByType.get(sample.sensorType);
+    const sensorIntervalMs = sample.sensorTimestamp === null || previousSensorTimestamp === undefined
+      ? null
+      : (sample.sensorTimestamp - previousSensorTimestamp) / 1000000;
+    if (sample.sensorTimestamp !== null) {
+      this.previousSensorTimestampByType.set(sample.sensorType, sample.sensorTimestamp);
+    }
+
+    this.appendSensorCallbackRecord(sample, callbackIntervalMs, sensorIntervalMs);
   }
 
   updateLocation(location: LocationSnapshot): void {
@@ -381,6 +455,7 @@ export class ResearchRecorder {
     const completenessSuffix = sourceIncomplete ? '-INCOMPLETE' : '';
     const fileName = `${sourceSessionId || `session-${Date.now()}`}${completenessSuffix}.jsonl`;
     this.exportInProgress = true;
+    let targetUri = '';
     try {
       const documentPicker = new picker.DocumentViewPicker(context);
       const uris = await documentPicker.save({
@@ -390,27 +465,37 @@ export class ResearchRecorder {
         this.lastExportPath = '已取消导出';
         return this.status();
       }
+      targetUri = uris[0];
 
       if (this.running || this.tempLogPath !== sourcePath) {
+        this.cleanupFailedExportTarget(targetUri, sourcePath);
         this.lastExportPath = '记录状态已变化，请重试导出';
         return this.status();
       }
       this.flushTempLogFile();
       this.refreshExportableLogState();
       if (!this.hasExportableLog) {
+        this.cleanupFailedExportTarget(targetUri, sourcePath);
         this.lastExportPath = 'no exportable log';
         return this.status();
       }
 
-      if (!this.copyTempLogToUri(uris[0], sourcePath)) {
+      if (!await this.copyTempLogToUri(targetUri, sourcePath)) {
+        this.cleanupFailedExportTarget(targetUri, sourcePath);
         this.lastExportPath = '导出复制失败';
         return this.status();
       }
-      const removed = this.removeExportedTempLog(sourcePath);
-      this.lastExportPath = removed
-        ? (sourceIncomplete ? `已导出：${fileName}（日志不完整）` : `已导出：${fileName}`)
-        : `已导出：${fileName}（本地副本待清理）`;
+      // Export is a copy operation. Keep the latest source log (and its
+      // integrity marker, if any) so the user can export it again. A new
+      // recording remains the only operation that overwrites the local log.
+      this.refreshExportableLogState();
+      this.lastExportPath = sourceIncomplete
+        ? `已导出：${fileName}（日志不完整，本地记录已保留）`
+        : `已导出：${fileName}（本地记录已保留）`;
     } catch (error) {
+      if (targetUri.length > 0) {
+        this.cleanupFailedExportTarget(targetUri, sourcePath);
+      }
       this.lastExportPath = '导出失败，请重试';
     } finally {
       this.exportInProgress = false;
@@ -573,14 +658,6 @@ export class ResearchRecorder {
       gyroY: frame.gyroscope ? frame.gyroscope.y : null,
       gyroZ: frame.gyroscope ? frame.gyroscope.z : null,
       gyroscopeTimestamp: frame.gyroscopeTimestamp !== undefined ? frame.gyroscopeTimestamp : null,
-      sysGravityX: frame.gravity ? frame.gravity.x : null,
-      sysGravityY: frame.gravity ? frame.gravity.y : null,
-      sysGravityZ: frame.gravity ? frame.gravity.z : null,
-      sysGravityTimestamp: frame.gravityTimestamp !== undefined ? frame.gravityTimestamp : null,
-      linearAccX: frame.linearAcceleration ? frame.linearAcceleration.x : null,
-      linearAccY: frame.linearAcceleration ? frame.linearAcceleration.y : null,
-      linearAccZ: frame.linearAcceleration ? frame.linearAcceleration.z : null,
-      linearAccTimestamp: frame.linearAccelerationTimestamp !== undefined ? frame.linearAccelerationTimestamp : null,
       rotVecX: frame.rotationVector ? frame.rotationVector.x : null,
       rotVecY: frame.rotationVector ? frame.rotationVector.y : null,
       rotVecZ: frame.rotationVector ? frame.rotationVector.z : null,
@@ -595,14 +672,119 @@ export class ResearchRecorder {
     this.writeJsonLine(JSON.stringify(record));
   }
 
+  private appendSensorCallbackRecord(
+    sample: SensorCallbackSample,
+    callbackIntervalMs: number | null,
+    sensorIntervalMs: number | null
+  ): void {
+    if (!this.sessionId) {
+      this.sessionId = `session-${sample.callbackTimestampMs}`;
+    }
+
+    const measurementElapsedMs = this.measurementActive && this.measurementStartMs > 0
+      ? Math.max(0, sample.callbackTimestampMs - this.measurementStartMs)
+      : null;
+    this.recordSeq += 1;
+    const record: SensorCallbackResearchRecord = {
+      timestampMs: sample.callbackTimestampMs,
+      sessionId: this.sessionId,
+      recordSchemaVersion: RECORD_SCHEMA_VERSION,
+      appVersionCode: APP_VERSION_CODE,
+      algorithmVersion: ALGORITHM_VERSION,
+      recordSeq: this.recordSeq,
+      recordType: 'sensor_callback',
+      measurementRunId: this.measurementRunId,
+      measurementActive: this.measurementActive,
+      measurementStartMs: this.measurementActive && this.measurementStartMs > 0 ? this.measurementStartMs : null,
+      measurementElapsedMs,
+      sensorType: sample.sensorType,
+      sensorTimestamp: sample.sensorTimestamp,
+      sensorIntervalMs,
+      callbackIntervalMs,
+      requestedIntervalNs: sample.requestedIntervalNs
+    };
+
+    if (sample.x !== undefined) record.x = sample.x;
+    if (sample.y !== undefined) record.y = sample.y;
+    if (sample.z !== undefined) record.z = sample.z;
+    if (sample.w !== undefined) record.w = sample.w;
+    if (sample.biasX !== undefined) record.biasX = sample.biasX;
+    if (sample.biasY !== undefined) record.biasY = sample.biasY;
+    if (sample.biasZ !== undefined) record.biasZ = sample.biasZ;
+
+    this.writeJsonLine(JSON.stringify(record));
+  }
+
+  private maybeAppendDeviceHealthRecord(timestampMs: number): void {
+    if (timestampMs - this.lastDeviceHealthRecordMs < DEVICE_HEALTH_RECORD_INTERVAL_MS) {
+      return;
+    }
+    this.appendDeviceHealthRecord(timestampMs, 'periodic');
+  }
+
+  private appendDeviceHealthRecord(timestampMs: number, reason: string): void {
+    if (!this.running) {
+      return;
+    }
+    if (!this.sessionId) {
+      this.sessionId = `session-${timestampMs}`;
+    }
+
+    let batteryTemperatureC: number | null = null;
+    let thermalLevel: number | null = null;
+    try {
+      const temperatureDeciC = batteryInfo.batteryTemperature;
+      if (Number.isFinite(temperatureDeciC)) {
+        batteryTemperatureC = temperatureDeciC / 10;
+      }
+    } catch (error) {
+    }
+    try {
+      const currentThermalLevel = thermal.getLevel();
+      if (Number.isFinite(currentThermalLevel)) {
+        thermalLevel = currentThermalLevel;
+      }
+    } catch (error) {
+    }
+
+    const measurementElapsedMs = this.measurementActive && this.measurementStartMs > 0
+      ? Math.max(0, timestampMs - this.measurementStartMs)
+      : null;
+    this.recordSeq += 1;
+    const record: DeviceHealthResearchRecord = {
+      timestampMs,
+      sessionId: this.sessionId,
+      recordSchemaVersion: RECORD_SCHEMA_VERSION,
+      appVersionCode: APP_VERSION_CODE,
+      algorithmVersion: ALGORITHM_VERSION,
+      recordSeq: this.recordSeq,
+      recordType: 'device_health',
+      measurementRunId: this.measurementRunId,
+      measurementActive: this.measurementActive,
+      measurementStartMs: this.measurementActive && this.measurementStartMs > 0 ? this.measurementStartMs : null,
+      measurementElapsedMs,
+      deviceHealthReason: reason,
+      batteryTemperatureC,
+      thermalLevel
+    };
+
+    this.lastDeviceHealthRecordMs = timestampMs;
+    this.writeJsonLine(JSON.stringify(record));
+  }
+
   private writeJsonLine(line: string): void {
     if (!this.running || !this.tempLogFile) {
       return;
     }
+    const nowMs = Date.now();
+    if (this.writeBuffer.length < 1) {
+      this.writeBufferStartMs = nowMs;
+    }
     this.writeBuffer.push(line);
     this.recordCount += 1;
     this.hasExportableLog = true;
-    if (this.writeBuffer.length < WRITE_BUFFER_LIMIT) {
+    const bufferAgeMs = Math.max(0, nowMs - this.writeBufferStartMs);
+    if (this.writeBuffer.length < WRITE_BUFFER_LIMIT && bufferAgeMs < WRITE_BUFFER_MAX_AGE_MS) {
       return;
     }
     this.flushWriteBuffer();
@@ -613,8 +795,14 @@ export class ResearchRecorder {
       return;
     }
     try {
-      fs.writeSync(this.tempLogFile.fd, `${this.writeBuffer.join('\n')}\n`);
+      const payload = `${this.writeBuffer.join('\n')}\n`;
+      const encoded = UTF8_ENCODER.encodeInto(payload);
+      const bytesWritten = fs.writeSync(this.tempLogFile.fd, encoded.buffer, { length: encoded.byteLength });
+      if (bytesWritten !== encoded.byteLength) {
+        throw new Error(`short research log write: ${bytesWritten}/${encoded.byteLength}`);
+      }
       this.writeBuffer = [];
+      this.writeBufferStartMs = 0;
     } catch (error) {
       this.running = false;
       this.writeFailed = true;
@@ -622,19 +810,35 @@ export class ResearchRecorder {
       this.lastExportPath = 'record file write failed';
       this.persistIntegrityWarning('record file write failed');
       this.writeBuffer = [];
+      this.writeBufferStartMs = 0;
       this.closeTempLogFile();
       this.refreshExportableLogState();
     }
   }
 
-  private overwriteSessionTarget(timestampMs: number): SessionTarget {
+  private newSessionTarget(timestampMs: number): SessionTarget {
+    let attempt = 0;
+    while (attempt < 1000) {
+      const uniqueSuffix = attempt === 0 ? `${timestampMs}` : `${timestampMs}-${attempt}`;
+      const target: SessionTarget = {
+        sessionId: `session-${uniqueSuffix}`,
+        path: `${this.filesDir}/${SESSION_LOG_PREFIX}${uniqueSuffix}${SESSION_LOG_SUFFIX}`
+      };
+      try {
+        fs.statSync(target.path);
+        attempt += 1;
+      } catch (error) {
+        return target;
+      }
+    }
+    const fallbackSuffix = `${timestampMs}-${Date.now()}`;
     return {
-      sessionId: `session-${timestampMs}`,
-      path: `${this.filesDir}/${LEGACY_TEMP_LOG_FILE_NAME}`
+      sessionId: `session-${fallbackSuffix}`,
+      path: `${this.filesDir}/${SESSION_LOG_PREFIX}${fallbackSuffix}${SESSION_LOG_SUFFIX}`
     };
   }
 
-  private clearPendingLogsForOverwrite(): void {
+  private clearSupersededPendingLogs(activePath: string): void {
     if (this.filesDir.length < 1) {
       return;
     }
@@ -647,19 +851,102 @@ export class ResearchRecorder {
           continue;
         }
         const path = `${this.filesDir}/${name}`;
+        if (path === activePath) {
+          continue;
+        }
         try {
           fs.unlinkSync(path);
           this.removeIntegrityMarker(path);
+          this.removeDiscardedMarker(path);
         } catch (error) {
-          // openTempLogForNewSession() still truncates the fixed current file when possible.
+          // The new session is already durable. A stale predecessor can be retried
+          // on the next successful recording start.
         }
       }
     } catch (error) {
     }
   }
 
+  private rollbackFailedSessionStart(failedPath: string, message: string): ResearchRecorderStatus {
+    this.running = false;
+    this.closeTempLogFile();
+    let failedFileRemoved = false;
+    try {
+      fs.unlinkSync(failedPath);
+      failedFileRemoved = true;
+    } catch (error) {
+    }
+    if (failedFileRemoved) {
+      this.removeIntegrityMarker(failedPath);
+      this.removeDiscardedMarker(failedPath);
+    } else {
+      this.quarantineFailedSession(failedPath);
+    }
+    this.tempLogPath = '';
+    this.selectNewestPendingLog(failedPath);
+    this.refreshExportableLogState();
+    this.restoreExportableLogSummary();
+    this.lastEvent = 'start_record_failed';
+    this.lastExportPath = message;
+    return this.status();
+  }
+
   private integrityMarkerPath(sourcePath: string): string {
     return `${sourcePath}.incomplete`;
+  }
+
+  private discardedMarkerPath(sourcePath: string): string {
+    return `${sourcePath}${DISCARDED_LOG_MARKER_SUFFIX}`;
+  }
+
+  private hasDiscardedMarker(sourcePath: string): boolean {
+    try {
+      fs.statSync(this.discardedMarkerPath(sourcePath));
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  private quarantineFailedSession(sourcePath: string): void {
+    let markerFile: fs.File | undefined = undefined;
+    let markerPersisted = false;
+    try {
+      markerFile = fs.openSync(
+        this.discardedMarkerPath(sourcePath),
+        fs.OpenMode.WRITE_ONLY | fs.OpenMode.CREATE | fs.OpenMode.TRUNC
+      );
+      fs.writeSync(markerFile.fd, 'failed session start\n');
+      fs.fsyncSync(markerFile.fd);
+      markerPersisted = true;
+    } catch (error) {
+      markerPersisted = false;
+    } finally {
+      if (markerFile) {
+        try {
+          fs.closeSync(markerFile);
+        } catch (error) {
+          markerPersisted = false;
+        }
+      }
+    }
+    if (markerPersisted) {
+      return;
+    }
+
+    let failedFile: fs.File | undefined = undefined;
+    try {
+      failedFile = fs.openSync(sourcePath, fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+      fs.fsyncSync(failedFile.fd);
+    } catch (error) {
+    } finally {
+      if (failedFile) {
+        try {
+          fs.closeSync(failedFile);
+        } catch (error) {
+        }
+      }
+    }
   }
 
   private hasIntegrityMarker(sourcePath: string): boolean {
@@ -702,7 +989,14 @@ export class ResearchRecorder {
     }
   }
 
-  private selectNewestPendingLog(): void {
+  private removeDiscardedMarker(sourcePath: string): void {
+    try {
+      fs.unlinkSync(this.discardedMarkerPath(sourcePath));
+    } catch (error) {
+    }
+  }
+
+  private selectNewestPendingLog(excludedPath: string = ''): void {
     if (this.running || this.filesDir.length < 1) {
       return;
     }
@@ -726,15 +1020,22 @@ export class ResearchRecorder {
       sessionNames.sort().reverse();
       for (const name of sessionNames) {
         const path = `${this.filesDir}/${name}`;
-        if (fs.statSync(path).size > 0) {
-          this.tempLogPath = path;
-          this.writeFailed = this.hasIntegrityMarker(path);
-          return;
+        if (path === excludedPath) {
+          continue;
         }
+        if (this.hasDiscardedMarker(path)) {
+          continue;
+        }
+        if (!this.isNonEmptyLogCandidate(path)) {
+          continue;
+        }
+        this.tempLogPath = path;
+        this.writeFailed = this.hasIntegrityMarker(path);
+        return;
       }
 
       const legacyPath = `${this.filesDir}/${LEGACY_TEMP_LOG_FILE_NAME}`;
-      if (fs.statSync(legacyPath).size > 0) {
+      if (legacyPath !== excludedPath && this.isNonEmptyLogCandidate(legacyPath)) {
         this.tempLogPath = legacyPath;
         this.writeFailed = this.hasIntegrityMarker(legacyPath);
       }
@@ -742,21 +1043,12 @@ export class ResearchRecorder {
     }
   }
 
-  private removeExportedTempLog(expectedPath: string): boolean {
-    if (this.running || this.tempLogPath.length < 1 || this.tempLogPath !== expectedPath) {
-      return false;
-    }
+  private isNonEmptyLogCandidate(path: string): boolean {
     try {
-      fs.unlinkSync(expectedPath);
+      return fs.statSync(path).size > 0;
     } catch (error) {
       return false;
     }
-    this.removeIntegrityMarker(expectedPath);
-    this.tempLogPath = '';
-    this.selectNewestPendingLog();
-    this.refreshExportableLogState();
-    this.restoreExportableLogSummary();
-    return true;
   }
 
   private openTempLogForNewSession(): boolean {
@@ -769,6 +1061,7 @@ export class ResearchRecorder {
         fs.OpenMode.WRITE_ONLY | fs.OpenMode.CREATE | fs.OpenMode.TRUNC
       );
       this.removeIntegrityMarker(this.tempLogPath);
+      this.removeDiscardedMarker(this.tempLogPath);
       return true;
     } catch (error) {
       this.tempLogFile = undefined;
@@ -794,40 +1087,102 @@ export class ResearchRecorder {
     }
   }
 
-  private copyTempLogToUri(uri: string, sourcePath: string): boolean {
+  private async copyTempLogToUri(uri: string, sourcePath: string): Promise<boolean> {
     let sourceFile: fs.File | undefined = undefined;
     let targetFile: fs.File | undefined = undefined;
+    let copySucceeded = false;
     try {
-      sourceFile = fs.openSync(sourcePath, fs.OpenMode.READ_ONLY);
-      targetFile = fs.openSync(uri, fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+      const expectedBytes = (await fs.stat(sourcePath)).size;
+      sourceFile = await fs.open(sourcePath, fs.OpenMode.READ_ONLY);
+      targetFile = await fs.open(uri, fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
       const buffer = new ArrayBuffer(EXPORT_COPY_BUFFER_BYTES);
+      let copiedBytes = 0;
+      let chunksSinceYield = 0;
+      let shortWrite = false;
       while (true) {
-        const bytesRead = fs.readSync(sourceFile.fd, buffer);
+        const bytesRead = await fs.read(sourceFile.fd, buffer);
         if (bytesRead <= 0) {
           break;
         }
-        const bytesWritten = fs.writeSync(targetFile.fd, buffer, { length: bytesRead });
-        if (bytesWritten !== bytesRead) {
-          return false;
+        let chunkOffset = 0;
+        while (chunkOffset < bytesRead) {
+          const remainingBytes = bytesRead - chunkOffset;
+          const writeBuffer = chunkOffset === 0 ? buffer : buffer.slice(chunkOffset, bytesRead);
+          const bytesWritten = await fs.write(targetFile.fd, writeBuffer, { length: remainingBytes });
+          if (bytesWritten <= 0 || bytesWritten > remainingBytes) {
+            shortWrite = true;
+            break;
+          }
+          chunkOffset += bytesWritten;
+          copiedBytes += bytesWritten;
+        }
+        if (shortWrite) {
+          break;
+        }
+        chunksSinceYield += 1;
+        if (chunksSinceYield >= EXPORT_YIELD_EVERY_CHUNKS) {
+          chunksSinceYield = 0;
+          await this.yieldExportLoop();
         }
       }
-      fs.fsyncSync(targetFile.fd);
-      return true;
+      if (!shortWrite) {
+        await fs.fsync(targetFile.fd);
+        copySucceeded = copiedBytes === expectedBytes;
+      }
     } catch (error) {
-      return false;
-    } finally {
-      if (sourceFile) {
-        try {
-          fs.closeSync(sourceFile);
-        } catch (error) {
-        }
+      copySucceeded = false;
+    }
+    if (sourceFile) {
+      try {
+        await fs.close(sourceFile);
+      } catch (error) {
+        copySucceeded = false;
       }
+    }
+    if (targetFile) {
+      try {
+        await fs.close(targetFile);
+      } catch (error) {
+        copySucceeded = false;
+      }
+    }
+    return copySucceeded;
+  }
+
+  private yieldExportLoop(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, 0);
+    });
+  }
+
+  private cleanupFailedExportTarget(uri: string, sourcePath: string): void {
+    if (uri.length < 1 || uri === sourcePath) {
+      return;
+    }
+    let targetFile: fs.File | undefined = undefined;
+    let truncated = false;
+    try {
+      targetFile = fs.openSync(uri, fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+      fs.fsyncSync(targetFile.fd);
+      truncated = true;
+    } catch (error) {
+    } finally {
       if (targetFile) {
         try {
           fs.closeSync(targetFile);
         } catch (error) {
+          truncated = false;
         }
       }
+    }
+    if (truncated) {
+      return;
+    }
+    try {
+      fs.unlinkSync(uri);
+    } catch (error) {
     }
   }
 
@@ -847,6 +1202,7 @@ export class ResearchRecorder {
     }
     this.tempLogFile = undefined;
     this.writeBuffer = [];
+    this.writeBufferStartMs = 0;
   }
 
   private refreshExportableLogState(): void {
