@@ -8,13 +8,13 @@ import os
 import statistics
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-ALGORITHM_VERSION = "anchor-delta-20260801-r4"
+ALGORITHM_VERSION = "anchor-delta-20260804-r5"
 PHONE_GNSS_ANCHOR_LAG_MS = 40
 PHONE_INERTIAL_HISTORY_RETENTION_MS = 200
 REFERENCE_DT_SECONDS = 0.02
@@ -669,9 +669,6 @@ class SpeedEstimator:
         self.filtered_acceleration = filtered
 
         self.update_main_axis_lock(frame.timestamp_ms)
-        if self.should_update_main_axis(filtered, gyro_magnitude, frame.timestamp_ms):
-            self.update_main_axis(filtered, frame.timestamp_ms, dt)
-
         forward_acceleration = v_dot(filtered, self.main_axis)
         lateral_vector = v_sub(filtered, v_scale(self.main_axis, forward_acceleration))
         lateral_acceleration = v_mag(lateral_vector)
@@ -686,6 +683,30 @@ class SpeedEstimator:
             elapsed_seconds,
             continuous,
         )
+
+        axis_candidate_state = self.detect_motion_state(
+            forward_acceleration,
+            lateral_acceleration,
+            gyro_magnitude,
+            frame.timestamp_ms,
+        )
+        if self.should_update_main_axis(
+            filtered,
+            gyro_magnitude,
+            frame.timestamp_ms,
+            axis_candidate_state,
+        ):
+            self.update_main_axis(filtered, frame.timestamp_ms, dt)
+            forward_acceleration = v_dot(filtered, self.main_axis)
+            lateral_vector = v_sub(
+                filtered,
+                v_scale(self.main_axis, forward_acceleration),
+            )
+            lateral_acceleration = v_mag(lateral_vector)
+            self.replace_latest_window_projection(
+                forward_acceleration,
+                lateral_acceleration,
+            )
 
         state = self.detect_motion_state(forward_acceleration, lateral_acceleration, gyro_magnitude, frame.timestamp_ms)
         effective_acceleration = self.effective_forward_acceleration(forward_acceleration, state)
@@ -981,12 +1002,23 @@ class SpeedEstimator:
         if self.velocity_mps > self.axis_lock_speed or timestamp_ms - self.start_ms > self.axis_lock_time_ms or self.main_axis_update_count >= self.axis_lock_update_count:
             self.main_axis_locked = True
 
-    def should_update_main_axis(self, filtered: Vector3, gyro_magnitude: float, timestamp_ms: int) -> bool:
+    def should_update_main_axis(
+        self,
+        filtered: Vector3,
+        gyro_magnitude: float,
+        timestamp_ms: int,
+        candidate_state: MotionState,
+    ) -> bool:
         acceleration_magnitude = v_mag(filtered)
+        if candidate_state in (
+            MotionState.CURVE,
+            MotionState.LOW_CONFIDENCE,
+            MotionState.STRONG_VIBRATION,
+            MotionState.CONDUCTION_VIBRATION,
+        ):
+            return False
         if not self.main_axis_initialized:
             return acceleration_magnitude > self.axis_init_acc_threshold and gyro_magnitude < self.axis_init_gyro_threshold
-        if self.motion_state in (MotionState.CURVE, MotionState.LOW_CONFIDENCE):
-            return False
 
         lateral_average = average_lateral(self.window_frames)
         gyro_average = average_gyro(self.window_frames)
@@ -1110,6 +1142,13 @@ class SpeedEstimator:
             )
         ):
             self.window_frames.pop(0)
+
+    def replace_latest_window_projection(self, forward: float, lateral: float) -> None:
+        if not self.window_frames:
+            return
+        latest = self.window_frames[-1]
+        latest.forward = forward
+        latest.lateral = lateral
 
     def detect_motion_state(
         self,
@@ -1398,7 +1437,7 @@ def parse_number(row: Dict[str, Any], key: str) -> Optional[float]:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -1430,20 +1469,35 @@ def make_sensor_frame(row: Dict[str, Any]) -> Optional[SensorFrame]:
     )
 
 
+SUPPORTED_RECORD_SCHEMAS = frozenset((11, 13, 14, 15, 16, 17))
+LEGACY_PARTIAL_SENSOR_METADATA_SCHEMAS = frozenset((11, 13))
+LIFECYCLE_RECORD_TYPE_SCHEMAS = frozenset((14, 15, 16, 17))
+STRUCTURAL_METADATA_FIELDS = (
+    "recordSchemaVersion",
+    "appVersionCode",
+    "sessionId",
+    "algorithmVersion",
+)
+
+
 @dataclass(frozen=True)
 class JsonlReadInfo:
-    complete: bool
+    complete: Optional[bool]
+    status: str
+    structure: Dict[str, Any]
     ignored_tail_line_number: Optional[int] = None
     ignored_tail_byte_count: int = 0
 
     def summary(self, allow_truncated_tail: bool) -> Dict[str, Any]:
+        truncated_tail_ignored = self.ignored_tail_line_number is not None
         result: Dict[str, Any] = {
-            "status": "complete" if self.complete else "incomplete_truncated_tail_ignored",
+            "status": self.status,
             "complete": self.complete,
             "allowTruncatedTail": allow_truncated_tail,
-            "truncatedTailIgnored": not self.complete,
+            "truncatedTailIgnored": truncated_tail_ignored,
+            "structure": self.structure,
         }
-        if not self.complete:
+        if truncated_tail_ignored:
             result["ignoredTail"] = {
                 "lineNumber": self.ignored_tail_line_number,
                 "byteCount": self.ignored_tail_byte_count,
@@ -1451,11 +1505,301 @@ class JsonlReadInfo:
         return result
 
 
+@dataclass
+class JsonlStructureTracker:
+    row_count: int = 0
+    first_event: Optional[str] = None
+    last_event: Optional[str] = None
+    start_record_count: int = 0
+    stop_record_count: int = 0
+    rows_after_stop: int = 0
+    lifecycle_record_type_mismatch_count: int = 0
+    first_record_seq: Optional[int] = None
+    last_record_seq: Optional[int] = None
+    missing_record_seq_count: int = 0
+    record_seq_anomaly_count: int = 0
+    record_seq_anomaly_examples: List[str] = field(default_factory=list)
+    missing_record_type_count: int = 0
+    schema_version: Optional[int] = None
+    schema_mismatch: bool = False
+    schema_examples: List[int] = field(default_factory=list)
+    invalid_schema_count: int = 0
+    app_version_code: Optional[int] = None
+    app_version_mismatch: bool = False
+    app_version_examples: List[int] = field(default_factory=list)
+    invalid_app_version_count: int = 0
+    session_id: Optional[str] = None
+    session_mismatch: bool = False
+    session_examples: List[str] = field(default_factory=list)
+    invalid_session_count: int = 0
+    algorithm_version: Optional[str] = None
+    algorithm_mismatch: bool = False
+    algorithm_examples: List[str] = field(default_factory=list)
+    invalid_algorithm_count: int = 0
+    missing_metadata: Dict[str, Dict[str, int]] = field(
+        default_factory=lambda: {
+            name: {"sensor": 0, "other": 0}
+            for name in STRUCTURAL_METADATA_FIELDS
+        }
+    )
+
+    @staticmethod
+    def _remember_example(examples: List[Any], value: Any) -> None:
+        if value not in examples and len(examples) < 4:
+            examples.append(value)
+
+    def _observe_metadata(self, row: Dict[str, Any], row_kind: str) -> None:
+        schema_value = row.get("recordSchemaVersion")
+        if schema_value is None:
+            self.missing_metadata["recordSchemaVersion"][row_kind] += 1
+        else:
+            parsed_schema = parse_number(row, "recordSchemaVersion")
+            if (
+                isinstance(schema_value, bool)
+                or parsed_schema is None
+                or not parsed_schema.is_integer()
+                or parsed_schema < 1
+            ):
+                self.invalid_schema_count += 1
+            else:
+                schema = int(parsed_schema)
+                if self.schema_version is None:
+                    self.schema_version = schema
+                elif schema != self.schema_version:
+                    self.schema_mismatch = True
+                self._remember_example(self.schema_examples, schema)
+
+        app_version_value = row.get("appVersionCode")
+        if app_version_value is None:
+            self.missing_metadata["appVersionCode"][row_kind] += 1
+        else:
+            parsed_app_version = parse_number(row, "appVersionCode")
+            if (
+                isinstance(app_version_value, bool)
+                or parsed_app_version is None
+                or not parsed_app_version.is_integer()
+                or parsed_app_version < 1
+            ):
+                self.invalid_app_version_count += 1
+            else:
+                app_version = int(parsed_app_version)
+                if self.app_version_code is None:
+                    self.app_version_code = app_version
+                elif app_version != self.app_version_code:
+                    self.app_version_mismatch = True
+                self._remember_example(self.app_version_examples, app_version)
+
+        session_value = row.get("sessionId")
+        if session_value is None:
+            self.missing_metadata["sessionId"][row_kind] += 1
+        elif not isinstance(session_value, str) or not session_value.strip():
+            self.invalid_session_count += 1
+        else:
+            if self.session_id is None:
+                self.session_id = session_value
+            elif session_value != self.session_id:
+                self.session_mismatch = True
+            self._remember_example(self.session_examples, session_value)
+
+        algorithm_value = row.get("algorithmVersion")
+        if algorithm_value is None:
+            self.missing_metadata["algorithmVersion"][row_kind] += 1
+        elif not isinstance(algorithm_value, str) or not algorithm_value.strip():
+            self.invalid_algorithm_count += 1
+        else:
+            if self.algorithm_version is None:
+                self.algorithm_version = algorithm_value
+            elif algorithm_value != self.algorithm_version:
+                self.algorithm_mismatch = True
+            self._remember_example(self.algorithm_examples, algorithm_value)
+
+    def observe(self, row: Dict[str, Any], line_number: int) -> None:
+        self.row_count += 1
+        record_type_value = row.get("recordType")
+        record_type = record_type_value if isinstance(record_type_value, str) else ""
+        if not record_type:
+            self.missing_record_type_count += 1
+        row_kind = "sensor" if record_type == "sensor" else "other"
+        self._observe_metadata(row, row_kind)
+
+        event_value = row.get("event")
+        event = event_value if isinstance(event_value, str) else None
+        if self.row_count == 1:
+            self.first_event = event
+        self.last_event = event
+        if event == "start_record":
+            self.start_record_count += 1
+        if event == "stop_record":
+            self.stop_record_count += 1
+        elif self.stop_record_count > 0:
+            self.rows_after_stop += 1
+        if event in ("start_record", "stop_record") and record_type != "lifecycle":
+            self.lifecycle_record_type_mismatch_count += 1
+
+        record_seq = row.get("recordSeq")
+        if record_seq is None:
+            self.missing_record_seq_count += 1
+            return
+        record_seq_int = int(record_seq)
+        if self.first_record_seq is None:
+            self.first_record_seq = record_seq_int
+            if record_seq_int != 1:
+                self._record_seq_anomaly(
+                    f"line {line_number}: sequence starts at {record_seq_int}, expected 1"
+                )
+        elif self.last_record_seq is not None and record_seq_int != self.last_record_seq + 1:
+            self._record_seq_anomaly(
+                f"line {line_number}: recordSeq {record_seq_int}, expected {self.last_record_seq + 1}"
+            )
+        self.last_record_seq = record_seq_int
+
+    def _record_seq_anomaly(self, description: str) -> None:
+        self.record_seq_anomaly_count += 1
+        if len(self.record_seq_anomaly_examples) < 8:
+            self.record_seq_anomaly_examples.append(description)
+
+    def finish(
+        self,
+        ignored_tail_line_number: Optional[int] = None,
+        ignored_tail_byte_count: int = 0,
+    ) -> JsonlReadInfo:
+        issues: List[str] = []
+        if self.schema_mismatch:
+            issues.append("recordSchemaVersion changes within the file")
+        if self.invalid_schema_count:
+            issues.append(f"invalid recordSchemaVersion rows: {self.invalid_schema_count}")
+
+        if self.schema_mismatch:
+            compatibility = "mixed_schema"
+        elif self.schema_version is None:
+            compatibility = "unknown_missing_schema"
+        elif self.schema_version in SUPPORTED_RECORD_SCHEMAS:
+            compatibility = "supported"
+        else:
+            compatibility = "unknown_unsupported_schema"
+
+        if compatibility == "supported":
+            schema = self.schema_version
+            assert schema is not None
+            require_sensor_metadata = schema not in LEGACY_PARTIAL_SENSOR_METADATA_SCHEMAS
+            for name in STRUCTURAL_METADATA_FIELDS:
+                missing = self.missing_metadata[name]["other"]
+                if require_sensor_metadata:
+                    missing += self.missing_metadata[name]["sensor"]
+                if missing:
+                    issues.append(f"missing {name} rows: {missing}")
+            if self.invalid_session_count:
+                issues.append(f"invalid sessionId rows: {self.invalid_session_count}")
+            if self.invalid_algorithm_count:
+                issues.append(f"invalid algorithmVersion rows: {self.invalid_algorithm_count}")
+            if self.invalid_app_version_count:
+                issues.append(f"invalid appVersionCode rows: {self.invalid_app_version_count}")
+            if self.app_version_mismatch:
+                issues.append("appVersionCode changes within the file")
+            if self.session_mismatch:
+                issues.append("sessionId changes within the file")
+            if self.algorithm_mismatch:
+                issues.append("algorithmVersion changes within the file")
+            if self.missing_record_type_count:
+                issues.append(f"missing recordType rows: {self.missing_record_type_count}")
+            if self.missing_record_seq_count:
+                issues.append(f"missing recordSeq rows: {self.missing_record_seq_count}")
+            if self.record_seq_anomaly_count:
+                issues.append(f"recordSeq discontinuities: {self.record_seq_anomaly_count}")
+            if self.first_event != "start_record":
+                issues.append("first row is not start_record")
+            if self.last_event != "stop_record":
+                issues.append("last row is not stop_record")
+            if self.start_record_count != 1:
+                issues.append(f"start_record count is {self.start_record_count}, expected 1")
+            if self.stop_record_count != 1:
+                issues.append(f"stop_record count is {self.stop_record_count}, expected 1")
+            if self.rows_after_stop:
+                issues.append(f"rows after stop_record: {self.rows_after_stop}")
+            if (
+                schema in LIFECYCLE_RECORD_TYPE_SCHEMAS
+                and self.lifecycle_record_type_mismatch_count
+            ):
+                issues.append(
+                    "start_record/stop_record rows with non-lifecycle recordType: "
+                    f"{self.lifecycle_record_type_mismatch_count}"
+                )
+        elif self.session_mismatch:
+            issues.append("sessionId changes within the file")
+        if compatibility != "supported" and self.app_version_mismatch:
+            issues.append("appVersionCode changes within the file")
+        if compatibility != "supported" and self.algorithm_mismatch:
+            issues.append("algorithmVersion changes within the file")
+        if compatibility != "supported" and self.record_seq_anomaly_count:
+            issues.append(f"recordSeq discontinuities: {self.record_seq_anomaly_count}")
+
+        truncated = ignored_tail_line_number is not None
+        if truncated:
+            complete: Optional[bool] = False
+            status = "incomplete_truncated_tail_ignored"
+        elif compatibility == "supported":
+            complete = not issues
+            status = "complete" if complete else "incomplete_structure"
+        elif compatibility == "mixed_schema":
+            complete = False
+            status = "incomplete_structure"
+        else:
+            complete = None
+            status = "unknown_structure"
+
+        structure: Dict[str, Any] = {
+            "compatibility": compatibility,
+            "supportedSchemaVersions": sorted(SUPPORTED_RECORD_SCHEMAS),
+            "recordCount": self.row_count,
+            "recordSchemaVersion": self.schema_version,
+            "appVersionCode": self.app_version_code,
+            "sessionId": self.session_id,
+            "algorithmVersion": self.algorithm_version,
+            "recordSeq": {
+                "first": self.first_record_seq,
+                "last": self.last_record_seq,
+                "contiguous": (
+                    self.missing_record_seq_count == 0
+                    and self.record_seq_anomaly_count == 0
+                    if self.first_record_seq is not None
+                    else None
+                ),
+                "anomalyCount": self.record_seq_anomaly_count,
+                "anomalyExamples": self.record_seq_anomaly_examples,
+            },
+            "lifecycle": {
+                "firstEvent": self.first_event,
+                "lastEvent": self.last_event,
+                "startRecordCount": self.start_record_count,
+                "stopRecordCount": self.stop_record_count,
+                "rowsAfterStop": self.rows_after_stop,
+                "recordTypeMismatchCount": self.lifecycle_record_type_mismatch_count,
+            },
+            "issues": issues,
+        }
+        if self.schema_mismatch:
+            structure["recordSchemaVersionExamples"] = self.schema_examples
+        if self.app_version_mismatch:
+            structure["appVersionCodeExamples"] = self.app_version_examples
+        if self.session_mismatch:
+            structure["sessionIdExamples"] = self.session_examples
+        if self.algorithm_mismatch:
+            structure["algorithmVersionExamples"] = self.algorithm_examples
+        return JsonlReadInfo(
+            complete=complete,
+            status=status,
+            structure=structure,
+            ignored_tail_line_number=ignored_tail_line_number,
+            ignored_tail_byte_count=ignored_tail_byte_count,
+        )
+
+
 def read_jsonl_with_info(
     path: Path,
     allow_truncated_tail: bool = False,
 ) -> Tuple[List[Dict[str, Any]], JsonlReadInfo]:
     rows: List[Dict[str, Any]] = []
+    structure_tracker = JsonlStructureTracker()
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             has_line_terminator = line.endswith("\n")
@@ -1470,8 +1814,7 @@ def read_jsonl_with_info(
                     row = json.loads(stripped_line)
                 except json.JSONDecodeError as error:
                     if allow_truncated_tail and not has_line_terminator:
-                        return rows, JsonlReadInfo(
-                            complete=False,
+                        return rows, structure_tracker.finish(
                             ignored_tail_line_number=line_number,
                             ignored_tail_byte_count=len(line.encode("utf-8")),
                         )
@@ -1489,11 +1832,20 @@ def read_jsonl_with_info(
                         f"{path}:{line_number}: timestampMs must be a finite integer"
                     )
                 row["timestampMs"] = int(timestamp)
+                location_time_value = row.get("locationTimeMs")
+                if location_time_value is not None:
+                    parsed_location_time = parse_number(row, "locationTimeMs")
+                    if parsed_location_time is None or not parsed_location_time.is_integer():
+                        raise ValueError(
+                            f"{path}:{line_number}: locationTimeMs must be a finite integer"
+                        )
+                    row["locationTimeMs"] = int(parsed_location_time)
                 record_seq = row.get("recordSeq")
                 if record_seq is not None:
                     parsed_record_seq = parse_number(row, "recordSeq")
                     if (
-                        parsed_record_seq is None
+                        isinstance(record_seq, bool)
+                        or parsed_record_seq is None
                         or not parsed_record_seq.is_integer()
                         or parsed_record_seq < 0
                     ):
@@ -1501,13 +1853,14 @@ def read_jsonl_with_info(
                             f"{path}:{line_number}: recordSeq must be a non-negative integer"
                         )
                     row["recordSeq"] = int(parsed_record_seq)
+                structure_tracker.observe(row, line_number)
                 if row.get("recordType") == "sensor_callback":
                     continue
                 rows.append(row)
     # JSONL append order (and recordSeq within a session) is the callback execution
     # order. Wall-clock timestampMs can move backwards, so globally sorting here can
     # invert stop/start and parking events across measurement runs.
-    return rows, JsonlReadInfo(complete=True)
+    return rows, structure_tracker.finish()
 
 
 def read_jsonl(
@@ -1833,7 +2186,7 @@ def build_output_runs(
         grouped.setdefault(run_id, []).append(item)
 
     result: Dict[str, Dict[str, Any]] = {}
-    for run_id, items in grouped.items():
+    for run_order, (run_id, items) in enumerate(grouped.items()):
         processing_items = sorted(
             items,
             key=lambda item: int(item.get("sourceRowIndex", item["timestampMs"])),
@@ -1841,6 +2194,7 @@ def build_output_runs(
         time_items = sorted(items, key=lambda item: int(item["timestampMs"]))
         result[run_id] = {
             "runId": run_id,
+            "runOrder": run_order,
             "items": processing_items,
             "timeItems": time_items,
             "timestamps": [int(item["timestampMs"]) for item in time_items],
@@ -1918,34 +2272,63 @@ def location_row_is_comparable(row: Dict[str, Any]) -> bool:
     return speed_accuracy is None or speed_accuracy > 0
 
 
-def compare_with_location(
+def build_location_comparison_points(
     rows: List[Dict[str, Any]],
-    outputs: List[Dict[str, Any]],
-    lag_ms: int = 0,
-    speed_key: str = "speedKmh",
-    output_runs: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    if not outputs:
-        return {}
-    if output_runs is None:
-        output_runs = build_output_runs(outputs, speed_key)
-    diffs: List[float] = []
-    moving_diffs: List[float] = []
-    paired = 0
+    output_runs: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Index comparable GNSS rows once for repeated lag/bucket comparisons."""
+    points: List[Dict[str, Any]] = []
     for source_row_index, row in enumerate(rows):
         if not location_row_is_comparable(row):
             continue
         series = select_output_run_for_row(row, output_runs, source_row_index)
         if series is None:
             continue
-        location_timestamp_ms = int(row.get("locationTimeMs") or row["timestampMs"])
+        location_time_value = row.get("locationTimeMs")
+        if location_time_value is None:
+            location_timestamp_ms = int(row["timestampMs"])
+        else:
+            parsed_location_time = parse_number(row, "locationTimeMs")
+            if parsed_location_time is None or not parsed_location_time.is_integer():
+                raise ValueError("locationTimeMs must be a finite integer")
+            location_timestamp_ms = int(parsed_location_time)
+            if location_timestamp_ms == 0:
+                location_timestamp_ms = int(row["timestampMs"])
+        points.append({
+            "series": series,
+            "locationTimestampMs": location_timestamp_ms,
+            "locationSpeedKmh": float(row["locationSpeedMps"]) * 3.6,
+        })
+    return points
+
+
+def compare_with_location(
+    rows: List[Dict[str, Any]],
+    outputs: List[Dict[str, Any]],
+    lag_ms: int = 0,
+    speed_key: str = "speedKmh",
+    output_runs: Optional[Dict[str, Dict[str, Any]]] = None,
+    location_points: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    if not outputs:
+        return {}
+    if output_runs is None:
+        output_runs = build_output_runs(outputs, speed_key)
+    if location_points is None:
+        location_points = build_location_comparison_points(rows, output_runs)
+    diffs: List[float] = []
+    moving_diffs: List[float] = []
+    paired = 0
+    for point in location_points:
+        series = point["series"]
+        location_timestamp_ms = int(point["locationTimestampMs"])
         target_timestamp_ms = location_timestamp_ms - lag_ms
         estimated_speed_kmh = interpolate_output_speed_from_series(
             series["timestamps"], series["speeds"], target_timestamp_ms
         )
         if estimated_speed_kmh is None:
             continue
-        location_speed_kmh = float(row["locationSpeedMps"]) * 3.6
+        location_speed_kmh = float(point["locationSpeedKmh"])
         diff = estimated_speed_kmh - location_speed_kmh
         diffs.append(diff)
         if location_speed_kmh >= 3.0:
@@ -2031,14 +2414,23 @@ def compare_bucketed(
     outputs: List[Dict[str, Any]],
     lag_ms: int = 0,
     speed_key: str = "speedKmh",
+    output_runs: Optional[Dict[str, Dict[str, Any]]] = None,
+    location_points: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     if not outputs:
         return {}
-    output_runs = build_output_runs(outputs, speed_key)
+    if output_runs is None:
+        output_runs = build_output_runs(outputs, speed_key)
+    if location_points is None:
+        location_points = build_location_comparison_points(rows, output_runs)
     next_calibration_index = 0
     for series in sorted(
         output_runs.values(),
-        key=lambda value: value["timestamps"][0] if value["timestamps"] else 0,
+        key=lambda value: (
+            value["sourceStart"] is None,
+            value["sourceStart"] if value["sourceStart"] is not None else value["runOrder"],
+            value["runOrder"],
+        ),
     ):
         samples = series["timeItems"]
         sec_since_cals = [float(item.get("secondsSinceCalibration", 0)) for item in samples]
@@ -2055,13 +2447,9 @@ def compare_bucketed(
     bucket_diffs: Dict[str, List[float]] = {}
     bucket_moving_diffs: Dict[str, List[float]] = {}
 
-    for source_row_index, row in enumerate(rows):
-        if not location_row_is_comparable(row):
-            continue
-        series = select_output_run_for_row(row, output_runs, source_row_index)
-        if series is None:
-            continue
-        location_timestamp_ms = int(row.get("locationTimeMs") or row["timestampMs"])
+    for point in location_points:
+        series = point["series"]
+        location_timestamp_ms = int(point["locationTimestampMs"])
         target_timestamp_ms = location_timestamp_ms - lag_ms
         estimated_speed_kmh = interpolate_output_speed_from_series(
             series["timestamps"], series["speeds"], target_timestamp_ms
@@ -2087,7 +2475,7 @@ def compare_bucketed(
             bucket_diffs[label] = []
             bucket_moving_diffs[label] = []
 
-        location_speed_kmh = float(row["locationSpeedMps"]) * 3.6
+        location_speed_kmh = float(point["locationSpeedKmh"])
         diff = estimated_speed_kmh - location_speed_kmh
         bucket_diffs[label].append(diff)
         if location_speed_kmh >= 3.0:
@@ -2110,10 +2498,15 @@ def scan_location_lag(
     max_lag_ms: int = 30000,
     step_ms: int = 1000,
     speed_key: str = "speedKmh",
+    output_runs: Optional[Dict[str, Dict[str, Any]]] = None,
+    location_points: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     if not outputs:
         return {}
-    output_runs = build_output_runs(outputs, speed_key)
+    if output_runs is None:
+        output_runs = build_output_runs(outputs, speed_key)
+    if location_points is None:
+        location_points = build_location_comparison_points(rows, output_runs)
     scans: List[Dict[str, Any]] = []
     for lag_ms in range(min_lag_ms, max_lag_ms + 1, step_ms):
         comparison = compare_with_location(
@@ -2122,6 +2515,7 @@ def scan_location_lag(
             lag_ms,
             speed_key,
             output_runs,
+            location_points,
         )
         moving = comparison.get("moving", {})
         if moving.get("count"):
@@ -2525,6 +2919,7 @@ def build_anchored_outputs_v2(
 def recorded_estimator_abs_diffs(
     rows: List[Dict[str, Any]],
     outputs: List[Dict[str, Any]],
+    output_runs: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[List[float], str]:
     """Compare replayed pure inertia only with an explicitly pure recorded field.
 
@@ -2532,8 +2927,6 @@ def recorded_estimator_abs_diffs(
     despite its historical name. Comparing that value with pure replay output
     creates false regressions, so those rows are reported as unavailable.
     """
-    samples = sorted(outputs, key=lambda item: int(item["timestampMs"]))
-    output_runs = build_output_runs(outputs)
     estimator_rows = [
         row for row in rows
         if row.get("recordType") == "estimator"
@@ -2543,6 +2936,8 @@ def recorded_estimator_abs_diffs(
         if parse_number(row, "pureInertialSpeedKmh") is not None
     ]
     if pure_estimator_rows:
+        if output_runs is None:
+            output_runs = build_output_runs(outputs)
         samples_by_run_and_seq: Dict[str, Dict[Tuple[float, int], Dict[str, Any]]] = {}
         samples_by_run_and_time: Dict[str, Dict[int, List[Dict[str, Any]]]] = {}
         for run_id, series in output_runs.items():
@@ -2594,6 +2989,7 @@ def recorded_estimator_abs_diffs(
     if estimator_rows:
         return [], "unavailable_display_only_estimator_rows"
 
+    samples = sorted(outputs, key=lambda item: int(item["timestampMs"]))
     legacy_differences = [
             abs(float(item["speedKmh"]) - float(item["recordedSpeedKmh"]))
             for item in samples
@@ -2615,8 +3011,19 @@ def summarize(
     pure_zero: bool = False,
     gnss_lag_ms: int = 0,
     anchor_interval_ms: int = 0,
+    include_lag_scans: bool = True,
+    include_bucketed_comparison: bool = True,
+    include_recorded_comparison: bool = True,
 ) -> Dict[str, Any]:
-    recorded_pairs, recorded_pair_source = recorded_estimator_abs_diffs(rows, outputs)
+    output_runs = build_output_runs(outputs)
+    if include_recorded_comparison:
+        recorded_pairs, recorded_pair_source = recorded_estimator_abs_diffs(
+            rows,
+            outputs,
+            output_runs,
+        )
+    else:
+        recorded_pairs, recorded_pair_source = [], "skipped"
     estimator_parity = replay_config_matches_app(replay_config)
     anchor_parity = (
         use_anchor_v2
@@ -2624,6 +3031,7 @@ def summarize(
         and math.isclose(anchor_power, 1.0, rel_tol=0.0, abs_tol=1e-12)
         and anchor_interval_ms == 0
     )
+    app_config_parity = estimator_parity and anchor_parity
     speeds = [float(item["speedKmh"]) for item in outputs]
     confidences = [float(item["confidence"]) for item in outputs]
     states = {}
@@ -2636,7 +3044,10 @@ def summarize(
             **replay_config,
             "estimatorParity": estimator_parity,
             "anchorParity": anchor_parity,
-            "appParity": estimator_parity and anchor_parity,
+            "appParity": app_config_parity,
+            "appParityDeprecated": True,
+            "appConfigParity": app_config_parity,
+            "crossRuntimeParity": "not_verified",
             "anchorOptions": {
                 "enabled": use_anchor_v2,
                 "pureZero": pure_zero,
@@ -2644,7 +3055,7 @@ def summarize(
                 "anchorIntervalMs": anchor_interval_ms,
                 "comparisonGnssLagMs": gnss_lag_ms,
             },
-            "note": "appParity requires app estimator defaults plus --anchor-v2 --pure-zero and zero anchor interval; GNSS lag only shifts comparison targets.",
+            "note": "appParity is a deprecated alias for appConfigParity. Config parity requires app estimator defaults plus --anchor-v2 --pure-zero and zero anchor interval; it does not verify cross-runtime numerical parity. GNSS lag only shifts comparison targets.",
         },
         "sensorSamples": len(outputs),
         "events": events,
@@ -2684,6 +3095,7 @@ def summarize(
                 else "schema v14 estimator row has no exact preceding sensor-frame pair"
             ),
         }
+    location_points = build_location_comparison_points(rows, output_runs)
     if use_anchor_v2:
         anchor_diagnostics: Dict[str, Any] = {}
         anchored = build_anchored_outputs_v2(
@@ -2722,16 +3134,80 @@ def summarize(
             }
         else:
             summary["rawEligibleAnchorSpeed"] = {}
-        summary["locationComparison"] = compare_with_location(rows, outputs, lag_ms=gnss_lag_ms)
-        summary["anchoredComparison"] = compare_with_location(rows, anchored, lag_ms=gnss_lag_ms, speed_key="anchoredSpeedKmh")
-        summary["anchoredLagScan"] = scan_location_lag(rows, anchored, speed_key="anchoredSpeedKmh")
-        summary["anchoredLagScanFine"] = scan_location_lag(rows, anchored, min_lag_ms=-2000, max_lag_ms=2000, step_ms=20, speed_key="anchoredSpeedKmh")
-        summary["anchoredDecay"] = compare_bucketed(rows, anchored, speed_key="anchoredSpeedKmh")
+        anchored_output_runs = build_output_runs(anchored, "anchoredSpeedKmh")
+        anchored_location_points = build_location_comparison_points(rows, anchored_output_runs)
+        summary["locationComparison"] = compare_with_location(
+            rows,
+            outputs,
+            lag_ms=gnss_lag_ms,
+            output_runs=output_runs,
+            location_points=location_points,
+        )
+        summary["anchoredComparison"] = compare_with_location(
+            rows,
+            anchored,
+            lag_ms=gnss_lag_ms,
+            speed_key="anchoredSpeedKmh",
+            output_runs=anchored_output_runs,
+            location_points=anchored_location_points,
+        )
+        if include_lag_scans:
+            summary["anchoredLagScan"] = scan_location_lag(
+                rows,
+                anchored,
+                speed_key="anchoredSpeedKmh",
+                output_runs=anchored_output_runs,
+                location_points=anchored_location_points,
+            )
+            summary["anchoredLagScanFine"] = scan_location_lag(
+                rows,
+                anchored,
+                min_lag_ms=-2000,
+                max_lag_ms=2000,
+                step_ms=20,
+                speed_key="anchoredSpeedKmh",
+                output_runs=anchored_output_runs,
+                location_points=anchored_location_points,
+            )
+        if include_bucketed_comparison:
+            summary["anchoredDecay"] = compare_bucketed(
+                rows,
+                anchored,
+                speed_key="anchoredSpeedKmh",
+                output_runs=anchored_output_runs,
+                location_points=anchored_location_points,
+            )
     else:
-        summary["locationComparison"] = compare_with_location(rows, outputs, lag_ms=gnss_lag_ms)
-        summary["locationLagScan"] = scan_location_lag(rows, outputs)
-        summary["locationLagScanFine"] = scan_location_lag(rows, outputs, min_lag_ms=-2000, max_lag_ms=2000, step_ms=20)
-        summary["calibrationDecay"] = compare_bucketed(rows, outputs)
+        summary["locationComparison"] = compare_with_location(
+            rows,
+            outputs,
+            lag_ms=gnss_lag_ms,
+            output_runs=output_runs,
+            location_points=location_points,
+        )
+        if include_lag_scans:
+            summary["locationLagScan"] = scan_location_lag(
+                rows,
+                outputs,
+                output_runs=output_runs,
+                location_points=location_points,
+            )
+            summary["locationLagScanFine"] = scan_location_lag(
+                rows,
+                outputs,
+                min_lag_ms=-2000,
+                max_lag_ms=2000,
+                step_ms=20,
+                output_runs=output_runs,
+                location_points=location_points,
+            )
+        if include_bucketed_comparison:
+            summary["calibrationDecay"] = compare_bucketed(
+                rows,
+                outputs,
+                output_runs=output_runs,
+                location_points=location_points,
+            )
     return summary
 
 
@@ -2752,6 +3228,71 @@ def replay_config_matches_app(config: Dict[str, Any]) -> bool:
         elif value != expected:
             return False
     return True
+
+
+def estimator_default_kwargs() -> Dict[str, Any]:
+    """Return the estimator's live constructor defaults as a reusable config."""
+    defaults: Dict[str, Any] = {}
+    for name, parameter in inspect.signature(SpeedEstimator.__init__).parameters.items():
+        if name == "self":
+            continue
+        if parameter.default is inspect.Parameter.empty:
+            raise RuntimeError(f"SpeedEstimator parameter has no default: {name}")
+        defaults[name] = parameter.default
+    return defaults
+
+
+def analyze_replay_rows(
+    rows: List[Dict[str, Any]],
+    estimator_kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    strict_start: bool = True,
+    infer_start_from_sensor: bool = True,
+    adaptive_gravity: bool = False,
+    use_anchor_v2: bool = False,
+    anchor_power: float = 1.0,
+    pure_zero: bool = False,
+    gnss_lag_ms: int = 0,
+    anchor_interval_ms: int = 0,
+    include_lag_scans: bool = True,
+    include_bucketed_comparison: bool = True,
+    include_recorded_comparison: bool = True,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Replay already-parsed rows and produce the same summary as the CLI."""
+    effective_estimator_kwargs = estimator_default_kwargs()
+    if estimator_kwargs:
+        unknown = set(estimator_kwargs) - set(effective_estimator_kwargs)
+        if unknown:
+            raise ValueError(f"unknown estimator parameters: {sorted(unknown)}")
+        effective_estimator_kwargs.update(estimator_kwargs)
+    replay_config = {
+        **effective_estimator_kwargs,
+        "strict_start": strict_start,
+        "infer_start_from_sensor": infer_start_from_sensor,
+        "adaptive_gravity": adaptive_gravity,
+    }
+    outputs, events = replay(
+        rows,
+        strict_start=strict_start,
+        infer_start_from_sensor=infer_start_from_sensor,
+        adaptive_gravity=adaptive_gravity,
+        **effective_estimator_kwargs,
+    )
+    summary = summarize(
+        rows,
+        outputs,
+        events,
+        replay_config,
+        use_anchor_v2=use_anchor_v2,
+        anchor_power=anchor_power,
+        pure_zero=pure_zero,
+        gnss_lag_ms=gnss_lag_ms,
+        anchor_interval_ms=anchor_interval_ms,
+        include_lag_scans=include_lag_scans,
+        include_bucketed_comparison=include_bucketed_comparison,
+        include_recorded_comparison=include_recorded_comparison,
+    )
+    return summary, outputs
 
 
 def validate_cli_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -2853,6 +3394,16 @@ def main() -> int:
             "Allow only one malformed final JSON fragment when it has no line "
             "terminator; the summary is marked as incomplete."
         ),
+    )
+    parser.add_argument(
+        "--skip-lag-scans",
+        action="store_true",
+        help="Internal fast path: omit coarse/fine lag-scan fields from the summary.",
+    )
+    parser.add_argument(
+        "--skip-bucketed-comparison",
+        action="store_true",
+        help="Internal fast path: omit calibration-decay bucket fields from the summary.",
     )
     parser.add_argument("--no-strict-start", action="store_true", help="Do not abort when current app would reject initial calibration.")
     parser.add_argument("--curve-positive-scale", type=float, default=0.35, help="Scale positive acceleration while in curve state.")
@@ -2980,29 +3531,37 @@ def main() -> int:
     estimator_kwargs["low_confidence_negative_scale"] = low_confidence_negative_scale
     estimator_kwargs["use_vibration_guard"] = not args.no_vibration_guard
 
-    replay_config = {
-        **estimator_kwargs,
-        "strict_start": not args.no_strict_start,
-        "infer_start_from_sensor": not args.no_infer_start,
-        "adaptive_gravity": args.adaptive_gravity,
-    }
-
-    outputs, events = replay(
+    summary, outputs = analyze_replay_rows(
         rows,
+        estimator_kwargs,
         strict_start=not args.no_strict_start,
         infer_start_from_sensor=not args.no_infer_start,
         adaptive_gravity=args.adaptive_gravity,
-        **estimator_kwargs,
+        use_anchor_v2=args.anchor_v2,
+        anchor_power=args.anchor_power,
+        pure_zero=args.pure_zero,
+        gnss_lag_ms=args.gnss_lag_ms,
+        anchor_interval_ms=args.anchor_interval_ms,
+        include_lag_scans=not args.skip_lag_scans,
+        include_bucketed_comparison=not args.skip_bucketed_comparison,
     )
     if not outputs:
         parser.error("replay produced no sensor samples")
-    summary = summarize(rows, outputs, events, replay_config, use_anchor_v2=getattr(args, "anchor_v2", False), anchor_power=args.anchor_power, pure_zero=args.pure_zero, gnss_lag_ms=args.gnss_lag_ms, anchor_interval_ms=args.anchor_interval_ms)
     summary["inputIntegrity"] = read_info.summary(args.allow_truncated_tail)
 
-    if not read_info.complete:
+    if read_info.complete is False:
+        if read_info.ignored_tail_line_number is not None:
+            warning = (
+                "warning: input JSONL is incomplete; ignored unterminated malformed "
+                f"tail at line {read_info.ignored_tail_line_number}"
+            )
+        else:
+            warning = f"warning: input JSONL is incomplete ({read_info.status})"
+        print(warning, file=sys.stderr)
+    elif read_info.complete is None:
         print(
-            f"warning: input JSONL is incomplete; ignored unterminated malformed "
-            f"tail at line {read_info.ignored_tail_line_number}",
+            "warning: input JSONL structural completeness is unknown "
+            f"({read_info.structure.get('compatibility', 'unknown')})",
             file=sys.stderr,
         )
 

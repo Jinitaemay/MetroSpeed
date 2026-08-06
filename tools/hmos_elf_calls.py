@@ -37,6 +37,7 @@ try:
     )
     from capstone.arm64 import ARM64_INS_BL, ARM64_OP_IMM
     from capstone.x86 import X86_INS_CALL, X86_OP_IMM
+    from elftools.common.exceptions import ELFError
     from elftools.elf.elffile import ELFFile
 except ImportError as exc:  # pragma: no cover - analyst environment dependency
     raise SystemExit(
@@ -447,7 +448,7 @@ def main() -> int:
             return command_list(index, args)
         executable = read_executable(args.elf)
         return command_calls(executable, index, args)
-    except (OSError, ValueError) as exc:
+    except (ELFError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

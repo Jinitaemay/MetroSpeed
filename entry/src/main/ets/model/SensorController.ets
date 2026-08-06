@@ -5,14 +5,30 @@ import { SensorCallbackSample, SensorFrame, Vector3, Quaternion } from './SpeedT
 type SensorFrameCallback = (frame: SensorFrame) => void;
 type SensorStatusCallback = (message: string) => void;
 type SensorSampleCallback = (sample: SensorCallbackSample) => void;
+export type CoreSensorFailureSensor = 'accelerometer' | 'gyroscope';
+export type CoreSensorFailurePhase = 'initial' | 'stale';
+export interface CoreSensorFatalError {
+  sensor: CoreSensorFailureSensor;
+  phase: CoreSensorFailurePhase;
+  timestampMs: number;
+  message: string;
+}
+export type CoreSensorFatalCallback = (error: CoreSensorFatalError) => void;
 const HIGH_RATE_INTERVAL_NS = 10000000;
 const HIGH_RATE_HZ = 1000000000 / HIGH_RATE_INTERVAL_NS;
 const MAX_SENSOR_AGE_NS = 60000000;
+const GYROSCOPE_FRESHNESS_TIMEOUT_NS = 1000000000;
+const GYROSCOPE_WATCHDOG_MAX_ACCEL_GAP_NS = 200000000;
+const CORE_SENSOR_WATCHDOG_INTERVAL_MS = 250;
+const ACCELEROMETER_INITIAL_TIMEOUT_MS = 3000;
+const ACCELEROMETER_STALE_TIMEOUT_MS = 2000;
+const ACCELEROMETER_STALL_CONFIRM_MS = 500;
 
 export class SensorController {
   private frameCallback?: SensorFrameCallback;
   private statusCallback?: SensorStatusCallback;
   private sensorSampleCallback?: SensorSampleCallback;
+  private fatalCallback?: CoreSensorFatalCallback;
 
   private latestGyroscope?: Vector3;
   private latestGyroscopeTimestamp: number | null = null;
@@ -37,6 +53,18 @@ export class SensorController {
   private uncalibratedMagneticFieldSubscribed: boolean = false;
 
   private running: boolean = false;
+  private requireGyroscope: boolean = false;
+  private coreFatalReported: boolean = false;
+  private optionalGyroscopeDegraded: boolean = false;
+  private gyroscopeFreshFrameSeen: boolean = false;
+  private accelerometerFrameSeen: boolean = false;
+  private coreStartCallbackMs: number = 0;
+  private accelerometerStallSuspectSinceMs: number = 0;
+  private coreSensorWatchdogTimer: number = -1;
+  private lastAccelerationTimestamp: number | null = null;
+  private lastAccelerationCallbackMs: number = 0;
+  private gyroscopeMissingSinceTimestamp: number | null = null;
+  private gyroscopeMissingSinceCallbackMs: number = 0;
   private subscriptionGeneration: number = 0;
   private auxiliaryGeneration: number = 0;
   private auxiliaryCleanupPending: boolean = false;
@@ -45,12 +73,14 @@ export class SensorController {
     frameCallback: SensorFrameCallback,
     statusCallback: SensorStatusCallback,
     sensorSampleCallback?: SensorSampleCallback,
-    requireGyroscope: boolean = true
+    requireGyroscope: boolean = true,
+    fatalCallback?: CoreSensorFatalCallback
   ): boolean {
     const coreCleanupSucceeded = this.stop();
     this.frameCallback = frameCallback;
     this.statusCallback = statusCallback;
     this.sensorSampleCallback = sensorSampleCallback;
+    this.fatalCallback = fatalCallback;
 
     if (!coreCleanupSucceeded) {
       this.emitStatus('上次核心传感器退订失败，请重试');
@@ -68,6 +98,16 @@ export class SensorController {
     this.magneticFieldAvailable = false;
     this.uncalibratedGyroscopeAvailable = false;
     this.uncalibratedMagneticFieldAvailable = false;
+    this.requireGyroscope = requireGyroscope;
+    this.coreFatalReported = false;
+    this.optionalGyroscopeDegraded = false;
+    this.gyroscopeFreshFrameSeen = false;
+    this.accelerometerFrameSeen = false;
+    this.coreStartCallbackMs = Date.now();
+    this.accelerometerStallSuspectSinceMs = 0;
+    this.lastAccelerationTimestamp = null;
+    this.lastAccelerationCallbackMs = 0;
+    this.clearGyroscopeMissingWindow();
 
     this.running = true;
 
@@ -83,6 +123,7 @@ export class SensorController {
       return false;
     }
 
+    this.scheduleCoreSensorWatchdog(this.subscriptionGeneration);
     this.emitActiveSensorStatus(false);
 
     return true;
@@ -149,6 +190,7 @@ export class SensorController {
     this.subscriptionGeneration += 1;
     this.auxiliaryGeneration += 1;
     this.running = false;
+    this.stopCoreSensorWatchdog();
     let coreCleanupSucceeded = true;
     if (!this.safeOffAccelerometer()) coreCleanupSucceeded = false;
     if (!this.safeOffGyroscope()) coreCleanupSucceeded = false;
@@ -171,8 +213,19 @@ export class SensorController {
     this.magneticFieldAvailable = false;
     this.uncalibratedGyroscopeAvailable = false;
     this.uncalibratedMagneticFieldAvailable = false;
+    this.requireGyroscope = false;
+    this.coreFatalReported = false;
+    this.optionalGyroscopeDegraded = false;
+    this.gyroscopeFreshFrameSeen = false;
+    this.accelerometerFrameSeen = false;
+    this.coreStartCallbackMs = 0;
+    this.accelerometerStallSuspectSinceMs = 0;
+    this.lastAccelerationTimestamp = null;
+    this.lastAccelerationCallbackMs = 0;
+    this.clearGyroscopeMissingWindow();
     this.frameCallback = undefined;
     this.sensorSampleCallback = undefined;
+    this.fatalCallback = undefined;
     return coreCleanupSucceeded;
   }
 
@@ -222,6 +275,7 @@ export class SensorController {
         });
         this.latestGyroscope = { x: data.x, y: data.y, z: data.z };
         this.latestGyroscopeTimestamp = data.timestamp;
+        this.gyroscopeAvailable = true;
       }, { interval: HIGH_RATE_INTERVAL_NS });
       this.gyroscopeSubscribed = true;
       this.gyroscopeAvailable = true;
@@ -230,6 +284,7 @@ export class SensorController {
       const err = error as BusinessError;
       this.gyroscopeSubscribed = false;
       this.gyroscopeAvailable = false;
+      this.optionalGyroscopeDegraded = !this.requireGyroscope;
       this.emitStatus(`陀螺仪不可用：${err.message}`);
       return false;
     }
@@ -378,8 +433,11 @@ export class SensorController {
       return;
     }
 
+    const callbackTimestampMs = Date.now();
+    this.observeAccelerationContinuity(sensorTimestamp, callbackTimestampMs);
+
     const frame: SensorFrame = {
-      timestampMs: Date.now(),
+      timestampMs: callbackTimestampMs,
       sensorTimestamp,
       acceleration
     };
@@ -387,9 +445,27 @@ export class SensorController {
     const gyroAgeNs = sensorTimestamp !== null && this.latestGyroscopeTimestamp !== null
       ? sensorTimestamp - this.latestGyroscopeTimestamp
       : null;
-    if (this.gyroscopeAvailable && gyroAgeNs !== null && Math.abs(gyroAgeNs) <= MAX_SENSOR_AGE_NS) {
+    const gyroscopeFresh = this.gyroscopeAvailable &&
+      gyroAgeNs !== null &&
+      Math.abs(gyroAgeNs) <= MAX_SENSOR_AGE_NS;
+    if (gyroscopeFresh) {
       frame.gyroscope = this.latestGyroscope;
       frame.gyroscopeTimestamp = this.latestGyroscopeTimestamp;
+      this.gyroscopeFreshFrameSeen = true;
+      const recoveredFromOptionalDegradation = this.optionalGyroscopeDegraded;
+      this.optionalGyroscopeDegraded = false;
+      this.clearGyroscopeMissingWindow();
+      if (recoveredFromOptionalDegradation) {
+        this.emitStatus('陀螺仪回调已恢复，研究记录恢复完整传感器采集');
+      }
+    } else {
+      this.handleMissingGyroscope(sensorTimestamp, callbackTimestampMs);
+      if (this.requireGyroscope) {
+        // Required-gyro measurement frames must never reach the estimator with
+        // an implicit zero gyro. A short skew can recover; a sustained gap is
+        // converted into one fatal status and deferred subscription cleanup.
+        return;
+      }
     }
 
     const rotVecAgeNs = sensorTimestamp !== null && this.latestRotationVectorTimestamp !== null
@@ -409,6 +485,147 @@ export class SensorController {
     }
 
     this.frameCallback(frame);
+  }
+
+  private observeAccelerationContinuity(sensorTimestamp: number | null, callbackTimestampMs: number): void {
+    let continuous = true;
+    if (sensorTimestamp !== null && this.lastAccelerationTimestamp !== null) {
+      const sensorGapNs = sensorTimestamp - this.lastAccelerationTimestamp;
+      continuous = sensorGapNs > 0 && sensorGapNs <= GYROSCOPE_WATCHDOG_MAX_ACCEL_GAP_NS;
+    } else if (this.lastAccelerationCallbackMs > 0) {
+      const callbackGapMs = callbackTimestampMs - this.lastAccelerationCallbackMs;
+      continuous = callbackGapMs > 0 &&
+        callbackGapMs * 1000000 <= GYROSCOPE_WATCHDOG_MAX_ACCEL_GAP_NS;
+    }
+    if (!continuous) {
+      this.clearGyroscopeMissingWindow();
+    }
+    this.accelerometerFrameSeen = true;
+    this.accelerometerStallSuspectSinceMs = 0;
+    this.lastAccelerationTimestamp = sensorTimestamp;
+    this.lastAccelerationCallbackMs = callbackTimestampMs;
+  }
+
+  private handleMissingGyroscope(sensorTimestamp: number | null, callbackTimestampMs: number): void {
+    if (this.gyroscopeMissingSinceCallbackMs <= 0) {
+      this.gyroscopeMissingSinceTimestamp = sensorTimestamp;
+      this.gyroscopeMissingSinceCallbackMs = callbackTimestampMs;
+      return;
+    }
+
+    let missingDurationNs = Math.max(0,
+      callbackTimestampMs - this.gyroscopeMissingSinceCallbackMs) * 1000000;
+    if (sensorTimestamp !== null && this.gyroscopeMissingSinceTimestamp !== null &&
+      sensorTimestamp >= this.gyroscopeMissingSinceTimestamp) {
+      missingDurationNs = sensorTimestamp - this.gyroscopeMissingSinceTimestamp;
+    }
+    if (missingDurationNs < GYROSCOPE_FRESHNESS_TIMEOUT_NS) {
+      return;
+    }
+
+    if (this.requireGyroscope) {
+      const phase: CoreSensorFailurePhase = this.gyroscopeFreshFrameSeen ? 'stale' : 'initial';
+      const reason = phase === 'initial' ? '陀螺仪首帧超时' : '陀螺仪数据中断';
+      this.failCoreSensor('gyroscope', phase, reason);
+      return;
+    }
+
+    if (!this.optionalGyroscopeDegraded) {
+      this.optionalGyroscopeDegraded = true;
+      this.gyroscopeAvailable = false;
+      this.emitStatus('研究记录已降级：陀螺仪回调超时，仅记录加速度');
+    }
+  }
+
+  private clearGyroscopeMissingWindow(): void {
+    this.gyroscopeMissingSinceTimestamp = null;
+    this.gyroscopeMissingSinceCallbackMs = 0;
+  }
+
+  private scheduleCoreSensorWatchdog(generation: number): void {
+    if (!this.isCoreSubscriptionActive(generation) || this.coreSensorWatchdogTimer >= 0) {
+      return;
+    }
+    this.coreSensorWatchdogTimer = setTimeout(() => {
+      this.coreSensorWatchdogTimer = -1;
+      if (!this.isCoreSubscriptionActive(generation)) {
+        return;
+      }
+      this.checkAccelerometerWatchdog();
+      if (this.isCoreSubscriptionActive(generation)) {
+        this.scheduleCoreSensorWatchdog(generation);
+      }
+    }, CORE_SENSOR_WATCHDOG_INTERVAL_MS);
+  }
+
+  private stopCoreSensorWatchdog(): void {
+    if (this.coreSensorWatchdogTimer < 0) {
+      return;
+    }
+    clearTimeout(this.coreSensorWatchdogTimer);
+    this.coreSensorWatchdogTimer = -1;
+  }
+
+  private checkAccelerometerWatchdog(): void {
+    const now = Date.now();
+    const referenceMs = this.accelerometerFrameSeen
+      ? this.lastAccelerationCallbackMs
+      : this.coreStartCallbackMs;
+    const timeoutMs = this.accelerometerFrameSeen
+      ? ACCELEROMETER_STALE_TIMEOUT_MS
+      : ACCELEROMETER_INITIAL_TIMEOUT_MS;
+    if (referenceMs <= 0 || now - referenceMs < timeoutMs) {
+      this.accelerometerStallSuspectSinceMs = 0;
+      return;
+    }
+    if (this.accelerometerStallSuspectSinceMs <= 0) {
+      this.accelerometerStallSuspectSinceMs = now;
+      return;
+    }
+    if (now - this.accelerometerStallSuspectSinceMs < ACCELEROMETER_STALL_CONFIRM_MS) {
+      return;
+    }
+
+    const phase: CoreSensorFailurePhase = this.accelerometerFrameSeen ? 'stale' : 'initial';
+    const reason = phase === 'initial' ? '加速度计首帧超时' : '加速度计数据中断';
+    this.failCoreSensor('accelerometer', phase, reason);
+  }
+
+  private failCoreSensor(
+    sensorType: CoreSensorFailureSensor,
+    phase: CoreSensorFailurePhase,
+    reason: string
+  ): void {
+    if (!this.running || this.coreFatalReported) {
+      return;
+    }
+    this.coreFatalReported = true;
+    if (sensorType === 'gyroscope') {
+      this.gyroscopeAvailable = false;
+    }
+    const failedGeneration = this.subscriptionGeneration;
+    this.running = false;
+    this.stopCoreSensorWatchdog();
+    const operation = this.requireGyroscope ? '测速已中止' : '研究记录传感器已中止';
+    this.emitStatus(`${operation}：${reason}，请重新开始`);
+    if (this.fatalCallback) {
+      try {
+        this.fatalCallback({
+          sensor: sensorType,
+          phase,
+          timestampMs: Date.now(),
+          message: reason
+        });
+      } catch (error) {
+        // A UI observer must not prevent core sensor teardown.
+      }
+    }
+    setTimeout(() => {
+      if (failedGeneration !== this.subscriptionGeneration || !this.coreFatalReported) {
+        return;
+      }
+      this.stop();
+    }, 0);
   }
 
   private emitStatus(message: string): void {

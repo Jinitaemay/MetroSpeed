@@ -205,10 +205,19 @@ def _sync_unlocked(
             f'ALGORITHM_VERSION = "{algo_version}"',
             "ALGORITHM_VERSION in replay_estimator.py",
         )
+        readme_algo_line_pattern = (
+            r"(?m)^(?P<prefix>[ \t]*(?:>[ \t]*|-[ \t]*)?)"
+            r"\*\*算法版本\*\*[：:][ \t]*`[^`\r\n]+`[ \t]*(?=\r?$)"
+        )
+        readme_algo_line = unique_match(
+            readme_algo_line_pattern,
+            staged_readme,
+            "ALGORITHM_VERSION line in README.md",
+        )
         staged_readme = replace_once(
             staged_readme,
-            r"(?m)^>\s*\*\*算法版本\*\*[：:]\s*`[^`\r\n]+`\s*$",
-            f"> **算法版本**：`{algo_version}`",
+            readme_algo_line_pattern,
+            f"{readme_algo_line.group('prefix')}**算法版本**：`{algo_version}`",
             "ALGORITHM_VERSION in README.md",
         )
 
@@ -287,8 +296,33 @@ def acquire_version_lock() -> tuple[int, str]:
             raise RuntimeError(
                 f"Another build/version sync is running: {LOCK_FILE.name}"
             ) from error
-        os.write(lock_fd, token.encode("ascii"))
-        os.fsync(lock_fd)
+        try:
+            encoded_token = token.encode("ascii")
+            written_bytes = 0
+            while written_bytes < len(encoded_token):
+                chunk_size = os.write(lock_fd, encoded_token[written_bytes:])
+                if chunk_size <= 0:
+                    raise OSError("version lock token write made no progress")
+                written_bytes += chunk_size
+            os.fsync(lock_fd)
+        except OSError as error:
+            cleanup_errors: list[str] = []
+            try:
+                os.close(lock_fd)
+            except OSError as close_error:
+                cleanup_errors.append(f"close: {close_error}")
+            try:
+                LOCK_FILE.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as unlink_error:
+                cleanup_errors.append(f"unlink: {unlink_error}")
+            if cleanup_errors:
+                raise RuntimeError(
+                    f"Could not initialize version lock ({error}); "
+                    f"cleanup incomplete: {'; '.join(cleanup_errors)}"
+                ) from error
+            raise
         return lock_fd, token
     raise RuntimeError(f"Could not acquire version lock: {LOCK_FILE.name}")
 
@@ -340,7 +374,7 @@ def main() -> int:
         if args.allow_downgrade and args.code is None:
             raise ValueError("--allow-downgrade requires an explicit --code")
         return sync(args.code, args.algo, args.check, args.allow_downgrade)
-    except (RuntimeError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         print(f"version sync failed: {error}", file=sys.stderr)
         return 1
 

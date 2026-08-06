@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Iterator
 
 try:
+    from dissect.extfs.exceptions import Error as ExtFSError
     from dissect.extfs.extfs import ExtFS
 except ImportError as exc:  # pragma: no cover - depends on analyst environment
     raise SystemExit(
@@ -401,7 +402,20 @@ def main() -> int:
         with image.open("rb") as image_stream:
             filesystem = ExtFS(image_stream)
             return int(args.handler(filesystem, args))
-    except (FileExistsError, IsADirectoryError, KeyError, OSError, ValueError) as exc:
+    except EOFError:
+        print(
+            "error: image is truncated or too small to contain an ExtFS filesystem",
+            file=sys.stderr,
+        )
+        return 2
+    except (
+        ExtFSError,
+        FileExistsError,
+        IsADirectoryError,
+        KeyError,
+        OSError,
+        ValueError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

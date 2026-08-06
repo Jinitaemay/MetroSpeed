@@ -17,6 +17,7 @@
 | `CAL-001` | 修改停车校准、静止窗或校准时龄 | 成功严格归零并保留按钮后真实增量；拒绝路径不改变速度或锚点 | 自动化测试与适用的确定性回放 | 成功、立即起步、拒绝三类结果 |
 | `DATA-001` | 修改研究 schema、写入、保留或导出 | 保持事务替换、完整性标记、异步复制和敏感数据不入库 | 自动化测试、故障路径检查、最终包权限核验 | schema、失败/恢复结果、权限与忽略规则 |
 | `REG-001` | 任何算法层或显示融合改动 | 对人工确认的当前代回归集做前后同输入、同参数的逐记录比较 | 第 5 节；版本化 manifest 落地前执行临时清单规则 | 输入清单及 SHA-256、参数、完整性、逐记录结果 |
+| `SCAN-001` | 执行参数敏感度扫描 | 只接受结构完整输入，复用与产品同构的进程内回放入口，并完成筛选与主回归两阶段 | 第 6 节；`param_sensitivity.py` | 输入完整性、参数与扰动、逐记录结果 |
 | `DOC-001` | 公开事实、当前状态、逆向证据或规则发生变化 | 信息写入唯一职责文档，其他文档只摘要并链接 | 第 8 节职责表与链接检查 | 更新文件、事实来源、交叉链接 |
 | `GIT-001` | commit、push、tag、Release、PR 或上架操作 | 权限不逐级推导，操作范围与用户明确授权一致 | 第 10 节 | staged diff、提交哈希或外部操作结果 |
 
@@ -59,14 +60,15 @@
 
 **规则 ID：`VER-001`**
 
-每次构建（`hvigorw assembleHap` / `assembleApp` 或 DevEco Studio build）时，`hvigorfile.ts` 会自动更新 `AppScope/app.json5` 中的 `versionCode`。
+每次实际产物构建（`hvigorw assembleHap` / `assembleApp` 或 DevEco Studio build）时，`hvigorfile.ts` 会自动更新 `AppScope/app.json5` 中的 `versionCode`；`clean`、IDE 模型同步和任务枚举不得消耗版本号或改写受控源码。
 
 - `versionCode` = `max(Unix 时间戳秒, 当前两处版本号 + 1)`，同秒构建或时钟回拨时仍自动递增
 - `versionName` = 语义化版本号（如 `1.0.0`），**手动管理**，发版时修改 `app.json5`
 - 不要在构建前手动编辑 `versionCode`，但可以手动修改 `versionName`
 - `targetSdkVersion` 是包含系统版本与 API 级别的完整配置值（如 `6.1.1(24)`），`target API 24` 仅表示其中的 API 级别；文档描述当前配置时不得混淆两者
 - `sync_version.py --code <timestamp>` 用于手动同步（无需每次构建执行）；默认拒绝低于当前值的显式版本号，只有本地有意回滚时才可加 `--allow-downgrade`
-- 构建入口与 `sync_version.py` 共用 `.sync-version.lock`，并采用保留原换行的原子替换/失败回滚；不要绕过两者直接并发改写版本字段
+- `sync_version.py --algo <标识>` 用于同步新的算法候选，并同时分配不低于当前值的新 `versionCode`；算法逻辑和标识尚未确定时不得反复调用消耗编号
+- 构建入口与 `sync_version.py` 共用 `.sync-version.lock`，并采用保留原换行的原子替换/失败回滚；锁初始化写入或刷新失败时也必须关闭描述符并清理本次新建的锁文件；不要绕过两者直接并发改写版本字段
 
 ### 2.2 构建命令
 
@@ -184,7 +186,9 @@ powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1 -JavaPath "D:\Java\b
 
 schema v14 起，所有实际传感器回调都必须逐条落盘并携带 `sessionId`、`measurementRunId` 和版本字段；估算器行必须同时保留纯惯性 `pureInertialSpeedKmh` 与界面显示 `displaySpeedKmh`。schema v15 进一步要求保存独立 `sensor_callback` 记录、请求周期、传感器时间戳和回调时间戳，任何频率判断都必须以实际时间戳为准，不得把请求值或加速度计驱动帧率套给其他传感器。schema v16 的新记录只订阅六类 100Hz 请求传感器，不再采集系统 `GRAVITY` / `LINEAR_ACCELEROMETER`；旧 v13/v15 的 `sysGravity*` 数据和分析开关必须保持可读。schema v17 沿用 v16 的传感器范围，并要求用独立 `device_health` 行在记录开始、结束及运行中每 10 秒保存 `batteryTemperatureC` 与 `thermalLevel`，不得把设备健康字段复制到每条 100Hz 记录。离线对比必须按 `measurementRunId` 隔离，纯惯性回归只允许与同一 `recordSeq` 邻接的精确传感器样本配对，禁止跨测速段或跨缺失样本插值；schema v13 的 `estimatedSpeedKmh` 是锚定后的显示速度，不能当作纯惯性回归基准。
 
-研究记录的本地保留和导出必须满足事务语义：新会话文件完成首行写入、刷新和状态确认后才可删除上一条记录；任何建文件失败都必须恢复旧记录。导出只复制、不删除源文件，采用异步分块读取避免长日志阻塞 UI；失败时清理不完整目标，成功后允许重复导出。JSONL 可能包含精确位置、卫星统计和设备热数据，必须由 `.gitignore` 排除且不得提交公开仓库。
+研究记录的本地保留和导出必须满足事务语义：新会话文件完成首行写入、刷新和状态确认后才可删除上一条记录；任何建文件失败都必须恢复旧记录。导出只复制、不删除源文件，采用异步分块读取避免长日志阻塞 UI；受控失败时应通过支持公共文档 URI 的系统能力清理不完整目标，文档服务拒绝删除时必须明确提示可能残留，不能用只支持应用沙箱路径的接口伪装成功，也不能把直接写文档 URI 描述成掉电原子提交；成功后允许重复导出。JSONL 可能包含精确位置、卫星统计和设备热数据，必须由 `.gitignore` 排除且不得提交公开仓库。
+
+离线工具在宣称输入可用于回归前，必须逐行验证受支持 schema 的会话边界、`recordSeq` 连续性、版本字段一致性以及 `start_record` / `stop_record` 生命周期。`inputIntegrity.complete` 采用三态语义：`true` 表示结构完整，`false` 表示已确认不完整，`null` 表示旧格式或未知结构无法判定；只有 `true` 可以计入完整回归通过。面向大日志的快速路径只能省略明确标注的可选统计，不能抽样、跳过输入行、绕过完整性校验或改变核心回放结果。实现应优先使用单次解析、在线统计、紧凑数值缓存或受控的第二遍顺序扫描，避免为同一分析重复解析整份日志和保留不必要的 Python 行对象。
 
 回放分析使用：
 ```
@@ -234,7 +238,7 @@ schema、完整性口径和必跑参数配置。算法或融合逻辑改动必�
 
 主回归集中的大文件仍完整顺序回放，避免并行解码多个数百 MB 文件造成内存压力。改动前基线可以复用，但缓存键必须同时包含代码提交哈希、输入文件 SHA-256 和完整命令行参数；任一项变化都必须重算。报告中必须标明复用的基线，禁止把缓存结果冒充本轮新运行。
 
-已确认仅在 EOF 写入中断的记录可以显式使用 `--allow-truncated-tail`，但必须让改动前后读取同一有效前缀，并把结果标为 `incomplete`。`_baseline_all.py` 必须显示 `inputIntegrity` 状态并以非零退出，禁止把截断输入计入完整全绿。
+已确认仅在 EOF 写入中断的记录可以显式使用 `--allow-truncated-tail`，但必须让改动前后读取同一有效前缀，并把结果标为 `incomplete`。`_baseline_all.py` 必须显示 `inputIntegrity` 的完整、不完整或未知状态；只有明确完整可以返回该项成功，不完整或未知都必须以非零退出，禁止把截断或无法证明完整的输入计入完整全绿。
 
 如果当前代主回归集增长到日常无法完整运行，应先在 manifest 中建立并经
 人工确认的分段配置，再修改本规则；不得自行静默抽样。`REG-MANIFEST-001`
@@ -258,7 +262,7 @@ schema、完整性口径和必跑参数配置。算法或融合逻辑改动必�
 
 灵敏度筛选不要求每个参数只跑一条记录——多跑几条互补记录的筛选不算"跳过筛选"。
 
-参数扫描使用 subprocess 调用 `replay_estimator.py` 的 CLI 参数，**不得**用文本补丁法或 monkey-patch 修改源代码。
+参数扫描必须调用 `replay_estimator.py` 提供的同构估算器默认参数和进程内顺序回放入口，使一份 JSONL 只解析一次；扫描前必须确认 `inputIntegrity.complete=true`。**不得**用文本补丁法或 monkey-patch 修改源代码，也不得另写一套与产品默认路径分叉的估算逻辑。
 
 参数扫描默认在 pure inertial 模式进行。当 pure 模式找到有效改进点后，应复跑该参数在锚点 v2 模式下是否仍改善——pure 最优 ≠ anchor 兼容。
 

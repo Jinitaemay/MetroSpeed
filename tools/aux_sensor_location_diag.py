@@ -11,13 +11,17 @@ summarized separately from the high-rate sensor stream.
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import math
+import shutil
 import sys
+import tempfile
+from array import array
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, TextIO
+from typing import Any, BinaryIO
 
 SUPPORTED_SCHEMA_VERSIONS = {15, 16, 17}
 SCHEMA16_PLUS_SENSOR_TYPES = {
@@ -41,14 +45,7 @@ THERMAL_LEVEL_NAMES = {
 }
 
 
-@dataclass(frozen=True)
-class Point:
-    value_ms: float
-    line_no: int
-    record_seq: int | None
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Gap:
     interval_ms: float
     line_no: int
@@ -56,7 +53,7 @@ class Gap:
     estimated_missing: int
 
 
-@dataclass
+@dataclass(slots=True)
 class SeriesStats:
     point_count: int
     interval_count: int
@@ -66,13 +63,147 @@ class SeriesStats:
     max_ms: float | None
     reverse_count: int
     duplicate_count: int
-    large_gaps: list[Gap]
+    large_gaps: list[Gap] = field(default_factory=list)
+    large_gap_count: int = 0
+    estimated_missing: int = 0
+
+
+@dataclass(slots=True)
+class SeriesAccumulator:
+    """Keep exact interval quantiles in a compact double array, not per-row objects."""
+
+    point_count: int = 0
+    first_ms: float | None = None
+    last_ms: float | None = None
+    previous_ms: float | None = None
+    max_ms: float | None = None
+    reverse_count: int = 0
+    duplicate_count: int = 0
+    positive_intervals: array = field(default_factory=lambda: array("d"))
+
+    def add(self, value_ms: float) -> None:
+        if self.first_ms is None:
+            self.first_ms = value_ms
+        if self.previous_ms is not None:
+            interval_ms = value_ms - self.previous_ms
+            if interval_ms > 0:
+                self.positive_intervals.append(interval_ms)
+                if self.max_ms is None or interval_ms > self.max_ms:
+                    self.max_ms = interval_ms
+            elif interval_ms < 0:
+                self.reverse_count += 1
+            else:
+                self.duplicate_count += 1
+        self.previous_ms = value_ms
+        self.last_ms = value_ms
+        self.point_count += 1
+
+    def summarize(self) -> SeriesStats:
+        effective_hz: float | None = None
+        if (
+            self.point_count > 1
+            and self.first_ms is not None
+            and self.last_ms is not None
+            and self.last_ms > self.first_ms
+        ):
+            effective_hz = (self.point_count - 1) * 1000.0 / (
+                self.last_ms - self.first_ms
+            )
+        return SeriesStats(
+            point_count=self.point_count,
+            interval_count=len(self.positive_intervals),
+            effective_hz=effective_hz,
+            p50_ms=percentile(self.positive_intervals, 0.50),
+            p95_ms=percentile(self.positive_intervals, 0.95),
+            max_ms=self.max_ms,
+            reverse_count=self.reverse_count,
+            duplicate_count=self.duplicate_count,
+            large_gaps=[],
+        )
+
+    def release_intervals(self) -> None:
+        self.positive_intervals = array("d")
+
+
+@dataclass(slots=True)
+class SequenceStats:
+    first: int | None = None
+    last: int | None = None
+    missing: int = 0
+    reverse: int = 0
+    duplicate: int = 0
+
+    def add(self, record_seq: int) -> None:
+        if self.first is None:
+            self.first = record_seq
+        if self.last is not None:
+            if record_seq > self.last:
+                self.missing += max(0, record_seq - self.last - 1)
+            elif record_seq < self.last:
+                self.reverse += 1
+            else:
+                self.duplicate += 1
+        self.last = record_seq
+
+
+@dataclass(frozen=True, slots=True)
+class SensorCallback:
+    sensor_type: str
+    callback_ms: float
+    sensor_ms: float
+    requested_ns: float
+
+
+@dataclass(slots=True)
+class GapScanner:
+    p50_ms: float | None
+    gap_factor: float
+    keep_count: int
+    previous_ms: float | None = None
+    large_gap_count: int = 0
+    estimated_missing: int = 0
+    largest: list[tuple[float, int, Gap]] = field(default_factory=list)
+
+    def add(self, value_ms: float, line_no: int, record_seq: int | None) -> None:
+        if self.previous_ms is None:
+            self.previous_ms = value_ms
+            return
+        interval_ms = value_ms - self.previous_ms
+        self.previous_ms = value_ms
+        if (
+            self.p50_ms is None
+            or self.p50_ms <= 0
+            or interval_ms <= self.p50_ms * self.gap_factor
+        ):
+            return
+        estimated_missing = max(0, round(interval_ms / self.p50_ms) - 1)
+        gap = Gap(interval_ms, line_no, record_seq, estimated_missing)
+        self.large_gap_count += 1
+        self.estimated_missing += estimated_missing
+        if self.keep_count <= 0:
+            return
+        entry = (interval_ms, -line_no, gap)
+        if len(self.largest) < self.keep_count:
+            heapq.heappush(self.largest, entry)
+        elif entry[:2] > self.largest[0][:2]:
+            heapq.heapreplace(self.largest, entry)
+
+    def apply(self, stats: SeriesStats) -> None:
+        stats.large_gap_count = self.large_gap_count
+        stats.estimated_missing = self.estimated_missing
+        stats.large_gaps = sorted(
+            (entry[2] for entry in self.largest),
+            key=lambda gap: (-gap.interval_ms, gap.line_no),
+        )
 
 
 def finite_number(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError):
+        return None
     return result if math.isfinite(result) else None
 
 
@@ -83,95 +214,117 @@ def optional_int(value: Any) -> int | None:
     return int(number)
 
 
-def percentile(sorted_values: list[float], quantile: float) -> float | None:
-    if not sorted_values:
+def select_kth(values: array, target: int) -> float:
+    """Select one exact order statistic in-place without expanding doubles to objects."""
+    left = 0
+    right = len(values) - 1
+    while left < right:
+        pivot = values[(left + right) // 2]
+        lower = left
+        upper = right
+        while lower <= upper:
+            while values[lower] < pivot:
+                lower += 1
+            while values[upper] > pivot:
+                upper -= 1
+            if lower <= upper:
+                values[lower], values[upper] = values[upper], values[lower]
+                lower += 1
+                upper -= 1
+        if target <= upper:
+            right = upper
+        elif target >= lower:
+            left = lower
+        else:
+            return float(values[target])
+    return float(values[left])
+
+
+def percentile(values: array, quantile: float) -> float | None:
+    if not values:
         return None
-    position = (len(sorted_values) - 1) * quantile
+    position = (len(values) - 1) * quantile
     lower = math.floor(position)
     upper = math.ceil(position)
+    lower_value = select_kth(values, lower)
     if lower == upper:
-        return sorted_values[lower]
+        return lower_value
+    upper_value = select_kth(values, upper)
     fraction = position - lower
-    return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
-
-
-def analyse_series(points: list[Point], gap_factor: float) -> SeriesStats:
-    positive_intervals: list[float] = []
-    interval_endpoints: list[tuple[float, Point]] = []
-    reverse_count = 0
-    duplicate_count = 0
-
-    for previous, current in zip(points, points[1:]):
-        interval_ms = current.value_ms - previous.value_ms
-        if interval_ms > 0:
-            positive_intervals.append(interval_ms)
-            interval_endpoints.append((interval_ms, current))
-        elif interval_ms < 0:
-            reverse_count += 1
-        else:
-            duplicate_count += 1
-
-    sorted_intervals = sorted(positive_intervals)
-    p50_ms = percentile(sorted_intervals, 0.50)
-    p95_ms = percentile(sorted_intervals, 0.95)
-    max_ms = sorted_intervals[-1] if sorted_intervals else None
-
-    effective_hz: float | None = None
-    if len(points) > 1:
-        span_ms = points[-1].value_ms - points[0].value_ms
-        if span_ms > 0:
-            effective_hz = (len(points) - 1) * 1000.0 / span_ms
-
-    large_gaps: list[Gap] = []
-    if p50_ms is not None and p50_ms > 0:
-        threshold_ms = p50_ms * gap_factor
-        for interval_ms, endpoint in interval_endpoints:
-            if interval_ms > threshold_ms:
-                estimated_missing = max(0, round(interval_ms / p50_ms) - 1)
-                large_gaps.append(
-                    Gap(
-                        interval_ms=interval_ms,
-                        line_no=endpoint.line_no,
-                        record_seq=endpoint.record_seq,
-                        estimated_missing=estimated_missing,
-                    )
-                )
-        large_gaps.sort(key=lambda gap: gap.interval_ms, reverse=True)
-
-    return SeriesStats(
-        point_count=len(points),
-        interval_count=len(positive_intervals),
-        effective_hz=effective_hz,
-        p50_ms=p50_ms,
-        p95_ms=p95_ms,
-        max_ms=max_ms,
-        reverse_count=reverse_count,
-        duplicate_count=duplicate_count,
-        large_gaps=large_gaps,
-    )
+    return lower_value * (1.0 - fraction) + upper_value * fraction
 
 
 def format_number(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
 
-def mode_requested_interval_ms(values_ns: Iterable[float]) -> tuple[float | None, int]:
-    rounded_ms = [round(value / 1_000_000.0, 6) for value in values_ns if value > 0]
-    if not rounded_ms:
+def mode_requested_interval_ms(counts: Counter[float]) -> tuple[float | None, int]:
+    if not counts:
         return None, 0
-    counts = Counter(rounded_ms)
     value_ms, count = counts.most_common(1)[0]
     return value_ms, count
 
 
-def open_source(source: str) -> tuple[TextIO, bool]:
+def parse_sensor_callback(row: dict[str, Any]) -> tuple[SensorCallback | None, list[str]]:
+    errors: list[str] = []
+    raw_sensor_type = row.get("sensorType")
+    sensor_type = raw_sensor_type if isinstance(raw_sensor_type, str) else ""
+    if not sensor_type.strip():
+        errors.append("sensorType")
+
+    callback_ms = finite_number(row.get("timestampMs"))
+    if callback_ms is None or callback_ms < 0:
+        errors.append("timestampMs")
+
+    sensor_timestamp_ns = finite_number(row.get("sensorTimestamp"))
+    if sensor_timestamp_ns is None or sensor_timestamp_ns < 0:
+        errors.append("sensorTimestamp")
+
+    requested_ns = finite_number(row.get("requestedIntervalNs"))
+    if requested_ns is None or requested_ns <= 0:
+        errors.append("requestedIntervalNs")
+
+    if errors:
+        return None, errors
+    return (
+        SensorCallback(
+            sensor_type=sensor_type,
+            callback_ms=callback_ms,
+            sensor_ms=sensor_timestamp_ns / 1_000_000.0,
+            requested_ns=requested_ns,
+        ),
+        [],
+    )
+
+
+def remember_line(lines: list[int], line_no: int, limit: int = 10) -> None:
+    if len(lines) < limit:
+        lines.append(line_no)
+
+
+def copy_source_to_snapshot(source: str, snapshot: BinaryIO) -> None:
     if source == "-":
-        return sys.stdin, False
-    return Path(source).open("r", encoding="utf-8"), True
+        stdin_buffer = getattr(sys.stdin, "buffer", None)
+        if stdin_buffer is not None:
+            shutil.copyfileobj(stdin_buffer, snapshot, length=1024 * 1024)
+        else:
+            while chunk := sys.stdin.read(1024 * 1024):
+                snapshot.write(chunk.encode("utf-8", errors="surrogatepass"))
+    else:
+        with Path(source).open("rb") as stream:
+            shutil.copyfileobj(stream, snapshot, length=1024 * 1024)
+    snapshot.seek(0)
+
+
+def parse_json_object(raw_line: bytes) -> dict[str, Any] | None:
+    try:
+        row = json.loads(raw_line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    return row if isinstance(row, dict) else None
 
 
 def print_series(label: str, stats: SeriesStats, gap_factor: float, show_gaps: int) -> None:
-    estimated_missing = sum(gap.estimated_missing for gap in stats.large_gaps)
     print(
         f"  {label}: effective={format_number(stats.effective_hz)} Hz, "
         f"P50={format_number(stats.p50_ms)} ms, "
@@ -181,8 +334,8 @@ def print_series(label: str, stats: SeriesStats, gap_factor: float, show_gaps: i
     print(
         f"    intervals={stats.interval_count}, reverse={stats.reverse_count}, "
         f"duplicate={stats.duplicate_count}, "
-        f"gaps(>{gap_factor:g}xP50)={len(stats.large_gaps)}, "
-        f"estimated_missing~={estimated_missing}"
+        f"gaps(>{gap_factor:g}xP50)={stats.large_gap_count}, "
+        f"estimated_missing~={stats.estimated_missing}"
     )
     for gap in stats.large_gaps[:show_gaps]:
         seq_text = "n/a" if gap.record_seq is None else str(gap.record_seq)
@@ -192,125 +345,221 @@ def print_series(label: str, stats: SeriesStats, gap_factor: float, show_gaps: i
         )
 
 
-def diagnose(source: str, gap_factor: float, show_gaps: int) -> bool:
-    sensor_points: dict[str, dict[str, list[Point]]] = defaultdict(
-        lambda: {"sensor": [], "callback": []}
+def _diagnose_snapshot(
+    snapshot: BinaryIO, source: str, gap_factor: float, show_gaps: int
+) -> bool:
+    sensor_accumulators: dict[str, dict[str, SeriesAccumulator]] = defaultdict(
+        lambda: {"sensor": SeriesAccumulator(), "callback": SeriesAccumulator()}
     )
-    requested_ns: dict[str, list[float]] = defaultdict(list)
-    system_points: dict[str, list[Point]] = defaultdict(list)
+    requested_modes: dict[str, Counter[float]] = defaultdict(Counter)
+    system_accumulators: dict[str, SeriesAccumulator] = defaultdict(SeriesAccumulator)
     schema_versions: Counter[int] = Counter()
-    session_sequences: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    session_sequences: dict[str, SequenceStats] = defaultdict(SequenceStats)
     invalid_json_lines: list[int] = []
+    invalid_json_count = 0
     invalid_record_seq_lines: list[int] = []
+    invalid_record_seq_count = 0
+    invalid_sensor_callback_lines: list[int] = []
+    invalid_sensor_callback_count = 0
+    invalid_sensor_callback_fields: Counter[str] = Counter()
     valid_rows = 0
     sensor_callback_rows = 0
+    valid_sensor_callback_rows = 0
+    observed_sensor_types: set[str] = set()
     device_health_rows = 0
-    device_health_points: list[Point] = []
+    device_health_accumulator = SeriesAccumulator()
     device_health_reasons: Counter[str] = Counter()
-    device_health_temperatures: list[float] = []
+    device_health_temperature_count = 0
+    device_health_temperature_min: float | None = None
+    device_health_temperature_max: float | None = None
     device_health_thermal_levels: Counter[int] = Counter()
     unavailable_battery_temperature_rows = 0
     unavailable_thermal_level_rows = 0
     invalid_device_health_lines: list[int] = []
+    invalid_device_health_count = 0
     first_record: dict[str, Any] | None = None
     last_record: dict[str, Any] | None = None
     sequence_integrity_ok = True
 
-    stream, should_close = open_source(source)
-    try:
-        for line_no, raw_line in enumerate(stream, start=1):
-            if not raw_line.strip():
-                continue
-            try:
-                row = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                invalid_json_lines.append(line_no)
-                continue
-            if not isinstance(row, dict):
-                invalid_json_lines.append(line_no)
-                continue
+    snapshot.seek(0)
+    for line_no, raw_line in enumerate(snapshot, start=1):
+        if not raw_line.strip():
+            continue
+        row = parse_json_object(raw_line)
+        if row is None:
+            invalid_json_count += 1
+            remember_line(invalid_json_lines, line_no)
+            continue
 
-            valid_rows += 1
-            if first_record is None:
-                first_record = row
-            last_record = row
-            schema_version = optional_int(row.get("recordSchemaVersion"))
-            if schema_version is not None:
-                schema_versions[schema_version] += 1
+        valid_rows += 1
+        if first_record is None:
+            first_record = row
+        last_record = row
+        schema_version = optional_int(row.get("recordSchemaVersion"))
+        if schema_version is not None:
+            schema_versions[schema_version] += 1
 
-            record_seq = optional_int(row.get("recordSeq"))
-            session_id = row.get("sessionId")
-            if record_seq is not None:
-                session_sequences[str(session_id or "<missing>")].append((record_seq, line_no))
+        record_seq = optional_int(row.get("recordSeq"))
+        session_id = row.get("sessionId")
+        if record_seq is not None:
+            session_sequences[str(session_id or "<missing>")].add(record_seq)
+        else:
+            invalid_record_seq_count += 1
+            remember_line(invalid_record_seq_lines, line_no)
+
+        record_type = row.get("recordType")
+        callback_ms = finite_number(row.get("timestampMs"))
+        if record_type == "sensor_callback":
+            sensor_callback_rows += 1
+            raw_sensor_type = row.get("sensorType")
+            observed_sensor_types.add(
+                raw_sensor_type
+                if isinstance(raw_sensor_type, str) and raw_sensor_type.strip()
+                else "<missing>"
+            )
+            callback, callback_errors = parse_sensor_callback(row)
+            if callback is None:
+                invalid_sensor_callback_count += 1
+                invalid_sensor_callback_fields.update(callback_errors)
+                remember_line(invalid_sensor_callback_lines, line_no)
+                continue
+            valid_sensor_callback_rows += 1
+            sensor_accumulators[callback.sensor_type]["callback"].add(
+                callback.callback_ms
+            )
+            sensor_accumulators[callback.sensor_type]["sensor"].add(
+                callback.sensor_ms
+            )
+            requested_modes[callback.sensor_type][
+                round(callback.requested_ns / 1_000_000.0, 6)
+            ] += 1
+        elif record_type == "device_health":
+            device_health_rows += 1
+            row_valid = True
+            if callback_ms is not None:
+                device_health_accumulator.add(callback_ms)
             else:
-                invalid_record_seq_lines.append(line_no)
+                row_valid = False
 
-            record_type = row.get("recordType")
-            callback_ms = finite_number(row.get("timestampMs"))
-            if record_type == "sensor_callback":
-                sensor_type = row.get("sensorType")
-                if not isinstance(sensor_type, str) or not sensor_type:
-                    sensor_type = "<missing>"
-                sensor_callback_rows += 1
+            reason = row.get("deviceHealthReason")
+            if isinstance(reason, str) and reason in DEVICE_HEALTH_REASONS:
+                device_health_reasons[reason] += 1
+            else:
+                row_valid = False
 
-                if callback_ms is not None:
-                    sensor_points[sensor_type]["callback"].append(
-                        Point(callback_ms, line_no, record_seq)
-                    )
-                sensor_timestamp_ns = finite_number(row.get("sensorTimestamp"))
-                if sensor_timestamp_ns is not None:
-                    sensor_points[sensor_type]["sensor"].append(
-                        Point(sensor_timestamp_ns / 1_000_000.0, line_no, record_seq)
-                    )
-                requested = finite_number(row.get("requestedIntervalNs"))
-                if requested is not None and requested > 0:
-                    requested_ns[sensor_type].append(requested)
-            elif record_type == "device_health":
-                device_health_rows += 1
-                row_valid = True
-                if callback_ms is not None:
-                    device_health_points.append(Point(callback_ms, line_no, record_seq))
-                else:
-                    row_valid = False
+            raw_temperature = row.get("batteryTemperatureC")
+            temperature = finite_number(raw_temperature)
+            if raw_temperature is None:
+                unavailable_battery_temperature_rows += 1
+            elif temperature is None:
+                row_valid = False
+            else:
+                device_health_temperature_count += 1
+                if (
+                    device_health_temperature_min is None
+                    or temperature < device_health_temperature_min
+                ):
+                    device_health_temperature_min = temperature
+                if (
+                    device_health_temperature_max is None
+                    or temperature > device_health_temperature_max
+                ):
+                    device_health_temperature_max = temperature
 
-                reason = row.get("deviceHealthReason")
-                if isinstance(reason, str) and reason in DEVICE_HEALTH_REASONS:
-                    device_health_reasons[reason] += 1
-                else:
-                    row_valid = False
+            raw_thermal_level = row.get("thermalLevel")
+            thermal_level = optional_int(raw_thermal_level)
+            if raw_thermal_level is None:
+                unavailable_thermal_level_rows += 1
+            elif thermal_level not in THERMAL_LEVEL_NAMES:
+                row_valid = False
+            else:
+                device_health_thermal_levels[thermal_level] += 1
 
-                raw_temperature = row.get("batteryTemperatureC")
-                temperature = finite_number(raw_temperature)
-                if raw_temperature is None:
-                    unavailable_battery_temperature_rows += 1
-                elif temperature is None:
-                    row_valid = False
-                else:
-                    device_health_temperatures.append(temperature)
+            if not row_valid:
+                invalid_device_health_count += 1
+                remember_line(invalid_device_health_lines, line_no)
+        elif record_type in {"location", "satellite"} and callback_ms is not None:
+            system_accumulators[str(record_type)].add(callback_ms)
 
-                raw_thermal_level = row.get("thermalLevel")
-                thermal_level = optional_int(raw_thermal_level)
-                if raw_thermal_level is None:
-                    unavailable_thermal_level_rows += 1
-                elif thermal_level not in THERMAL_LEVEL_NAMES:
-                    row_valid = False
-                else:
-                    device_health_thermal_levels[thermal_level] += 1
+    sensor_stats = {
+        sensor_type: {
+            clock: accumulator.summarize()
+            for clock, accumulator in clocks.items()
+        }
+        for sensor_type, clocks in sensor_accumulators.items()
+    }
+    system_stats = {
+        record_type: accumulator.summarize()
+        for record_type, accumulator in system_accumulators.items()
+    }
+    device_health_stats = device_health_accumulator.summarize()
 
-                if not row_valid:
-                    invalid_device_health_lines.append(line_no)
-            elif record_type in {"location", "satellite"} and callback_ms is not None:
-                system_points[str(record_type)].append(Point(callback_ms, line_no, record_seq))
-    finally:
-        if should_close:
-            stream.close()
+    sensor_gap_scanners = {
+        sensor_type: {
+            clock: GapScanner(stats.p50_ms, gap_factor, show_gaps)
+            for clock, stats in clocks.items()
+        }
+        for sensor_type, clocks in sensor_stats.items()
+    }
+    system_gap_scanners = {
+        record_type: GapScanner(stats.p50_ms, gap_factor, show_gaps)
+        for record_type, stats in system_stats.items()
+    }
+    device_health_gap_scanner = GapScanner(
+        device_health_stats.p50_ms, gap_factor, show_gaps
+    )
+
+    for clocks in sensor_accumulators.values():
+        for accumulator in clocks.values():
+            accumulator.release_intervals()
+    for accumulator in system_accumulators.values():
+        accumulator.release_intervals()
+    device_health_accumulator.release_intervals()
+
+    snapshot.seek(0)
+    for line_no, raw_line in enumerate(snapshot, start=1):
+        if not raw_line.strip():
+            continue
+        row = parse_json_object(raw_line)
+        if row is None:
+            continue
+        record_seq = optional_int(row.get("recordSeq"))
+        record_type = row.get("recordType")
+        callback_ms = finite_number(row.get("timestampMs"))
+        if record_type == "sensor_callback":
+            callback, _ = parse_sensor_callback(row)
+            if callback is None:
+                continue
+            scanners = sensor_gap_scanners.get(callback.sensor_type)
+            if scanners is None:
+                continue
+            scanners["callback"].add(callback.callback_ms, line_no, record_seq)
+            scanners["sensor"].add(callback.sensor_ms, line_no, record_seq)
+        elif record_type == "device_health" and callback_ms is not None:
+            device_health_gap_scanner.add(callback_ms, line_no, record_seq)
+        elif record_type in system_gap_scanners and callback_ms is not None:
+            system_gap_scanners[str(record_type)].add(
+                callback_ms, line_no, record_seq
+            )
+
+    for sensor_type, clocks in sensor_stats.items():
+        for clock, stats in clocks.items():
+            sensor_gap_scanners[sensor_type][clock].apply(stats)
+    for record_type, stats in system_stats.items():
+        system_gap_scanners[record_type].apply(stats)
+    device_health_gap_scanner.apply(device_health_stats)
 
     print(f"\n=== {source} ===")
     print(
         f"rows={valid_rows}, sensor_callback={sensor_callback_rows}, "
-        f"invalid_json={len(invalid_json_lines)}, "
+        f"invalid_json={invalid_json_count}, "
         f"schemas={dict(sorted(schema_versions.items()))}"
     )
+    if invalid_sensor_callback_count:
+        print(
+            f"valid_sensor_callback={valid_sensor_callback_rows}, "
+            f"invalid_sensor_callback={invalid_sensor_callback_count}"
+        )
     uniform_schema = len(schema_versions) == 1
     schema_version = next(iter(schema_versions), None) if uniform_schema else None
     schema_ok = (
@@ -323,36 +572,44 @@ def diagnose(source: str, gap_factor: float, show_gaps: int) -> bool:
         f"supported_uniform_schema={'yes' if schema_ok else 'no'} "
         f"(supported={sorted(SUPPORTED_SCHEMA_VERSIONS)})"
     )
-    if invalid_json_lines:
+    if invalid_json_count:
         shown = ", ".join(str(line) for line in invalid_json_lines[:10])
-        suffix = " ..." if len(invalid_json_lines) > 10 else ""
+        suffix = " ..." if invalid_json_count > len(invalid_json_lines) else ""
         print(f"invalid JSON lines: {shown}{suffix}")
-    if invalid_record_seq_lines:
+    if invalid_record_seq_count:
         shown = ", ".join(str(line) for line in invalid_record_seq_lines[:10])
-        suffix = " ..." if len(invalid_record_seq_lines) > 10 else ""
+        suffix = " ..." if invalid_record_seq_count > len(invalid_record_seq_lines) else ""
         print(f"missing/invalid recordSeq lines: {shown}{suffix}")
         sequence_integrity_ok = False
+    if invalid_sensor_callback_count:
+        shown = ", ".join(str(line) for line in invalid_sensor_callback_lines)
+        suffix = (
+            " ..."
+            if invalid_sensor_callback_count > len(invalid_sensor_callback_lines)
+            else ""
+        )
+        print(f"invalid sensor_callback lines: {shown}{suffix}")
+        print(
+            "invalid sensor_callback fields: "
+            f"{dict(sorted(invalid_sensor_callback_fields.items()))}"
+        )
 
     if len(session_sequences) != 1:
         print(f"session_count={len(session_sequences)} (expected 1)")
         sequence_integrity_ok = False
 
-    for session_id, entries in session_sequences.items():
-        gaps = 0
-        reverse = 0
-        duplicate = 0
-        for (previous, _), (current, _) in zip(entries, entries[1:]):
-            if current > previous:
-                gaps += max(0, current - previous - 1)
-            elif current < previous:
-                reverse += 1
-            else:
-                duplicate += 1
+    for session_id, sequence in session_sequences.items():
         print(
-            f"recordSeq[{session_id}]: first={entries[0][0]}, last={entries[-1][0]}, "
-            f"missing={gaps}, reverse={reverse}, duplicate={duplicate}"
+            f"recordSeq[{session_id}]: first={sequence.first}, last={sequence.last}, "
+            f"missing={sequence.missing}, reverse={sequence.reverse}, "
+            f"duplicate={sequence.duplicate}"
         )
-        if entries[0][0] != 1 or gaps > 0 or reverse > 0 or duplicate > 0:
+        if (
+            sequence.first != 1
+            or sequence.missing > 0
+            or sequence.reverse > 0
+            or sequence.duplicate > 0
+        ):
             sequence_integrity_ok = False
 
     start_ok = (
@@ -372,7 +629,9 @@ def diagnose(source: str, gap_factor: float, show_gaps: int) -> bool:
 
     sensor_set_ok = True
     if schema_version is not None and schema_version >= 16:
-        unexpected_sensor_types = sorted(set(sensor_points) - SCHEMA16_PLUS_SENSOR_TYPES)
+        unexpected_sensor_types = sorted(
+            observed_sensor_types - SCHEMA16_PLUS_SENSOR_TYPES
+        )
         sensor_set_ok = not unexpected_sensor_types
         print(
             "schema16_plus_sensor_set="
@@ -380,23 +639,25 @@ def diagnose(source: str, gap_factor: float, show_gaps: int) -> bool:
             f"(unexpected={unexpected_sensor_types})"
         )
 
-    if not sensor_points:
-        print("No schema-15/16/17 sensor_callback records found.")
+    if not sensor_stats:
+        print("No valid schema-15/16/17 sensor_callback records found.")
     else:
         print("\nSensor callback cadence:")
-        for sensor_type in sorted(sensor_points):
-            sensor_series = sensor_points[sensor_type]
-            request_ms, request_count = mode_requested_interval_ms(requested_ns[sensor_type])
+        for sensor_type in sorted(sensor_stats):
+            clocks = sensor_stats[sensor_type]
+            request_ms, request_count = mode_requested_interval_ms(
+                requested_modes[sensor_type]
+            )
             request_hz = None if request_ms is None or request_ms <= 0 else 1000.0 / request_ms
             print(
-                f"\n{sensor_type}: records={len(sensor_series['callback'])}, "
+                f"\n{sensor_type}: records={clocks['callback'].point_count}, "
                 f"requested_mode={format_number(request_ms)} ms/"
                 f"{format_number(request_hz)} Hz ({request_count} rows)"
             )
-            if sensor_series["sensor"]:
+            if clocks["sensor"].point_count:
                 print_series(
                     "sensor timestamp",
-                    analyse_series(sensor_series["sensor"], gap_factor),
+                    clocks["sensor"],
                     gap_factor,
                     show_gaps,
                 )
@@ -404,18 +665,18 @@ def diagnose(source: str, gap_factor: float, show_gaps: int) -> bool:
                 print("  sensor timestamp: unavailable")
             print_series(
                 "callback clock",
-                analyse_series(sensor_series["callback"], gap_factor),
+                clocks["callback"],
                 gap_factor,
                 show_gaps,
             )
 
-    if system_points:
+    if system_stats:
         print("\nSystem callback cadence:")
-        for record_type in sorted(system_points):
-            print(f"\n{record_type}: records={len(system_points[record_type])}")
+        for record_type in sorted(system_stats):
+            print(f"\n{record_type}: records={system_stats[record_type].point_count}")
             print_series(
                 "callback clock",
-                analyse_series(system_points[record_type], gap_factor),
+                system_stats[record_type],
                 gap_factor,
                 show_gaps,
             )
@@ -426,25 +687,25 @@ def diagnose(source: str, gap_factor: float, show_gaps: int) -> bool:
             device_health_rows >= 2
             and device_health_reasons["start"] == 1
             and device_health_reasons["stop"] == 1
-            and not invalid_device_health_lines
+            and invalid_device_health_count == 0
         )
         print("\nDevice health:")
         print(
             f"  records={device_health_rows}, reasons={dict(device_health_reasons)}, "
             f"valid={'yes' if device_health_ok else 'no'}"
         )
-        if device_health_points:
+        if device_health_stats.point_count:
             print_series(
                 "sampling clock",
-                analyse_series(device_health_points, gap_factor),
+                device_health_stats,
                 gap_factor,
                 show_gaps,
             )
-        if device_health_temperatures:
+        if device_health_temperature_count:
             print(
                 "  batteryTemperatureC: "
-                f"min={min(device_health_temperatures):.1f}, "
-                f"max={max(device_health_temperatures):.1f}, "
+                f"min={device_health_temperature_min:.1f}, "
+                f"max={device_health_temperature_max:.1f}, "
                 f"unavailable={unavailable_battery_temperature_rows}"
             )
         else:
@@ -465,15 +726,20 @@ def diagnose(source: str, gap_factor: float, show_gaps: int) -> bool:
             print(
                 f"  thermalLevel: unavailable ({unavailable_thermal_level_rows} rows)"
             )
-        if invalid_device_health_lines:
+        if invalid_device_health_count:
             shown = ", ".join(str(line) for line in invalid_device_health_lines[:10])
-            suffix = " ..." if len(invalid_device_health_lines) > 10 else ""
+            suffix = (
+                " ..."
+                if invalid_device_health_count > len(invalid_device_health_lines)
+                else ""
+            )
             print(f"  invalid device_health lines: {shown}{suffix}")
 
     return (
         valid_rows > 0
-        and sensor_callback_rows > 0
-        and not invalid_json_lines
+        and valid_sensor_callback_rows > 0
+        and invalid_sensor_callback_count == 0
+        and invalid_json_count == 0
         and schema_ok
         and sensor_set_ok
         and device_health_ok
@@ -481,6 +747,12 @@ def diagnose(source: str, gap_factor: float, show_gaps: int) -> bool:
         and start_ok
         and terminal_ok
     )
+
+
+def diagnose(source: str, gap_factor: float, show_gaps: int) -> bool:
+    with tempfile.TemporaryFile(mode="w+b") as snapshot:
+        copy_source_to_snapshot(source, snapshot)
+        return _diagnose_snapshot(snapshot, source, gap_factor, show_gaps)
 
 
 def main() -> int:

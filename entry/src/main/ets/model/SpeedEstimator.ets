@@ -309,14 +309,14 @@ export class SpeedEstimator {
 
     const gyroMagnitude = frame.gyroscope ? magnitude(frame.gyroscope) : 0;
     this.updateMainAxisLock(frame.timestampMs);
-    const axisAllowed = this.shouldUpdateMainAxis(filtered, gyroMagnitude);
-    if (axisAllowed) {
-      this.updateMainAxis(filtered, dt);
-    }
 
-    const forwardAcceleration = dot(filtered, this.mainAxis);
-    const lateralVector = subtract(filtered, scale(this.mainAxis, forwardAcceleration));
-    const lateralAcceleration = magnitude(lateralVector);
+    // Classify the current sample before allowing it to teach the vehicle axis.
+    // The vibration evidence (acceleration step, gyro and gravity deviation) is
+    // axis-independent, while the provisional projection lets the existing curve
+    // and low-confidence guards apply to this sample instead of one frame late.
+    let forwardAcceleration = dot(filtered, this.mainAxis);
+    let lateralVector = subtract(filtered, scale(this.mainAxis, forwardAcceleration));
+    let lateralAcceleration = magnitude(lateralVector);
     this.pushWindowFrame(
       forwardAcceleration,
       lateralAcceleration,
@@ -326,6 +326,16 @@ export class SpeedEstimator {
       timing.elapsedSeconds,
       timing.continuous
     );
+
+    const axisCandidateState = this.detectMotionState(forwardAcceleration, gyroMagnitude, frame.timestampMs);
+    const axisAllowed = this.shouldUpdateMainAxis(filtered, gyroMagnitude, axisCandidateState);
+    if (axisAllowed) {
+      this.updateMainAxis(filtered, dt);
+      forwardAcceleration = dot(filtered, this.mainAxis);
+      lateralVector = subtract(filtered, scale(this.mainAxis, forwardAcceleration));
+      lateralAcceleration = magnitude(lateralVector);
+      this.replaceLatestWindowProjection(forwardAcceleration, lateralAcceleration);
+    }
 
     const state = this.detectMotionState(forwardAcceleration, gyroMagnitude, frame.timestampMs);
     const effectiveAcceleration = this.effectiveForwardAcceleration(forwardAcceleration, state);
@@ -609,13 +619,16 @@ export class SpeedEstimator {
     }
   }
 
-  private shouldUpdateMainAxis(filtered: Vector3, gyroMagnitude: number): boolean {
+  private shouldUpdateMainAxis(filtered: Vector3, gyroMagnitude: number, candidateState: MotionState): boolean {
     const accelerationMagnitude = magnitude(filtered);
+    if (candidateState === MotionState.Curve ||
+      candidateState === MotionState.LowConfidence ||
+      candidateState === MotionState.StrongVibration ||
+      candidateState === MotionState.ConductionVibration) {
+      return false;
+    }
     if (!this.mainAxisInitialized) {
       return accelerationMagnitude > 0.18 && gyroMagnitude < 0.18;
-    }
-    if (this.motionState === MotionState.Curve || this.motionState === MotionState.LowConfidence) {
-      return false;
     }
 
     const lateralAverage = averageLateral(this.windowFrames);
@@ -726,6 +739,15 @@ export class SpeedEstimator {
     ) {
       this.windowFrames.shift();
     }
+  }
+
+  private replaceLatestWindowProjection(forward: number, lateral: number): void {
+    if (this.windowFrames.length < 1) {
+      return;
+    }
+    const latest = this.windowFrames[this.windowFrames.length - 1];
+    latest.forward = forward;
+    latest.lateral = lateral;
   }
 
   private detectMotionState(forward: number, gyroMagnitude: number, timestampMs: number): MotionState {

@@ -41,11 +41,9 @@ function atomicWrite(path: string, text: string, expectedText: string): void {
 function acquireVersionLock(): { fd: number; token: string } {
     const token = `pid=${process.pid} time=${Date.now()}\n`;
     for (let attempt = 0; attempt < 2; attempt++) {
+        let fd: number;
         try {
-            const fd = fs.openSync(lockPath, 'wx');
-            fs.writeFileSync(fd, token, 'ascii');
-            fs.fsyncSync(fd);
-            return { fd, token };
+            fd = fs.openSync(lockPath, 'wx');
         } catch (error) {
             const errorCode = (error as { code?: string }).code;
             if (errorCode !== 'EEXIST') {
@@ -64,6 +62,32 @@ function acquireVersionLock(): { fd: number; token: string } {
                 throw staleError;
             }
             throw new Error(`Another build/version sync is running: ${lockPath}`);
+        }
+
+        try {
+            fs.writeFileSync(fd, token, 'ascii');
+            fs.fsyncSync(fd);
+            return { fd, token };
+        } catch (error) {
+            const cleanupErrors: string[] = [];
+            try {
+                fs.closeSync(fd);
+            } catch (closeError) {
+                cleanupErrors.push(`close: ${String(closeError)}`);
+            }
+            try {
+                fs.unlinkSync(lockPath);
+            } catch (unlinkError) {
+                if ((unlinkError as { code?: string }).code !== 'ENOENT') {
+                    cleanupErrors.push(`unlink: ${String(unlinkError)}`);
+                }
+            }
+            if (cleanupErrors.length > 0) {
+                throw new Error(
+                    `Failed to initialize version lock: ${String(error)}; cleanup incomplete: ${cleanupErrors.join('; ')}`
+                );
+            }
+            throw error;
         }
     }
     throw new Error(`Could not acquire version lock: ${lockPath}`);
@@ -149,7 +173,15 @@ function updateBuildVersion(): void {
     }
 }
 
-updateBuildVersion();
+function shouldUpdateBuildVersion(argv: string[]): boolean {
+    return argv.some((argument: string) =>
+        /(^|:)(assembleHap|assembleApp)(?:$|@)/i.test(argument)
+    );
+}
+
+if (shouldUpdateBuildVersion(process.argv.slice(2))) {
+    updateBuildVersion();
+}
 
 export default {
     system: appTasks

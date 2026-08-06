@@ -43,6 +43,15 @@ def usage_error(message: str) -> None:
     raise SystemExit(2)
 
 
+def concise_subprocess_error(stderr: str, limit: int = 240) -> str:
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    if not lines:
+        return "unknown replay failure"
+    error_lines = [line for line in lines if "error:" in line.casefold()]
+    selected = error_lines[-1] if error_lines else lines[-1]
+    return selected[-limit:]
+
+
 if DATA_DIR is None:
     usage_error("请用 --dir <目录> 或设置环境变量 METROSPEED_DATA_DIR")
 if not DATA_DIR.exists():
@@ -96,13 +105,20 @@ success_count = 0
 failure_count = 0
 gnss_comparison_count = 0
 incomplete_count = 0
+unknown_integrity_count = 0
 for fname in FILES:
     path = DATA_DIR / fname
     if not path.exists():
         print(f"SKIP {fname}: file not found")
         failure_count += 1
         continue
-    cmd = [sys.executable, str(REPLAY), str(path)]
+    cmd = [
+        sys.executable,
+        str(REPLAY),
+        str(path),
+        "--skip-lag-scans",
+        "--skip-bucketed-comparison",
+    ]
     if ANCHOR_V2:
         cmd.append("--anchor-v2")
     if PURE_ZERO:
@@ -114,7 +130,7 @@ for fname in FILES:
         capture_output=True, text=True, cwd=str(TOOLS_DIR.parent),
     )
     if result.returncode != 0:
-        print(f"ERROR {fname}: {result.stderr.strip()[:120]}")
+        print(f"ERROR {fname}: {concise_subprocess_error(result.stderr)}")
         failure_count += 1
         continue
     try:
@@ -132,8 +148,9 @@ for fname in FILES:
         failure_count += 1
         continue
     integrity = d.get("inputIntegrity")
-    input_complete = isinstance(integrity, dict) and integrity.get("complete") is True
-    if not input_complete:
+    integrity_value = integrity.get("complete") if isinstance(integrity, dict) else None
+    input_complete = integrity_value is True
+    if integrity_value is False:
         incomplete_count += 1
         if isinstance(integrity, dict):
             ignored_tail = integrity.get("ignoredTail", {})
@@ -146,6 +163,10 @@ for fname in FILES:
             )
         else:
             print(f"INCOMPLETE {fname}: replay did not report input integrity")
+    elif integrity_value is not True:
+        unknown_integrity_count += 1
+        status = integrity.get("status", "unknown") if isinstance(integrity, dict) else "missing"
+        print(f"UNKNOWN {fname}: input integrity status={status}")
     if ANCHOR_V2:
         comp = d.get("anchoredComparison", {})
         moving = comp.get("moving", {})
@@ -186,7 +207,7 @@ for fname in FILES:
         f"all_count={all_comp.get('count', 0)} "
         f"pairs={pairs} "
         f"samples={samples} "
-        f"input_complete={str(input_complete).lower()} "
+        f"input_complete={'true' if input_complete else ('false' if integrity_value is False else 'unknown')} "
         f"max_kmh={max_kmh:.0f} "
         f"median_kmh={median_kmh:.0f} "
         f"file={fname}"
@@ -194,7 +215,8 @@ for fname in FILES:
 
 print(
     f"summary: success={success_count} failed_or_missing={failure_count} "
-    f"with_gnss_comparison={gnss_comparison_count} incomplete={incomplete_count}"
+    f"with_gnss_comparison={gnss_comparison_count} incomplete={incomplete_count} "
+    f"unknown_integrity={unknown_integrity_count}"
 )
 if success_count == 0 or failure_count > 0:
     raise SystemExit(1)

@@ -11,6 +11,7 @@ try:
         PARKING_WINDOW_SECONDS,
         PRE_CAL_BUFFER_SECONDS,
         REFERENCE_DT_SECONDS,
+        MotionState,
         PreCalFrame,
         SensorFrame,
         SpeedEstimator,
@@ -26,6 +27,7 @@ except ImportError:
         PARKING_WINDOW_SECONDS,
         PRE_CAL_BUFFER_SECONDS,
         REFERENCE_DT_SECONDS,
+        MotionState,
         PreCalFrame,
         SensorFrame,
         SpeedEstimator,
@@ -590,6 +592,58 @@ class RateIndependentEstimatorTests(unittest.TestCase):
             estimator_100.distance_m,
             delta=0.002,
         )
+
+    def test_conduction_spikes_cannot_claim_axis_before_real_departure(self) -> None:
+        estimator = SpeedEstimator()
+        estimator.start(0)
+
+        for timestamp_ms in range(0, 1500 + 10, 10):
+            estimator.ingest(
+                SensorFrame(
+                    timestamp_ms=timestamp_ms,
+                    sensor_timestamp=float(timestamp_ms) * 1_000_000.0,
+                    acceleration=(0.0, 0.0, GRAVITY),
+                    gyroscope=(0.0, 0.0, 0.0),
+                    gyroscope_timestamp=None,
+                )
+            )
+
+        spike_states = []
+        for timestamp_ms, spike_x in ((1510, 1.6), (1520, -1.6)):
+            output = estimator.ingest(
+                SensorFrame(
+                    timestamp_ms=timestamp_ms,
+                    sensor_timestamp=float(timestamp_ms) * 1_000_000.0,
+                    acceleration=(spike_x, 0.0, GRAVITY),
+                    gyroscope=(0.0, 0.0, 0.0),
+                    gyroscope_timestamp=None,
+                )
+            )
+            spike_states.append(output.motion_state)
+
+        self.assertEqual(
+            spike_states,
+            [MotionState.CONDUCTION_VIBRATION, MotionState.CONDUCTION_VIBRATION],
+        )
+        self.assertFalse(estimator.main_axis_initialized)
+
+        final_output = None
+        for timestamp_ms in range(1530, 6530, 10):
+            final_output = estimator.ingest(
+                SensorFrame(
+                    timestamp_ms=timestamp_ms,
+                    sensor_timestamp=float(timestamp_ms) * 1_000_000.0,
+                    acceleration=(0.0, 0.6, GRAVITY),
+                    gyroscope=(0.0, 0.0, 0.0),
+                    gyroscope_timestamp=None,
+                )
+            )
+
+        self.assertIsNotNone(final_output)
+        assert final_output is not None
+        self.assertTrue(estimator.main_axis_initialized)
+        self.assertGreater(abs(estimator.main_axis[1]), 0.98)
+        self.assertAlmostEqual(final_output.speed_kmh, 10.0, delta=0.75)
 
     def test_parking_calibration_resets_stationary_drift_at_both_rates(self) -> None:
         estimator_50, result_50 = run_parking_calibration(50, False)

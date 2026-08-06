@@ -2,7 +2,9 @@ import fs from '@ohos.file.fs';
 import picker from '@ohos.file.picker';
 import common from '@ohos.app.ability.common';
 import util from '@ohos.util';
-import { batteryInfo, thermal } from '@kit.BasicServicesKit';
+import { BusinessError } from '@ohos.base';
+import { batteryInfo, deviceInfo, thermal } from '@kit.BasicServicesKit';
+import { fileManagerService } from '@kit.FileManagerServiceKit';
 import { LocationSnapshot, SatelliteSnapshot } from './LocationController';
 import {
   CalibrationState,
@@ -16,8 +18,8 @@ import {
 const ESTIMATOR_RECORD_INTERVAL_MS = 500;
 const DEVICE_HEALTH_RECORD_INTERVAL_MS = 10000;
 const RECORD_SCHEMA_VERSION = 17;
-const APP_VERSION_CODE = 1785660666;
-const ALGORITHM_VERSION = 'anchor-delta-20260801-r4';
+const APP_VERSION_CODE = 1786008552;
+const ALGORITHM_VERSION = 'anchor-delta-20260804-r5';
 const LEGACY_TEMP_LOG_FILE_NAME = 'research-current.jsonl';
 const SESSION_LOG_PREFIX = 'research-session-';
 const SESSION_LOG_SUFFIX = '.jsonl';
@@ -37,6 +39,16 @@ export interface ResearchRecorderStatus {
   lastEvent: string;
   lastExportPath: string;
 }
+
+export type ResearchExportPhase = 'choosing' | 'copying' | 'syncing' | 'completed' | 'failed';
+
+export interface ResearchExportProgress {
+  phase: ResearchExportPhase;
+  copiedBytes: number;
+  totalBytes: number;
+}
+
+export type ResearchExportProgressCallback = (progress: ResearchExportProgress) => void;
 
 interface ResearchRecord {
   timestampMs: number;
@@ -425,7 +437,10 @@ export class ResearchRecorder {
     return this.status();
   }
 
-  async exportJsonl(context: common.UIAbilityContext): Promise<ResearchRecorderStatus> {
+  async exportJsonl(
+    context: common.UIAbilityContext,
+    onProgress?: ResearchExportProgressCallback
+  ): Promise<ResearchRecorderStatus> {
     if (this.exportInProgress) {
       this.lastExportPath = '导出正在进行';
       return this.status();
@@ -453,14 +468,36 @@ export class ResearchRecorder {
     const sourceSessionId = this.sessionId;
     const sourceIncomplete = this.writeFailed;
     const completenessSuffix = sourceIncomplete ? '-INCOMPLETE' : '';
-    const fileName = `${sourceSessionId || `session-${Date.now()}`}${completenessSuffix}.jsonl`;
+    const exportAttemptMs = Date.now();
+    const fileName = `${sourceSessionId || `session-${exportAttemptMs}`}${completenessSuffix}` +
+      `-export-${exportAttemptMs}.jsonl`;
     this.exportInProgress = true;
     let targetUri = '';
+    let copiedBytes = 0;
+    let totalBytes = 0;
+    const copyProgress = (progress: ResearchExportProgress): void => {
+      copiedBytes = progress.copiedBytes;
+      totalBytes = progress.totalBytes;
+      this.emitExportProgress(onProgress, progress);
+    };
     try {
-      const documentPicker = new picker.DocumentViewPicker(context);
-      const uris = await documentPicker.save({
-        newFileNames: [fileName]
+      this.emitExportProgress(onProgress, {
+        phase: 'choosing',
+        copiedBytes: 0,
+        totalBytes: 0
       });
+      const documentPicker = new picker.DocumentViewPicker(context);
+      const saveOptions: picker.DocumentSaveOptions = {
+        newFileNames: [fileName]
+      };
+      if (deviceInfo.sdkApiVersion >= 23) {
+        // API 23+ grants temporary create/delete access without pre-creating a
+        // zero-byte target. A picker URI cannot be atomically renamed through
+        // the sandbox-only fs.rename API, so an abrupt process/device stop can
+        // still leave an incomplete target after creation has begun.
+        saveOptions.autoCreateEmptyFile = false;
+      }
+      const uris = await documentPicker.save(saveOptions);
       if (uris.length < 1) {
         this.lastExportPath = '已取消导出';
         return this.status();
@@ -468,21 +505,36 @@ export class ResearchRecorder {
       targetUri = uris[0];
 
       if (this.running || this.tempLogPath !== sourcePath) {
-        this.cleanupFailedExportTarget(targetUri, sourcePath);
-        this.lastExportPath = '记录状态已变化，请重试导出';
+        const targetRemoved = await this.cleanupFailedExportTarget(targetUri, sourcePath);
+        this.lastExportPath = this.failedExportMessage('记录状态已变化，请重试导出', targetRemoved);
+        this.emitExportProgress(onProgress, {
+          phase: 'failed',
+          copiedBytes,
+          totalBytes
+        });
         return this.status();
       }
       this.flushTempLogFile();
       this.refreshExportableLogState();
       if (!this.hasExportableLog) {
-        this.cleanupFailedExportTarget(targetUri, sourcePath);
-        this.lastExportPath = 'no exportable log';
+        const targetRemoved = await this.cleanupFailedExportTarget(targetUri, sourcePath);
+        this.lastExportPath = this.failedExportMessage('没有可导出的记录', targetRemoved);
+        this.emitExportProgress(onProgress, {
+          phase: 'failed',
+          copiedBytes,
+          totalBytes
+        });
         return this.status();
       }
 
-      if (!await this.copyTempLogToUri(targetUri, sourcePath)) {
-        this.cleanupFailedExportTarget(targetUri, sourcePath);
-        this.lastExportPath = '导出复制失败';
+      if (!await this.copyTempLogToUri(targetUri, sourcePath, copyProgress)) {
+        const targetRemoved = await this.cleanupFailedExportTarget(targetUri, sourcePath);
+        this.lastExportPath = this.failedExportMessage('导出复制失败', targetRemoved);
+        this.emitExportProgress(onProgress, {
+          phase: 'failed',
+          copiedBytes,
+          totalBytes
+        });
         return this.status();
       }
       // Export is a copy operation. Keep the latest source log (and its
@@ -490,13 +542,24 @@ export class ResearchRecorder {
       // recording remains the only operation that overwrites the local log.
       this.refreshExportableLogState();
       this.lastExportPath = sourceIncomplete
-        ? `已导出：${fileName}（日志不完整，本地记录已保留）`
-        : `已导出：${fileName}（本地记录已保留）`;
+        ? `已导出：${fileName}（日志不完整，仍可再次导出）`
+        : `已导出：${fileName}（仍可再次导出）`;
+      this.emitExportProgress(onProgress, {
+        phase: 'completed',
+        copiedBytes,
+        totalBytes
+      });
     } catch (error) {
+      let targetRemoved = true;
       if (targetUri.length > 0) {
-        this.cleanupFailedExportTarget(targetUri, sourcePath);
+        targetRemoved = await this.cleanupFailedExportTarget(targetUri, sourcePath);
       }
-      this.lastExportPath = '导出失败，请重试';
+      this.lastExportPath = this.failedExportMessage('导出失败，请重试', targetRemoved);
+      this.emitExportProgress(onProgress, {
+        phase: 'failed',
+        copiedBytes,
+        totalBytes
+      });
     } finally {
       this.exportInProgress = false;
     }
@@ -1087,18 +1150,45 @@ export class ResearchRecorder {
     }
   }
 
-  private async copyTempLogToUri(uri: string, sourcePath: string): Promise<boolean> {
+  private emitExportProgress(
+    onProgress: ResearchExportProgressCallback | undefined,
+    progress: ResearchExportProgress
+  ): void {
+    if (!onProgress) {
+      return;
+    }
+    try {
+      onProgress(progress);
+    } catch (error) {
+      // Export observers must not interrupt or invalidate the file copy.
+    }
+  }
+
+  private async copyTempLogToUri(
+    uri: string,
+    sourcePath: string,
+    onProgress: ResearchExportProgressCallback
+  ): Promise<boolean> {
     let sourceFile: fs.File | undefined = undefined;
     let targetFile: fs.File | undefined = undefined;
     let copySucceeded = false;
     try {
       const expectedBytes = (await fs.stat(sourcePath)).size;
       sourceFile = await fs.open(sourcePath, fs.OpenMode.READ_ONLY);
-      targetFile = await fs.open(uri, fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+      targetFile = await fs.open(
+        uri,
+        fs.OpenMode.WRITE_ONLY | fs.OpenMode.CREATE | fs.OpenMode.TRUNC
+      );
       const buffer = new ArrayBuffer(EXPORT_COPY_BUFFER_BYTES);
       let copiedBytes = 0;
       let chunksSinceYield = 0;
+      let lastReportedBytes = 0;
       let shortWrite = false;
+      onProgress({
+        phase: 'copying',
+        copiedBytes: 0,
+        totalBytes: expectedBytes
+      });
       while (true) {
         const bytesRead = await fs.read(sourceFile.fd, buffer);
         if (bytesRead <= 0) {
@@ -1122,10 +1212,28 @@ export class ResearchRecorder {
         chunksSinceYield += 1;
         if (chunksSinceYield >= EXPORT_YIELD_EVERY_CHUNKS) {
           chunksSinceYield = 0;
+          lastReportedBytes = copiedBytes;
+          onProgress({
+            phase: 'copying',
+            copiedBytes,
+            totalBytes: expectedBytes
+          });
           await this.yieldExportLoop();
         }
       }
       if (!shortWrite) {
+        if (copiedBytes !== lastReportedBytes) {
+          onProgress({
+            phase: 'copying',
+            copiedBytes,
+            totalBytes: expectedBytes
+          });
+        }
+        onProgress({
+          phase: 'syncing',
+          copiedBytes,
+          totalBytes: expectedBytes
+        });
         await fs.fsync(targetFile.fd);
         copySucceeded = copiedBytes === expectedBytes;
       }
@@ -1157,33 +1265,27 @@ export class ResearchRecorder {
     });
   }
 
-  private cleanupFailedExportTarget(uri: string, sourcePath: string): void {
+  private failedExportMessage(message: string, targetRemoved: boolean): string {
+    return targetRemoved ? message : `${message}；保存位置可能残留未完成文件，请手动删除`;
+  }
+
+  private async cleanupFailedExportTarget(uri: string, sourcePath: string): Promise<boolean> {
     if (uri.length < 1 || uri === sourcePath) {
-      return;
+      return false;
     }
-    let targetFile: fs.File | undefined = undefined;
-    let truncated = false;
     try {
-      targetFile = fs.openSync(uri, fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
-      fs.fsyncSync(targetFile.fd);
-      truncated = true;
+      await fileManagerService.deleteToTrash(uri);
+      return true;
     } catch (error) {
-    } finally {
-      if (targetFile) {
-        try {
-          fs.closeSync(targetFile);
-        } catch (error) {
-          truncated = false;
-        }
+      const deleteError = error as BusinessError;
+      if (deleteError.code === 1014000002) {
+        return true;
       }
     }
-    if (truncated) {
-      return;
-    }
-    try {
-      fs.unlinkSync(uri);
-    } catch (error) {
-    }
+    // Public picker URIs are outside the application sandbox, so fs.unlink is
+    // not a supported fallback. Permission and I/O failures must remain visible
+    // to the user as a possible residual target instead of being hidden.
+    return false;
   }
 
   private closeTempLogFile(): void {

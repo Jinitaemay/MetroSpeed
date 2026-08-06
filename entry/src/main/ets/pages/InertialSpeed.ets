@@ -1,9 +1,14 @@
 import abilityAccessCtrl from '@ohos.abilityAccessCtrl';
 import common from '@ohos.app.ability.common';
 import { SpeedEstimator } from '../model/SpeedEstimator';
-import { SensorController } from '../model/SensorController';
+import { CoreSensorFatalError, SensorController } from '../model/SensorController';
 import { LocationController, LocationSnapshot, SatelliteSnapshot } from '../model/LocationController';
-import { ResearchRecorder, ResearchRecorderStatus } from '../model/ResearchRecorder';
+import {
+  ResearchExportPhase,
+  ResearchExportProgress,
+  ResearchRecorder,
+  ResearchRecorderStatus
+} from '../model/ResearchRecorder';
 import { BackgroundState } from '../model/BackgroundState';
 import { emitter } from '@kit.BasicServicesKit';
 import {
@@ -75,8 +80,15 @@ struct InertialSpeed {
   @State private gnssSpeedKmh: number = 0;
   @State private showPlacementWarning: boolean = false;
   @State private speedStatsHeight: number = 0;
+  @State private researchPanelHeight: number = 0;
   @State private researchExportInProgress: boolean = false;
+  @State private researchExportPhase: ResearchExportPhase = 'choosing';
+  @State private researchExportCopiedBytes: number = 0;
+  @State private researchExportTotalBytes: number = 0;
+  @State private researchExportPercent: number = 0;
   @State private navigationInProgress: boolean = false;
+  private researchExportLastUiUpdateMs: number = 0;
+  private readonly RESEARCH_EXPORT_UI_MIN_INTERVAL_MS: number = 250;
   private backgroundSensorsPaused: boolean = false;
   private backgroundHandlerRegistered: boolean = false;
   private measurementOperationId: number = 0;
@@ -185,6 +197,14 @@ struct InertialSpeed {
     }
   }
 
+  onBackPress(): boolean {
+    if (!this.researchExportInProgress) {
+      return false;
+    }
+    this.locationStatus = '正在导出，请等待完成后返回';
+    return true;
+  }
+
   aboutToDisappear(): void {
     this.measurementOperationId += 1;
     this.measurementStartPending = false;
@@ -257,6 +277,8 @@ struct InertialSpeed {
       this.sensorStatus = message;
     }, (sample: SensorCallbackSample) => {
       this.researchRecorder.recordSensorCallback(sample);
+    }, true, (error: CoreSensorFatalError) => {
+      this.handleMeasurementCoreSensorFatal(error, operationId);
     });
     if (!sensorsStarted) {
       const measurementSensorError = this.sensorStatus;
@@ -381,6 +403,43 @@ struct InertialSpeed {
     }
   }
 
+  private handleMeasurementCoreSensorFatal(error: CoreSensorFatalError, operationId: number): void {
+    // Sensor callbacks may originate inside the platform callback stack. Defer
+    // page teardown so sensor.off is never re-entered from sensor.on callbacks.
+    setTimeout(() => {
+      if (operationId !== this.measurementOperationId || !this.isRunning) {
+        return;
+      }
+      const reason = `core_sensor_failure sensor=${error.sensor} phase=${error.phase}`;
+      this.stopMeasurement(reason);
+      const recordingContinues = this.researchStatus.running;
+      this.sensorStatus = `测速已中止：${error.message}` +
+        (recordingContinues ? '；研究记录继续' : '，请重新开始');
+    }, 0);
+  }
+
+  private handleResearchCoreSensorFatal(error: CoreSensorFatalError, operationId: number): void {
+    setTimeout(() => {
+      if (operationId !== this.researchOperationId || this.isRunning || !this.researchStatus.running) {
+        return;
+      }
+      this.researchOperationId += 1;
+      const now = Date.now();
+      this.researchStatus = this.researchRecorder.markSystemEvent(
+        now,
+        '研究记录传感器中断',
+        `sensor=${error.sensor} phase=${error.phase} message=${error.message}`
+      );
+      this.sensorController.stop();
+      this.researchSensorActive = false;
+      this.researchStatus = this.researchRecorder.stop(now);
+      BackgroundState.recordingActive = false;
+      this.notifyCollectionStateChanged();
+      this.stopLocationIfUnused();
+      this.sensorStatus = `研究记录已停止：${error.message}，请重新开始`;
+    }, 0);
+  }
+
   private toggleMeasurement(): void {
     if (this.measurementStartPending) {
       return;
@@ -419,7 +478,7 @@ struct InertialSpeed {
     this.researchRecorder.recordSensorFrame(frame);
 
     if (this.isInitialCalibrationRejected(nextFrame.stats)) {
-      this.abortStartCalibration();
+      this.abortStartCalibration(nextFrame);
       return;
     }
 
@@ -627,14 +686,25 @@ struct InertialSpeed {
     return stats.calibrationCount === 1 && stats.calibrationRejected;
   }
 
-  private abortStartCalibration(): void {
+  private abortStartCalibration(rejectedFrame: EstimatorFrame): void {
+    const rejectionStats = rejectedFrame.stats;
+    const rejectionNotes = `reason=initial_calibration_unstable ` +
+      `calibrationRejected=${rejectionStats.calibrationRejected} ` +
+      `status=${rejectionStats.statusText} ` +
+      `confidence=${rejectionStats.confidence.toFixed(2)} ` +
+      `state=${motionStateText(rejectionStats.motionState)}`;
+    this.researchRecorder.updateEstimator(
+      rejectedFrame.sample,
+      rejectionStats,
+      rejectedFrame.calibration
+    );
     this.measurementOperationId += 1;
     BackgroundState.measurementActive = false;
     this.notifyCollectionStateChanged();
     const now = Date.now();
     this.sensorController.stop();
     this.researchSensorActive = false;
-    const resetStats = this.estimator.reset(now);
+    this.estimator.reset(now);
     this.stats = {
       currentSpeedKmh: 0,
       maxSpeedKmh: 0,
@@ -654,7 +724,7 @@ struct InertialSpeed {
     this.gnssSpeedKmh = 0;
     this.showPlacementWarning = false;
     this.sensorStatus = '开始失败：初始校准不稳';
-    this.researchStatus = this.researchRecorder.cancelMeasurement(now, resetStats.statusText);
+    this.researchStatus = this.researchRecorder.cancelMeasurement(now, rejectionNotes);
     this.syncResearchRuntimeState();
     this.stopLocationIfUnused();
     if (this.researchStatus.running) {
@@ -765,13 +835,16 @@ struct InertialSpeed {
 
     this.researchRecorder.clearEstimatorSnapshot();
     this.sensorStatus = '正在启动研究记录传感器';
+    const sensorOperationId = this.researchOperationId;
     const started = this.sensorController.start((frame: SensorFrame) => {
       this.onResearchSensorFrame(frame);
     }, (message: string) => {
       this.sensorStatus = message;
     }, (sample: SensorCallbackSample) => {
       this.researchRecorder.recordSensorCallback(sample);
-    }, false);
+    }, false, (error: CoreSensorFatalError) => {
+      this.handleResearchCoreSensorFatal(error, sensorOperationId);
+    });
     if (started) {
       this.sensorController.startAuxiliarySensors();
       if (!this.sensorController.isGyroscopeAvailable) {
@@ -941,16 +1014,99 @@ struct InertialSpeed {
       return;
     }
 
-    this.researchExportInProgress = true;
+    this.setResearchExportActive(true);
+    this.researchExportPhase = 'choosing';
+    this.researchExportCopiedBytes = 0;
+    this.researchExportTotalBytes = 0;
+    this.researchExportPercent = 0;
+    this.researchExportLastUiUpdateMs = 0;
     try {
       this.locationStatus = '请选择导出位置';
-      this.researchStatus = await this.researchRecorder.exportJsonl(context);
+      this.researchStatus = await this.researchRecorder.exportJsonl(
+        context,
+        (progress: ResearchExportProgress): void => {
+          this.applyResearchExportProgress(progress);
+        }
+      );
       this.locationStatus = this.researchStatus.lastExportPath || '导出完成';
     } catch (error) {
       this.locationStatus = '导出失败';
     } finally {
-      this.researchExportInProgress = false;
+      this.setResearchExportActive(false);
     }
+  }
+
+  private setResearchExportActive(active: boolean): void {
+    this.researchExportInProgress = active;
+    BackgroundState.exportActive = active;
+    this.notifyCollectionStateChanged();
+  }
+
+  private applyResearchExportProgress(progress: ResearchExportProgress): void {
+    const nextPercent = progress.totalBytes > 0
+      ? Math.min(100, Math.floor(progress.copiedBytes * 100 / progress.totalBytes))
+      : 0;
+    const now = Date.now();
+    const phaseChanged = progress.phase !== this.researchExportPhase;
+    const percentChanged = nextPercent !== this.researchExportPercent;
+    const totalBytesChanged = progress.totalBytes !== this.researchExportTotalBytes;
+    const copiedBytesChanged = progress.copiedBytes !== this.researchExportCopiedBytes;
+    const samePercentByteRefreshDue = progress.phase === 'copying' && copiedBytesChanged &&
+      now - this.researchExportLastUiUpdateMs >= this.RESEARCH_EXPORT_UI_MIN_INTERVAL_MS;
+    const copyCompleted = progress.totalBytes > 0 && progress.copiedBytes === progress.totalBytes;
+    if (!phaseChanged && !percentChanged && !totalBytesChanged &&
+      !samePercentByteRefreshDue && !copyCompleted) {
+      return;
+    }
+    this.researchExportPhase = progress.phase;
+    this.researchExportCopiedBytes = progress.copiedBytes;
+    this.researchExportTotalBytes = progress.totalBytes;
+    this.researchExportPercent = nextPercent;
+    this.researchExportLastUiUpdateMs = now;
+    if (progress.phase === 'choosing') {
+      this.locationStatus = '请选择导出位置';
+    } else if (progress.phase === 'copying') {
+      this.locationStatus = `正在导出 ${nextPercent}%`;
+    } else if (progress.phase === 'syncing') {
+      this.locationStatus = '正在完成写入';
+    }
+  }
+
+  private exportOverlayTitle(): string {
+    if (this.researchExportPhase === 'choosing') {
+      return '请选择保存位置';
+    }
+    if (this.researchExportPhase === 'copying') {
+      return `正在导出 ${this.researchExportPercent}%`;
+    }
+    if (this.researchExportPhase === 'syncing') {
+      return '正在完成写入';
+    }
+    if (this.researchExportPhase === 'completed') {
+      return '导出完成';
+    }
+    return '导出失败';
+  }
+
+  private formatExportBytes(bytes: number): string {
+    if (bytes >= 1024 * 1024) {
+      const megabytes = bytes / (1024 * 1024);
+      return `${megabytes >= 100 ? megabytes.toFixed(0) : megabytes.toFixed(1)} MB`;
+    }
+    if (bytes >= 1024) {
+      return `${Math.round(bytes / 1024)} KB`;
+    }
+    return `${bytes} B`;
+  }
+
+  private exportProgressAccessibilityText(): string {
+    if (this.researchExportPhase === 'copying') {
+      return `正在导出，${this.researchExportPercent}%，请保持应用在前台，完成后仍可再次导出`;
+    }
+    if (this.researchExportPhase === 'syncing') {
+      return '正在完成写入，请保持应用在前台，完成后仍可再次导出';
+    }
+    return `${this.exportOverlayTitle()}，请保持应用在前台，完成后仍可再次导出`;
   }
 
   private hasResearchLog(): boolean {
@@ -958,15 +1114,24 @@ struct InertialSpeed {
   }
 
   private returnToModeSelection(): void {
+    if (this.researchExportInProgress) {
+      this.locationStatus = '正在导出，请等待完成后返回';
+      return;
+    }
+    if (this.navigationInProgress) {
+      return;
+    }
+    this.navigationInProgress = true;
     try {
       this.getUIContext().getRouter().back();
     } catch {
+      this.navigationInProgress = false;
       this.locationStatus = '无法返回测速方式首页';
     }
   }
 
   private switchToTunnelLightSpeed(): void {
-    if (this.navigationInProgress) {
+    if (this.navigationInProgress || this.researchExportInProgress) {
       return;
     }
     this.navigationInProgress = true;
@@ -1011,14 +1176,16 @@ struct InertialSpeed {
   @Builder
   private Header() {
     Row() {
-      Button('‹', { type: ButtonType.Normal, stateEffect: true })
+      Button('‹', { type: ButtonType.Normal, stateEffect: !this.researchExportInProgress })
         .width(44)
         .height(40)
         .fontSize(28)
         .fontColor('#F8FAFC')
         .backgroundColor('#1E293B')
         .borderRadius(8)
-        .accessibilityText('返回测速方式首页')
+        .focusable(!this.researchExportInProgress)
+        .hitTestBehavior(this.researchExportInProgress ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.Default)
+        .accessibilityText(this.researchExportInProgress ? '正在导出，暂时无法返回' : '返回测速方式首页')
         .margin({ right: 12 })
         .onClick(() => {
           this.returnToModeSelection();
@@ -1294,11 +1461,18 @@ struct InertialSpeed {
 
       Toggle({ type: ToggleType.Switch, isOn: this.tunnelSwitchOn })
         .selectedColor('#F59E0B')
-        .accessibilityText(this.tunnelSwitchOn ? '关闭 GNSS 锚点冻结，恢复刷新' :
-          '开启 GNSS 锚点冻结，仅供对照实验')
+        .focusable(!this.researchExportInProgress)
+        .hitTestBehavior(this.researchExportInProgress ?
+          HitTestMode.BLOCK_DESCENDANTS : HitTestMode.Default)
+        .accessibilityText(this.researchExportInProgress ? '正在导出，GNSS 锚点冻结暂不可操作' :
+          (this.tunnelSwitchOn ? '关闭 GNSS 锚点冻结，恢复刷新' :
+            '开启 GNSS 锚点冻结，仅供对照实验'))
         .scale({ x: 1.25, y: 1.25 })
         .margin({ right: 8 })
         .onChange((isOn: boolean) => {
+          if (this.researchExportInProgress) {
+            return;
+          }
           this.setTunnelStateFromSwitch(isOn);
         });
     }
@@ -1309,8 +1483,57 @@ struct InertialSpeed {
   }
 
   @Builder
+  private ExportOverlay() {
+    Column({ space: 14 }) {
+      if (this.researchExportPhase === 'copying') {
+        Text(this.exportOverlayTitle())
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#F8FAFC');
+        Progress({ value: this.researchExportPercent, total: 100, type: ProgressType.Linear })
+          .width('100%')
+          .height(8)
+          .color('#4FD1C5')
+          .backgroundColor(this.tunnelSwitchOn ? '#5B4630' : '#334155');
+        Text(`${this.formatExportBytes(this.researchExportCopiedBytes)} / ` +
+          `${this.formatExportBytes(this.researchExportTotalBytes)}`)
+          .fontSize(14)
+          .fontColor('#CBD5E1');
+      } else {
+        LoadingProgress()
+          .width(42)
+          .height(42)
+          .color('#F59E0B');
+        Text(this.exportOverlayTitle())
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#F8FAFC');
+      }
+      Text('请保持应用在前台，完成前请勿离开')
+        .fontSize(13)
+        .fontColor('#CBD5E1')
+        .textAlign(TextAlign.Center);
+      Text('导出完成后仍可再次导出')
+        .fontSize(12)
+        .fontColor('#94A3B8');
+    }
+    .width('100%')
+    .height(this.researchPanelHeight)
+    .padding({ left: 24, right: 24, top: 20, bottom: 20 })
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+    .backgroundColor(this.tunnelSwitchOn ? '#251E16' : '#0F172A')
+    .border({ width: 1, color: this.tunnelSwitchOn ? '#A36D22' : '#1E293B' })
+    .borderRadius(8)
+    .hitTestBehavior(HitTestMode.BLOCK_DESCENDANTS)
+    .accessibilityGroup(true)
+    .accessibilityText(this.exportProgressAccessibilityText());
+  }
+
+  @Builder
   private ResearchPanel() {
-    Column({ space: 10 }) {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column({ space: 10 }) {
       Row() {
         Text(this.researchStatus.running ? '记录中' : '研究记录')
           .fontSize(16)
@@ -1354,8 +1577,9 @@ struct InertialSpeed {
           .focusable(this.hasResearchLog() && !this.researchStatus.running && !this.researchExportInProgress)
           .hitTestBehavior(this.hasResearchLog() && !this.researchStatus.running && !this.researchExportInProgress ?
             HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
-          .accessibilityText(this.hasResearchLog() && !this.researchStatus.running && !this.researchExportInProgress ?
-            '导出' : '导出，不可用')
+          .accessibilityText(this.researchExportInProgress ?
+            `正在导出，${this.researchExportPercent}%，暂不可操作` :
+            (this.hasResearchLog() && !this.researchStatus.running ? '导出' : '导出，不可用'))
           .backgroundColor(this.hasResearchLog() && !this.researchStatus.running && !this.researchExportInProgress ? '#F59E0B' : '#1E293B')
           .onClick(() => {
             this.exportResearchLog();
@@ -1388,12 +1612,23 @@ struct InertialSpeed {
       .width('100%')
       .height(32)
       .justifyContent(FlexAlign.Center);
+      }
+      .width('100%')
+      .padding(12)
+      .backgroundColor(this.tunnelSwitchOn ? '#251E16' : '#0F172A')
+      .border({ width: 1, color: this.tunnelSwitchOn ? '#A36D22' : '#1E293B' })
+      .borderRadius(8)
+      .onAreaChange((_: Area, newArea: Area) => {
+        const height = newArea.height as number;
+        if (height > 0 && height !== this.researchPanelHeight) {
+          this.researchPanelHeight = height;
+        }
+      });
+      if (this.researchExportInProgress && this.researchPanelHeight > 0) {
+        this.ExportOverlay();
+      }
     }
-    .width('100%')
-    .padding(12)
-    .backgroundColor(this.tunnelSwitchOn ? '#251E16' : '#0F172A')
-    .border({ width: 1, color: this.tunnelSwitchOn ? '#A36D22' : '#1E293B' })
-    .borderRadius(8);
+    .width('100%');
   }
 
   build() {

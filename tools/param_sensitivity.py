@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""参数敏感度扫描 — subprocess 运行 replay_estimator.py 改 CLI 参数"""
-import argparse, inspect, json, subprocess, sys
+"""参数敏感度扫描：单次解析 JSONL，并复用顺序回放记录。"""
+import argparse, inspect, sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-ROOT = Path(__file__).resolve().parents[1]
-REPLAY = ROOT / "tools" / "replay_estimator.py"
+try:
+    from .replay_estimator import (
+        SpeedEstimator,
+        analyze_replay_rows,
+        estimator_default_kwargs,
+        read_jsonl_with_info,
+    )
+except ImportError:
+    from replay_estimator import (  # type: ignore
+        SpeedEstimator,
+        analyze_replay_rows,
+        estimator_default_kwargs,
+        read_jsonl_with_info,
+    )
 
 SCANS: List[Dict[str, Any]] = [
     # effective acceleration (7 existing CLI)
@@ -98,36 +110,38 @@ SCANS: List[Dict[str, Any]] = [
 
 
 def validate_scan_schema() -> List[str]:
-    """Fail fast when the estimator constructor or replay CLI drifts from this table."""
-    from replay_estimator import SpeedEstimator
-
+    """Fail fast when a sensitivity entry no longer maps to the estimator."""
     errors: List[str] = []
     parameters = inspect.signature(SpeedEstimator.__init__).parameters
-    help_result = subprocess.run(
-        [sys.executable, str(REPLAY), "--help"],
-        capture_output=True, text=True, cwd=str(ROOT),
-    )
-    if help_result.returncode != 0:
-        return [f"failed to inspect replay CLI: {help_result.stderr.strip()[:200]}"]
     for scan in SCANS:
         parameter = parameters.get(scan["name"])
         if parameter is None:
             errors.append(f"constructor parameter missing: {scan['name']}")
-        elif parameter.default != scan["default"]:
-            errors.append(
-                f"default mismatch for {scan['name']}: scan={scan['default']} estimator={parameter.default}"
-            )
-        if scan["flag"] not in help_result.stdout:
-            errors.append(f"CLI flag missing: {scan['flag']}")
     return errors
 
 
-def replay_one(jsonl: Path, flag: str, value_str: str, bucket: str = None) -> Dict[str, Any]:
-    cmd = [sys.executable, str(REPLAY), str(jsonl), "--no-infer-start", flag, value_str]
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT))
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip()[:200])
-    d = json.loads(r.stdout)
+def replay_one(
+    rows: List[Dict[str, Any]],
+    parameter_name: Optional[str] = None,
+    value: Optional[Any] = None,
+    bucket: Optional[str] = None,
+) -> Dict[str, Any]:
+    estimator_kwargs = estimator_default_kwargs()
+    if parameter_name is not None:
+        if parameter_name not in estimator_kwargs:
+            raise RuntimeError(f"unknown estimator parameter: {parameter_name}")
+        estimator_kwargs[parameter_name] = value
+    d, outputs = analyze_replay_rows(
+        rows,
+        estimator_kwargs,
+        strict_start=True,
+        infer_start_from_sensor=False,
+        include_lag_scans=False,
+        include_bucketed_comparison=bucket is not None,
+        include_recorded_comparison=False,
+    )
+    if not outputs:
+        raise RuntimeError("replay produced no sensor samples")
     if bucket:
         decay = d.get("calibrationDecay", {})
         b = decay.get(bucket)
@@ -162,7 +176,29 @@ def main() -> int:
     pert = args.perturbation
     bucket = args.bucket
 
-    baseline = replay_one(args.jsonl, "--curve-positive-scale", "0.35", bucket)
+    try:
+        rows, read_info = read_jsonl_with_info(args.jsonl)
+    except (OSError, ValueError) as error:
+        print(f"failed to read input JSONL: {error}", file=sys.stderr)
+        return 1
+    if read_info.complete is not True:
+        print(
+            "input JSONL is not structurally complete "
+            f"(status={read_info.status}); formal parameter scans require "
+            "inputIntegrity.complete=true",
+            file=sys.stderr,
+        )
+        return 1
+    if not rows:
+        print("input JSONL contains no replayable records", file=sys.stderr)
+        return 1
+
+    defaults = estimator_default_kwargs()
+    try:
+        baseline = replay_one(rows, bucket=bucket)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"failed to compute baseline: {error}", file=sys.stderr)
+        return 1
     if not baseline["count"] or baseline["count"] < args.min_paired:
         print(f"too few pairs ({baseline.get('count', 0)}), skip")
         return 1
@@ -184,8 +220,7 @@ def main() -> int:
     failed_scans = 0
     for s in scans:
         name = s["name"]
-        flag = s["flag"]
-        default = s["default"]
+        default = defaults[name]
         fmt = s["fmt"]
         up_val = default * (1 + pert)
         dn_val = default * (1 - pert)
@@ -194,8 +229,11 @@ def main() -> int:
         if "min" in s:
             dn_val = max(dn_val, s["min"])
         try:
-            up = replay_one(args.jsonl, flag, f"{up_val:{fmt}}", bucket)
-            dn = replay_one(args.jsonl, flag, f"{dn_val:{fmt}}", bucket)
+            value_type = int if isinstance(default, int) and not isinstance(default, bool) else float
+            up_value = value_type(f"{up_val:{fmt}}")
+            dn_value = value_type(f"{dn_val:{fmt}}")
+            up = replay_one(rows, name, up_value, bucket)
+            dn = replay_one(rows, name, dn_value, bucket)
         except Exception as e:
             print(f"  SKIP {name}: {e}")
             failed_scans += 1

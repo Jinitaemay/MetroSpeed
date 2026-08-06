@@ -10,11 +10,17 @@ struct TunnelLight {
   @State private results: LightSpeedResult[] = [];
   @State private tapCount: number = 0;
   @State private statusText: string = '输入相邻灯光的实际间距，然后在每盏灯经过同一参照位置时打点';
+  private navigationInProgress: boolean = false;
 
   private returnToModeSelection(): void {
+    if (this.navigationInProgress) {
+      return;
+    }
+    this.navigationInProgress = true;
     try {
       this.getUIContext().getRouter().back();
     } catch {
+      this.navigationInProgress = false;
       this.statusText = '无法返回测速方式首页';
     }
   }
@@ -137,8 +143,9 @@ struct TunnelLight {
             .fontSize(14)
             .fontColor('#CBD5E1')
             .width('100%');
-          TextInput({ text: this.distanceText, placeholder: '例如 10' })
-          .type(InputType.NUMBER_DECIMAL)
+          TextInput({ text: this.distanceText, placeholder: '例如 9.6' })
+            .type(InputType.NUMBER_DECIMAL)
+            .accessibilityText('相邻灯光间距，单位米')
             .fontSize(18)
             .fontColor('#F8FAFC')
             .placeholderColor('#94A3B8')

@@ -57,6 +57,7 @@ class BaselineScopeTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("current.jsonl", result.stdout)
+        self.assertIn("invalid JSONL", result.stdout)
         self.assertNotIn("ignored_replay_result.jsonl", result.stdout)
         self.assertNotIn("historical.jsonl", result.stdout)
 

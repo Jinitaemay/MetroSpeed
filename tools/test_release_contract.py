@@ -80,6 +80,51 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("} finally {", permission_helper)
         self.assertIn("if (!permissionResult.granted) {", page)
 
+    def test_initial_calibration_failure_preserves_rejected_snapshot(self) -> None:
+        page = self.read("entry/src/main/ets/pages/InertialSpeed.ets")
+        recorder = self.read("entry/src/main/ets/model/ResearchRecorder.ets")
+        sensor_frame = page[
+            page.index("  private onSensorFrame(frame: SensorFrame): void {"):
+            page.index("  private resetDisplayStats(): void {")
+        ]
+        self.assertIn("this.abortStartCalibration(nextFrame);", sensor_frame)
+
+        abort = page[
+            page.index(
+                "  private abortStartCalibration(rejectedFrame: EstimatorFrame): void {"
+            ):
+            page.index("  private async toggleResearchRecording(): Promise<void> {")
+        ]
+        notes_index = abort.index("const rejectionNotes =")
+        snapshot_index = abort.index("this.researchRecorder.updateEstimator(")
+        reset_index = abort.index("this.estimator.reset(now)")
+        cancel_index = abort.index(
+            "this.researchRecorder.cancelMeasurement(now, rejectionNotes)"
+        )
+        self.assertLess(notes_index, reset_index)
+        self.assertLess(snapshot_index, reset_index)
+        self.assertLess(reset_index, cancel_index)
+        self.assertIn("reason=initial_calibration_unstable", abort)
+        self.assertIn(
+            "calibrationRejected=${rejectionStats.calibrationRejected}", abort
+        )
+        self.assertIn("status=${rejectionStats.statusText}", abort)
+        self.assertIn("confidence=${rejectionStats.confidence.toFixed(2)}", abort)
+        self.assertIn("state=${motionStateText(rejectionStats.motionState)}", abort)
+        self.assertNotIn("resetStats.statusText", abort)
+
+        cancel = recorder[
+            recorder.index("  cancelMeasurement(timestampMs: number, notes: string)"):
+            recorder.index("  clearEstimatorSnapshot(): void")
+        ]
+        append = recorder[
+            recorder.index("  private appendRecord("):
+            recorder.index("  private appendLocationFields(")
+        ]
+        self.assertIn("this.appendRecord(timestampMs, '开始失败', notes);", cancel)
+        self.assertIn("if (recordType === 'event' && stats)", append)
+        self.assertIn("this.appendEstimatorSummary(record, stats);", append)
+
     def test_disabled_controls_keep_accessible_contrast(self) -> None:
         page = self.read("entry/src/main/ets/pages/InertialSpeed.ets")
         index = self.read("entry/src/main/ets/pages/Index.ets")
@@ -87,7 +132,9 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertNotIn(".enabled(", index)
         self.assertNotIn("disabledButtonStyle", page)
         self.assertNotIn("disabledButtonStyle", index)
-        self.assertEqual(page.count("HitTestMode.BLOCK_DESCENDANTS"), 5)
+        # Six guarded controls, plus the GNSS anchor-freeze control and the
+        # non-interactive export overlay that lets the parent Scroll keep gestures.
+        self.assertEqual(page.count("HitTestMode.BLOCK_DESCENDANTS"), 8)
         self.assertEqual(index.count("HitTestMode.BLOCK_DESCENDANTS"), 1)
         self.assertIn("'停车校准，不可用'", page)
         self.assertIn("'导出，不可用'", page)
@@ -162,7 +209,7 @@ class ReleaseContractTests(unittest.TestCase):
             page.index("  private startResearchSensors(): boolean {"):
             page.index("  private ensureResearchSensorsOrStop(): boolean {")
         ]
-        self.assertIn("}, false);", research_start)
+        self.assertIn("}, false, (error: CoreSensorFatalError)", research_start)
         self.assertIn("研究记录已降级：陀螺仪不可用", research_start)
         self.assertIn("研究记录传感器降级", page)
         self.assertIn("private subscriptionGeneration: number = 0;", controller)
@@ -347,6 +394,28 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn(".border({ width: 1, color: '#FECACA' })", page)
         self.assertIn(".backgroundColor('#DC2626')", page)
         self.assertNotIn("Button('留在此页'", page)
+
+    def test_mode_pages_guard_back_navigation_and_label_light_distance(self) -> None:
+        inertial = self.read("entry/src/main/ets/pages/InertialSpeed.ets")
+        light = self.read("entry/src/main/ets/pages/TunnelLight.ets")
+        return_bodies = (
+            inertial[
+                inertial.index("private returnToModeSelection"):
+                inertial.index("private switchToTunnelLightSpeed")
+            ],
+            light[
+                light.index("private returnToModeSelection"):
+                light.index("private updateDistance")
+            ],
+        )
+        for return_body in return_bodies:
+            self.assertIn("if (this.navigationInProgress)", return_body)
+            self.assertIn("this.navigationInProgress = true", return_body)
+            self.assertIn("getRouter().back();", return_body)
+            self.assertNotIn("getRouter().back().then", return_body)
+            self.assertIn("this.navigationInProgress = false", return_body)
+        self.assertIn(".accessibilityText('相邻灯光间距，单位米')", light)
+        self.assertIn("placeholder: '例如 9.6'", light)
 
 
 if __name__ == "__main__":

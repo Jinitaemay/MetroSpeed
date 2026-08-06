@@ -173,7 +173,7 @@ export default class EntryAbility extends UIAbility {
     if (!this.mainWindow) {
       return;
     }
-    const keepScreenOn = !this.isInBackground && BackgroundState.isCollectionActive();
+    const keepScreenOn = !this.isInBackground && BackgroundState.shouldKeepScreenOn();
     this.mainWindow.setWindowKeepScreenOn(keepScreenOn).catch((screenError: BusinessError) => {
       console.warn(`Failed to update keep-screen-on state: ${screenError.message}`);
     });
