@@ -71,6 +71,62 @@ class CoreSensorAxisGuardContractTests(unittest.TestCase):
         self.assertIn("failedGeneration !== this.subscriptionGeneration", fatal)
         self.assertIn("this.stopCoreSensorWatchdog();", fatal)
 
+    def test_watchdog_uses_monotonic_uptime_but_frames_keep_wall_time(self) -> None:
+        controller = read("entry/src/main/ets/model/SensorController.ets")
+        emit = section(controller, "  private emitFrame", "  private observeAccelerationContinuity")
+        watchdog = section(
+            controller,
+            "  private checkAccelerometerWatchdog",
+            "  private failCoreSensor(",
+        )
+        monotonic = section(
+            controller,
+            "  private readMonotonicNowMs",
+            "  private scheduleCoreSensorWatchdog",
+        )
+
+        self.assertIn("systemDateTime.getUptime(systemDateTime.TimeType.STARTUP)", monotonic)
+        self.assertIn("Math.min(wallDeltaMs, CORE_SENSOR_WATCHDOG_INTERVAL_MS * 2)", monotonic)
+        self.assertIn("const wallNowMs = Date.now();", emit)
+        self.assertIn("const monotonicNowMs = this.readMonotonicNowMs();", emit)
+        self.assertIn("timestampMs: wallNowMs", emit)
+        self.assertIn("this.observeAccelerationContinuity(sensorTimestamp, monotonicNowMs)", emit)
+        self.assertIn("const now = this.readMonotonicNowMs();", watchdog)
+        self.assertNotIn("Date.now()", watchdog)
+        self.assertIn("coreStartMonotonicMs", controller)
+        self.assertIn("lastAccelerationMonotonicMs", controller)
+        self.assertIn("gyroscopeMissingSinceMonotonicMs", controller)
+
+    def test_non_finite_sensor_callbacks_are_dropped_before_recording_or_state(self) -> None:
+        controller = read("entry/src/main/ets/model/SensorController.ets")
+        subscriptions = (
+            ("  private subscribeAcceleration", "  private subscribeGyroscope"),
+            ("  private subscribeGyroscope", "  private subscribeRotationVector"),
+            ("  private subscribeRotationVector", "  private subscribeMagneticField"),
+            ("  private subscribeMagneticField", "  private subscribeUncalibratedGyroscope"),
+            ("  private subscribeUncalibratedGyroscope", "  private subscribeUncalibratedMagneticField"),
+            ("  private subscribeUncalibratedMagneticField", "  private emitSensorSample"),
+        )
+        for begin, end in subscriptions:
+            body = section(controller, begin, end)
+            finite_guard = body.index("isFiniteSensorTimestamp(data.timestamp)")
+            recorded = body.index("this.emitSensorSample({")
+            self.assertLess(finite_guard, recorded)
+
+        acceleration = section(
+            controller,
+            "  private subscribeAcceleration",
+            "  private subscribeGyroscope",
+        )
+        self.assertLess(
+            acceleration.index("isFiniteVector3(data.x, data.y, data.z)"),
+            acceleration.index("this.emitFrame("),
+        )
+        stop = section(controller, "  stop(): boolean", "  private subscribeAcceleration")
+        self.assertIn(
+            "return coreCleanupSucceeded && auxiliaryCleanupSucceeded;", stop
+        )
+
     def test_optional_gyro_degrades_and_can_recover(self) -> None:
         controller = read("entry/src/main/ets/model/SensorController.ets")
         missing = section(controller, "  private handleMissingGyroscope", "  private clearGyroscopeMissingWindow")

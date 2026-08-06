@@ -5,16 +5,23 @@ import inspect
 import json
 import math
 import os
+import sqlite3
 import statistics
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 
-ALGORITHM_VERSION = "anchor-delta-20260804-r5"
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+
+ALGORITHM_VERSION = "anchor-delta-20260807-r5"
 PHONE_GNSS_ANCHOR_LAG_MS = 40
 PHONE_INERTIAL_HISTORY_RETENTION_MS = 200
 REFERENCE_DT_SECONDS = 0.02
@@ -23,6 +30,7 @@ PRE_CAL_BUFFER_SECONDS = 3.6
 PRE_CAL_MAX_FRAMES = 800
 PARKING_WINDOW_SECONDS = 1.5
 PARKING_WINDOW_MIN_SAMPLES = 30
+PARKING_WINDOW_MAX_AGE_MS = 300
 MOTION_WINDOW_MAX_FRAMES = 400
 DEPARTURE_EVIDENCE_SECONDS = 0.06
 APP_PARITY_ESTIMATOR_CONFIG = {
@@ -461,10 +469,13 @@ class SpeedEstimator:
         self.use_sys_gravity = use_sys_gravity
         self.running = False
         self.start_ms = 0
+        self.logical_timestamp_ms = 0.0
+        self.logical_clock_initialized = False
         self.last_timestamp_ms = 0
         self.last_sensor_timestamp_ns: Optional[float] = None
         self.last_valid_delta_seconds = clamp(dt_fallback, dt_clamp_lo, dt_clamp_hi)
         self.last_elapsed_delta_seconds = self.last_valid_delta_seconds
+        self.last_clock_elapsed_seconds = self.last_valid_delta_seconds
         self.last_sample_continuous = True
         self.velocity_mps = 0.0
         self.distance_m = 0.0
@@ -499,6 +510,7 @@ class SpeedEstimator:
         self.parking_calibration_success_until_ms = 0
         self.parking_calibration_result = 0
         self.parking_calibration_request_ms = 0
+        self.parking_calibration_evidence_reference_ms = 0
         self.parking_calibration_previous_ms = 0
         self.parking_calibration_snapshot: List[PreCalFrame] = []
         self.parking_post_request_frames: List[PreCalFrame] = []
@@ -507,13 +519,16 @@ class SpeedEstimator:
 
     def start(self, timestamp_ms: int) -> None:
         self.running = True
-        self.start_ms = timestamp_ms
+        self.start_ms = 0
+        self.logical_timestamp_ms = 0.0
+        self.logical_clock_initialized = False
         self.last_timestamp_ms = timestamp_ms
         self.last_sensor_timestamp_ns = None
         self.last_valid_delta_seconds = clamp(
             self.dt_fallback, self.dt_clamp_lo, self.dt_clamp_hi
         )
         self.last_elapsed_delta_seconds = self.last_valid_delta_seconds
+        self.last_clock_elapsed_seconds = self.last_valid_delta_seconds
         self.last_sample_continuous = True
         self.velocity_mps = 0.0
         self.distance_m = 0.0
@@ -536,12 +551,13 @@ class SpeedEstimator:
         self.parking_calibration_success_until_ms = 0
         self.parking_calibration_result = 0
         self.parking_calibration_request_ms = 0
+        self.parking_calibration_evidence_reference_ms = 0
         self.parking_calibration_previous_ms = 0
         self.parking_calibration_snapshot = []
         self.parking_post_request_frames = []
         self.last_raw_acceleration = None
         self.initial_calibration_done = False
-        self.begin_calibration(timestamp_ms)
+        self.begin_calibration(self.logical_timestamp_ms)
 
     def stop(self, timestamp_ms: int) -> None:
         self.running = False
@@ -553,12 +569,14 @@ class SpeedEstimator:
             self.dt_fallback, self.dt_clamp_lo, self.dt_clamp_hi
         )
         self.last_elapsed_delta_seconds = self.last_valid_delta_seconds
+        self.last_clock_elapsed_seconds = self.last_valid_delta_seconds
         self.last_sample_continuous = True
         self.parking_calibration_pending = False
         self.parking_calibration_rejected_until_ms = 0
         self.parking_calibration_success_until_ms = 0
         self.parking_calibration_result = 0
         self.parking_calibration_request_ms = 0
+        self.parking_calibration_evidence_reference_ms = 0
         self.parking_calibration_previous_ms = 0
         self.parking_calibration_snapshot = []
         self.parking_post_request_frames = []
@@ -570,7 +588,9 @@ class SpeedEstimator:
         pure_mode = self.pure_mode
         self.__init__(**constructor_kwargs)
         self.pure_mode = pure_mode
-        self.start_ms = timestamp_ms
+        self.start_ms = 0
+        self.logical_timestamp_ms = 0.0
+        self.logical_clock_initialized = False
         self.last_timestamp_ms = timestamp_ms
 
     def set_pure_mode(self, pure: int) -> None:
@@ -581,7 +601,19 @@ class SpeedEstimator:
         self.parking_calibration_result = 0
         return result
 
-    def calibrate_at_stop(self, timestamp_ms: int) -> bool:
+    def calibrate_at_stop(self, action_timestamp_ms: int) -> bool:
+        # Mirror the app: sensor time owns the estimator clock, while a bounded
+        # action delay only determines whether the pre-click evidence is stale.
+        action_delay_ms = action_timestamp_ms - self.last_timestamp_ms
+        bounded_action_delay_ms = (
+            action_delay_ms
+            if (
+                math.isfinite(action_delay_ms)
+                and 0 <= action_delay_ms <= PARKING_WINDOW_MAX_AGE_MS
+            )
+            else PARKING_WINDOW_MAX_AGE_MS + 1
+        )
+        timestamp_ms = self.logical_timestamp_ms
         if not self.initial_calibration_done:
             return False
         if self.parking_calibration_pending:
@@ -591,6 +623,9 @@ class SpeedEstimator:
         self.parking_calibration_success_until_ms = 0
         self.parking_calibration_result = 0
         self.parking_calibration_request_ms = timestamp_ms
+        self.parking_calibration_evidence_reference_ms = (
+            timestamp_ms + bounded_action_delay_ms
+        )
         self.parking_calibration_previous_ms = self.last_calibration_ms
         self.parking_calibration_snapshot = list(self.pre_cal_buffer)
         self.parking_post_request_frames = []
@@ -604,6 +639,11 @@ class SpeedEstimator:
 
         dt = self.compute_delta_seconds(frame)
         elapsed_seconds = self.last_elapsed_delta_seconds
+        if self.logical_clock_initialized:
+            self.logical_timestamp_ms += self.last_clock_elapsed_seconds * 1000.0
+        else:
+            self.logical_clock_initialized = True
+        timestamp_ms = self.logical_timestamp_ms
         continuous = self.last_sample_continuous
         raw_acceleration = frame.acceleration
         if not continuous:
@@ -611,7 +651,7 @@ class SpeedEstimator:
             self.window_frames = []
             self.filtered_acceleration = v_empty()
             if not self.initial_calibration_done and not self.parking_calibration_pending:
-                self.reset_calibration_evidence(frame.timestamp_ms)
+                self.reset_calibration_evidence(timestamp_ms)
         acc_step = self.compute_acc_step(
             raw_acceleration,
             elapsed_seconds,
@@ -623,12 +663,12 @@ class SpeedEstimator:
             and not self.parking_calibration_pending
             and self.calibration_samples == 0
         ):
-            self.calibration_until_ms = frame.timestamp_ms + self.calibration_duration_ms
-            self.last_calibration_ms = frame.timestamp_ms
+            self.calibration_until_ms = timestamp_ms + self.calibration_duration_ms
+            self.last_calibration_ms = timestamp_ms
 
         pre_cal_gyro = v_mag(frame.gyroscope) if frame.gyroscope is not None else 0.0
         pre_cal_frame = PreCalFrame(
-            timestamp_ms=frame.timestamp_ms,
+            timestamp_ms=timestamp_ms,
             acceleration=raw_acceleration,
             gyro_magnitude=pre_cal_gyro,
             acc_step=acc_step,
@@ -643,10 +683,10 @@ class SpeedEstimator:
         if self.parking_calibration_pending:
             self.parking_post_request_frames.append(pre_cal_frame)
 
-        if frame.timestamp_ms <= self.calibration_until_ms:
+        if timestamp_ms <= self.calibration_until_ms:
             calibration_gyro_magnitude = v_mag(frame.gyroscope) if frame.gyroscope is not None else 0.0
             self.collect_calibration(
-                frame.timestamp_ms,
+                timestamp_ms,
                 raw_acceleration,
                 calibration_gyro_magnitude,
                 acc_step,
@@ -655,7 +695,7 @@ class SpeedEstimator:
                 self.motion_state = MotionState.CALIBRATING
                 return self.make_output(frame, v_empty(), sample_confidence=0.35)
 
-        self.finish_calibration_if_needed(frame.timestamp_ms)
+        self.finish_calibration_if_needed(timestamp_ms)
 
         gyro_magnitude = v_mag(frame.gyroscope) if frame.gyroscope is not None else 0.0
         self.update_gravity_from_gyro(frame.gyroscope, dt, gyro_magnitude)
@@ -668,12 +708,12 @@ class SpeedEstimator:
         filtered = self.low_pass(clipped, self.low_pass_alpha, dt)
         self.filtered_acceleration = filtered
 
-        self.update_main_axis_lock(frame.timestamp_ms)
+        self.update_main_axis_lock(timestamp_ms)
         forward_acceleration = v_dot(filtered, self.main_axis)
         lateral_vector = v_sub(filtered, v_scale(self.main_axis, forward_acceleration))
         lateral_acceleration = v_mag(lateral_vector)
         self.push_window_frame(
-            frame.timestamp_ms,
+            timestamp_ms,
             forward_acceleration,
             lateral_acceleration,
             gyro_magnitude,
@@ -688,15 +728,15 @@ class SpeedEstimator:
             forward_acceleration,
             lateral_acceleration,
             gyro_magnitude,
-            frame.timestamp_ms,
+            timestamp_ms,
         )
         if self.should_update_main_axis(
             filtered,
             gyro_magnitude,
-            frame.timestamp_ms,
+            timestamp_ms,
             axis_candidate_state,
         ):
-            self.update_main_axis(filtered, frame.timestamp_ms, dt)
+            self.update_main_axis(filtered, timestamp_ms, dt)
             forward_acceleration = v_dot(filtered, self.main_axis)
             lateral_vector = v_sub(
                 filtered,
@@ -708,14 +748,19 @@ class SpeedEstimator:
                 lateral_acceleration,
             )
 
-        state = self.detect_motion_state(forward_acceleration, lateral_acceleration, gyro_magnitude, frame.timestamp_ms)
+        state = self.detect_motion_state(
+            forward_acceleration,
+            lateral_acceleration,
+            gyro_magnitude,
+            timestamp_ms,
+        )
         effective_acceleration = self.effective_forward_acceleration(forward_acceleration, state)
         previous_velocity_mps = self.velocity_mps
         self.velocity_mps = max(0.0, self.velocity_mps + effective_acceleration * dt)
         self.distance_m += ((previous_velocity_mps + self.velocity_mps) / 2.0) * dt
 
         self.max_speed_kmh = max(self.max_speed_kmh, self.velocity_mps * 3.6)
-        self.confidence = self.compute_confidence(state, gyro_magnitude, frame.timestamp_ms)
+        self.confidence = self.compute_confidence(state, gyro_magnitude, timestamp_ms)
         self.motion_state = state
         pre_cal_frame.integrated = True
         return self.make_output(frame, filtered)
@@ -804,8 +849,11 @@ class SpeedEstimator:
                 if window_sample_count < PARKING_WINDOW_MIN_SAMPLES:
                     continue
                 window_end_timestamp_ms = parking_frames[end_index].timestamp_ms
-                window_age_ms = self.parking_calibration_request_ms - window_end_timestamp_ms
-                if window_age_ms < 0 or window_age_ms > 300:
+                window_age_ms = (
+                    self.parking_calibration_evidence_reference_ms
+                    - window_end_timestamp_ms
+                )
+                if window_age_ms < 0 or window_age_ms > PARKING_WINDOW_MAX_AGE_MS:
                     continue
                 s = v_empty()
                 sq = 0.0
@@ -903,6 +951,7 @@ class SpeedEstimator:
                 self.filtered_acceleration = v_empty()
         self.parking_calibration_pending = False
         self.parking_calibration_request_ms = 0
+        self.parking_calibration_evidence_reference_ms = 0
         self.parking_calibration_previous_ms = 0
         self.parking_calibration_snapshot = []
         self.parking_post_request_frames = []
@@ -966,9 +1015,11 @@ class SpeedEstimator:
 
     def compute_delta_seconds(self, frame: SensorFrame) -> float:
         timestamp_ms = frame.timestamp_ms
+        sensor_clock_delta = False
         if frame.sensor_timestamp is not None:
             if self.last_sensor_timestamp_ns is not None and frame.sensor_timestamp > self.last_sensor_timestamp_ns:
                 raw_dt = (frame.sensor_timestamp - self.last_sensor_timestamp_ns) / 1_000_000_000.0
+                sensor_clock_delta = True
             else:
                 raw_dt = (timestamp_ms - self.last_timestamp_ms) / 1000.0
             self.last_sensor_timestamp_ns = frame.sensor_timestamp
@@ -978,12 +1029,18 @@ class SpeedEstimator:
         self.last_timestamp_ms = timestamp_ms
         if raw_dt <= 0 or not math.isfinite(raw_dt):
             self.last_elapsed_delta_seconds = self.last_valid_delta_seconds
+            self.last_clock_elapsed_seconds = self.last_valid_delta_seconds
             self.last_sample_continuous = True
             return self.last_valid_delta_seconds
         delta_seconds = clamp(raw_dt, self.dt_clamp_lo, self.dt_clamp_hi)
         continuous = raw_dt <= MAX_CONTINUOUS_SAMPLE_SECONDS
         self.last_elapsed_delta_seconds = (
             raw_dt if continuous else self.last_valid_delta_seconds
+        )
+        self.last_clock_elapsed_seconds = (
+            raw_dt
+            if continuous or sensor_clock_delta
+            else self.last_valid_delta_seconds
         )
         self.last_sample_continuous = continuous
         if continuous:
@@ -1372,8 +1429,8 @@ class SpeedEstimator:
             main_axis=self.main_axis,
             calibration_count=self.calibration_count,
             calibration_rejected=(
-                frame.timestamp_ms < self.calibration_rejected_until_ms
-                or frame.timestamp_ms < self.parking_calibration_rejected_until_ms
+                self.logical_timestamp_ms < self.calibration_rejected_until_ms
+                or self.logical_timestamp_ms < self.parking_calibration_rejected_until_ms
             ),
         )
 
@@ -1469,6 +1526,15 @@ def make_sensor_frame(row: Dict[str, Any]) -> Optional[SensorFrame]:
     )
 
 
+def invalid_required_sensor_fields(row: Dict[str, Any]) -> List[str]:
+    """Return required composite-sensor fields that are not finite numbers."""
+    return [
+        field_name
+        for field_name in ("accX", "accY", "accZ")
+        if parse_number(row, field_name) is None
+    ]
+
+
 SUPPORTED_RECORD_SCHEMAS = frozenset((11, 13, 14, 15, 16, 17))
 LEGACY_PARTIAL_SENSOR_METADATA_SCHEMAS = frozenset((11, 13))
 LIFECYCLE_RECORD_TYPE_SCHEMAS = frozenset((14, 15, 16, 17))
@@ -1536,6 +1602,8 @@ class JsonlStructureTracker:
     algorithm_mismatch: bool = False
     algorithm_examples: List[str] = field(default_factory=list)
     invalid_algorithm_count: int = 0
+    invalid_sensor_payload_count: int = 0
+    invalid_sensor_payload_examples: List[str] = field(default_factory=list)
     missing_metadata: Dict[str, Dict[str, int]] = field(
         default_factory=lambda: {
             name: {"sensor": 0, "other": 0}
@@ -1621,6 +1689,14 @@ class JsonlStructureTracker:
             self.missing_record_type_count += 1
         row_kind = "sensor" if record_type == "sensor" else "other"
         self._observe_metadata(row, row_kind)
+        if row_kind == "sensor":
+            invalid_fields = invalid_required_sensor_fields(row)
+            if invalid_fields:
+                self.invalid_sensor_payload_count += 1
+                if len(self.invalid_sensor_payload_examples) < 8:
+                    self.invalid_sensor_payload_examples.append(
+                        f"line {line_number}: {', '.join(invalid_fields)}"
+                    )
 
         event_value = row.get("event")
         event = event_value if isinstance(event_value, str) else None
@@ -1664,6 +1740,11 @@ class JsonlStructureTracker:
         ignored_tail_byte_count: int = 0,
     ) -> JsonlReadInfo:
         issues: List[str] = []
+        if self.invalid_sensor_payload_count:
+            issues.append(
+                "sensor rows with invalid required acceleration fields: "
+                f"{self.invalid_sensor_payload_count}"
+            )
         if self.schema_mismatch:
             issues.append("recordSchemaVersion changes within the file")
         if self.invalid_schema_count:
@@ -1775,6 +1856,10 @@ class JsonlStructureTracker:
                 "rowsAfterStop": self.rows_after_stop,
                 "recordTypeMismatchCount": self.lifecycle_record_type_mismatch_count,
             },
+            "sensorPayload": {
+                "invalidRequiredAccelerationCount": self.invalid_sensor_payload_count,
+                "invalidExamples": self.invalid_sensor_payload_examples,
+            },
             "issues": issues,
         }
         if self.schema_mismatch:
@@ -1794,17 +1879,32 @@ class JsonlStructureTracker:
         )
 
 
-def read_jsonl_with_info(
-    path: Path,
-    allow_truncated_tail: bool = False,
-) -> Tuple[List[Dict[str, Any]], JsonlReadInfo]:
-    rows: List[Dict[str, Any]] = []
-    structure_tracker = JsonlStructureTracker()
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            has_line_terminator = line.endswith("\n")
-            stripped_line = line.strip()
-            if stripped_line:
+class ValidatedJsonlRows:
+    """Single-pass validated JSONL rows with integrity metadata after exhaustion.
+
+    The historical reader materializes every decoded object.  Baseline replay can
+    instead consume this iterator directly: every physical line is still decoded
+    and checked, while high-rate callback and sensor objects become collectible as
+    soon as the estimator has consumed them.
+    """
+
+    def __init__(self, path: Path, allow_truncated_tail: bool = False) -> None:
+        self.path = path
+        self.allow_truncated_tail = allow_truncated_tail
+        self._started = False
+        self._read_info: Optional[JsonlReadInfo] = None
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        if self._started:
+            raise RuntimeError("validated JSONL stream can only be consumed once")
+        self._started = True
+        structure_tracker = JsonlStructureTracker()
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                has_line_terminator = line.endswith("\n")
+                stripped_line = line.strip()
+                if not stripped_line:
+                    continue
                 # Schema 15+ records raw callbacks for cadence research.
                 # Estimator replay consumes the composite `sensor` rows instead,
                 # so callback rows do not change replay order or results. Decode
@@ -1812,24 +1912,29 @@ def read_jsonl_with_info(
                 # JSONL integrity checks.
                 try:
                     row = json.loads(stripped_line)
+                except RecursionError as error:
+                    raise ValueError(
+                        f"{self.path}:{line_number}: JSONL nesting is too deep"
+                    ) from error
                 except json.JSONDecodeError as error:
-                    if allow_truncated_tail and not has_line_terminator:
-                        return rows, structure_tracker.finish(
+                    if self.allow_truncated_tail and not has_line_terminator:
+                        self._read_info = structure_tracker.finish(
                             ignored_tail_line_number=line_number,
                             ignored_tail_byte_count=len(line.encode("utf-8")),
                         )
+                        return
                     raise ValueError(
-                        f"{path}:{line_number}: invalid JSONL: {error.msg} "
+                        f"{self.path}:{line_number}: invalid JSONL: {error.msg} "
                         f"(column {error.colno})"
                     ) from error
                 if not isinstance(row, dict):
                     raise ValueError(
-                        f"{path}:{line_number}: each JSONL row must be an object"
+                        f"{self.path}:{line_number}: each JSONL row must be an object"
                     )
                 timestamp = parse_number(row, "timestampMs")
                 if timestamp is None or not timestamp.is_integer():
                     raise ValueError(
-                        f"{path}:{line_number}: timestampMs must be a finite integer"
+                        f"{self.path}:{line_number}: timestampMs must be a finite integer"
                     )
                 row["timestampMs"] = int(timestamp)
                 location_time_value = row.get("locationTimeMs")
@@ -1837,7 +1942,7 @@ def read_jsonl_with_info(
                     parsed_location_time = parse_number(row, "locationTimeMs")
                     if parsed_location_time is None or not parsed_location_time.is_integer():
                         raise ValueError(
-                            f"{path}:{line_number}: locationTimeMs must be a finite integer"
+                            f"{self.path}:{line_number}: locationTimeMs must be a finite integer"
                         )
                     row["locationTimeMs"] = int(parsed_location_time)
                 record_seq = row.get("recordSeq")
@@ -1850,17 +1955,30 @@ def read_jsonl_with_info(
                         or parsed_record_seq < 0
                     ):
                         raise ValueError(
-                            f"{path}:{line_number}: recordSeq must be a non-negative integer"
+                            f"{self.path}:{line_number}: recordSeq must be a non-negative integer"
                         )
                     row["recordSeq"] = int(parsed_record_seq)
                 structure_tracker.observe(row, line_number)
-                if row.get("recordType") == "sensor_callback":
-                    continue
-                rows.append(row)
-    # JSONL append order (and recordSeq within a session) is the callback execution
-    # order. Wall-clock timestampMs can move backwards, so globally sorting here can
-    # invert stop/start and parking events across measurement runs.
-    return rows, structure_tracker.finish()
+                if row.get("recordType") != "sensor_callback":
+                    yield row
+        # JSONL append order (and recordSeq within a session) is the callback
+        # execution order. Wall-clock timestampMs can move backwards, so the
+        # stream must never be globally sorted.
+        self._read_info = structure_tracker.finish()
+
+    def finish(self) -> JsonlReadInfo:
+        if self._read_info is None:
+            raise RuntimeError("validated JSONL stream was not consumed to completion")
+        return self._read_info
+
+
+def read_jsonl_with_info(
+    path: Path,
+    allow_truncated_tail: bool = False,
+) -> Tuple[List[Dict[str, Any]], JsonlReadInfo]:
+    stream = ValidatedJsonlRows(path, allow_truncated_tail=allow_truncated_tail)
+    rows = list(stream)
+    return rows, stream.finish()
 
 
 def read_jsonl(
@@ -1899,10 +2017,13 @@ def parking_calibration_event_kind(event: str) -> Optional[str]:
 
 
 def replay(
-    rows: List[Dict[str, Any]],
+    rows: Iterable[Dict[str, Any]],
     strict_start: bool,
     infer_start_from_sensor: bool,
     adaptive_gravity: bool = False,
+    output_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+    collect_outputs: bool = True,
+    collect_events: bool = True,
     **estimator_kwargs: Any,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     start_event = "\u5f00\u59cb\u6d4b\u901f"
@@ -1914,7 +2035,7 @@ def replay(
     tunnel_inside = False
     has_gnss_anchor = False
     gnss_anchor_usable = False
-    first_timestamp = int(rows[0]["timestampMs"]) if rows else 0
+    first_timestamp: Optional[int] = None
     current_run_id: Optional[str] = None
     replay_run_count = 0
 
@@ -1926,6 +2047,10 @@ def replay(
     scenario_is_subway = True  # 安全默认：判定前用自估重力
     if adaptive_gravity:
         estimator.use_sys_gravity = False  # 判定为驾车后才启用系统重力
+
+    def record_event(item: Dict[str, Any]) -> None:
+        if collect_events:
+            replay_events.append(item)
 
     def begin_replay_run(
         timestamp_ms: int,
@@ -1951,7 +2076,7 @@ def replay(
             scenario_decided = False
             scenario_is_subway = True
             estimator.use_sys_gravity = False
-        replay_events.append({
+        record_event({
             "t": timestamp_ms,
             "event": event_name,
             "measurementRunId": current_run_id,
@@ -1964,7 +2089,7 @@ def replay(
         nonlocal running, current_run_id
         if not running:
             return
-        replay_events.append({
+        record_event({
             "t": timestamp_ms,
             "event": event_name,
             "measurementRunId": current_run_id,
@@ -1976,6 +2101,8 @@ def replay(
 
     for source_row_index, row in enumerate(rows):
         timestamp_ms = int(row.get("timestampMs", 0))
+        if first_timestamp is None:
+            first_timestamp = timestamp_ms
         event = str(row.get("event") or "")
         notes = str(row.get("notes") or "")
 
@@ -1999,7 +2126,7 @@ def replay(
                     end_replay_run(timestamp_ms, "implicit_stop_before_new_start")
                 begin_replay_run(timestamp_ms, row, "start")
             else:
-                replay_events.append({
+                record_event({
                     "t": timestamp_ms,
                     "event": "measurement_already_running",
                     "measurementRunId": current_run_id,
@@ -2021,19 +2148,29 @@ def replay(
         parking_kind = parking_calibration_event_kind(event)
         if running and parking_kind in ("request", "legacy"):
             speed_kmh = estimator.velocity_mps * 3.6
-            replay_events.append({
+            raw_location_speed = row.get("locationSpeedMps")
+            location_speed_mps = parse_number(row, "locationSpeedMps")
+            if raw_location_speed is not None and location_speed_mps is None:
+                raise ValueError(
+                    "parking calibration event locationSpeedMps must be a finite number"
+                )
+            record_event({
                 "t": timestamp_ms,
                 "event": "parking_calibration_before",
                 "speedKmh": speed_kmh,
                 "recordedSpeedKmh": row.get("estimatedSpeedKmh"),
-                "locationSpeedKmh": None if row.get("locationSpeedMps") is None else float(row["locationSpeedMps"]) * 3.6,
+                "locationSpeedKmh": (
+                    None
+                    if location_speed_mps is None
+                    else location_speed_mps * 3.6
+                ),
                 "gravity": estimator.gravity_estimate,
                 "mainAxis": estimator.main_axis,
                 "mainAxisInit": estimator.main_axis_initialized,
                 "calibrationCount": estimator.calibration_count,
             })
             accepted = estimator.calibrate_at_stop(timestamp_ms)
-            replay_events.append({
+            record_event({
                 "t": timestamp_ms,
                 "event": "parking_calibration_requested",
                 "accepted": accepted,
@@ -2046,21 +2183,21 @@ def replay(
         if running and parking_kind == "success":
             has_gnss_anchor = True
             gnss_anchor_usable = True
-            replay_events.append({"t": timestamp_ms, "event": "parking_calibration_success"})
+            record_event({"t": timestamp_ms, "event": "parking_calibration_success"})
             continue
         if running and parking_kind == "rejected":
-            replay_events.append({"t": timestamp_ms, "event": "parking_calibration_rejected"})
+            record_event({"t": timestamp_ms, "event": "parking_calibration_rejected"})
             continue
         if event_matches(event, "\u5165\u96a7"):
             tunnel_inside = True
             if running:
-                replay_events.append({"t": timestamp_ms, "event": "tunnel_enter"})
+                record_event({"t": timestamp_ms, "event": "tunnel_enter"})
             continue
         if event_matches(event, "\u51fa\u96a7"):
             tunnel_inside = False
             gnss_anchor_usable = False
             if running:
-                replay_events.append({"t": timestamp_ms, "event": "tunnel_exit"})
+                record_event({"t": timestamp_ms, "event": "tunnel_exit"})
             continue
         if running and event_matches(event, stop_event):
             end_replay_run(timestamp_ms, "stop")
@@ -2092,7 +2229,12 @@ def replay(
             continue
         frame = make_sensor_frame(row)
         if frame is None:
-            continue
+            invalid_fields = invalid_required_sensor_fields(row)
+            raise ValueError(
+                "sensor row has invalid required acceleration fields "
+                f"({', '.join(invalid_fields)}; recordSeq={row.get('recordSeq')!r}; "
+                f"sourceRowIndex={source_row_index})"
+            )
 
         # 磁力计场景检测器：前 500 帧采集 std 中位数，判定一次场景（分析层）
         if adaptive_gravity and frame.mag is not None and not scenario_decided:
@@ -2111,7 +2253,7 @@ def replay(
                 scenario_is_subway = median_std >= 2.5
                 scenario_decided = True
                 estimator.use_sys_gravity = (not scenario_is_subway) and (frame.sys_gravity is not None)
-                replay_events.append({
+                record_event({
                     "t": timestamp_ms,
                     "event": "adaptive_gravity_decided",
                     "medianStd": median_std,
@@ -2121,7 +2263,7 @@ def replay(
 
         output = estimator.ingest(frame)
         if strict_start and output.calibration_count == 1 and output.calibration_rejected:
-            replay_events.append({
+            record_event({
                 "t": timestamp_ms,
                 "event": "start_rejected",
                 "speedKmh": output.speed_kmh,
@@ -2134,18 +2276,18 @@ def replay(
         if parking_result > 0:
             has_gnss_anchor = True
             gnss_anchor_usable = True
-            replay_events.append({
+            record_event({
                 "t": timestamp_ms,
                 "event": "parking_calibration_replay_success",
                 "speedKmh": output.speed_kmh,
             })
         elif parking_result < 0:
-            replay_events.append({
+            record_event({
                 "t": timestamp_ms,
                 "event": "parking_calibration_replay_rejected",
                 "speedKmh": output.speed_kmh,
             })
-        outputs.append({
+        output_item = {
             "timestampMs": output.timestamp_ms,
             "sourceRowIndex": source_row_index,
             "recordSeq": row.get("recordSeq"),
@@ -2166,8 +2308,14 @@ def replay(
             "mainAxisY": output.main_axis[1],
             "mainAxisZ": output.main_axis[2],
             "calibrationRejected": output.calibration_rejected,
-            "secondsSinceCalibration": (output.timestamp_ms - estimator.last_calibration_ms) / 1000.0,
-        })
+            "secondsSinceCalibration": (
+                estimator.logical_timestamp_ms - estimator.last_calibration_ms
+            ) / 1000.0,
+        }
+        if output_sink is not None:
+            output_sink(output_item)
+        if collect_outputs:
+            outputs.append(output_item)
         estimator.set_pure_mode(
             0 if has_gnss_anchor and gnss_anchor_usable else 1
         )
@@ -2409,6 +2557,394 @@ def diff_stats(values: List[float]) -> Dict[str, float]:
     }
 
 
+@dataclass
+class StreamingRunMeta:
+    run_id: str
+    run_key: int
+    run_order: int
+    source_start: int
+    source_end: int
+    timestamp_min: int
+    timestamp_max: int
+
+
+class StreamingBaselineStore:
+    """Disk-backed output index for the baseline gate's required statistics.
+
+    Sensor outputs and comparable GNSS rows are buffered in small batches and
+    then written to SQLite.  SQLite is explicitly configured to put sorting
+    work on disk, so exact medians, p90 values and wall-clock rollback ordering
+    do not require millions of Python dictionaries or a second JSONL parse.
+    """
+
+    BATCH_SIZE = 4096
+
+    def __init__(self) -> None:
+        file_descriptor, temp_name = tempfile.mkstemp(
+            prefix="metrospeed-replay-",
+            suffix=".sqlite3",
+        )
+        os.close(file_descriptor)
+        self.path = Path(temp_name)
+        self.connection: Optional[sqlite3.Connection] = None
+        try:
+            self.connection = sqlite3.connect(str(self.path))
+            self.connection.execute("PRAGMA journal_mode=OFF")
+            self.connection.execute("PRAGMA synchronous=OFF")
+            self.connection.execute("PRAGMA temp_store=FILE")
+            self.connection.execute("PRAGMA cache_size=-8192")
+            self.connection.executescript(
+                """
+                CREATE TABLE outputs (
+                    run_key INTEGER NOT NULL,
+                    source_index INTEGER NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    speed_kmh REAL NOT NULL
+                );
+                CREATE TABLE locations (
+                    source_index INTEGER NOT NULL,
+                    recorded_run_id TEXT,
+                    measurement_active INTEGER NOT NULL,
+                    callback_timestamp_ms INTEGER NOT NULL,
+                    location_timestamp_ms INTEGER NOT NULL,
+                    location_speed_kmh REAL NOT NULL
+                );
+                CREATE TABLE comparison_diffs (
+                    moving INTEGER NOT NULL,
+                    diff_kmh REAL NOT NULL
+                );
+                """
+            )
+        except Exception:
+            if self.connection is not None:
+                self.connection.close()
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+        self._output_batch: List[Tuple[int, int, int, float]] = []
+        self._location_batch: List[Tuple[int, Optional[str], int, int, int, float]] = []
+        self._diff_batch: List[Tuple[int, float]] = []
+        self._runs: List[StreamingRunMeta] = []
+        self._runs_by_id: Dict[str, StreamingRunMeta] = {}
+        self.sample_count = 0
+        self.min_speed_kmh: Optional[float] = None
+        self.max_speed_kmh: Optional[float] = None
+        self.last_speed_kmh: Optional[float] = None
+        self._finalized = False
+
+    def __enter__(self) -> "StreamingBaselineStore":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close()
+
+    def _require_connection(self) -> sqlite3.Connection:
+        if self.connection is None:
+            raise RuntimeError("streaming baseline store is closed")
+        return self.connection
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _flush_outputs(self) -> None:
+        if not self._output_batch:
+            return
+        self._require_connection().executemany(
+            "INSERT INTO outputs VALUES (?, ?, ?, ?)",
+            self._output_batch,
+        )
+        self._output_batch.clear()
+
+    def _flush_locations(self) -> None:
+        if not self._location_batch:
+            return
+        self._require_connection().executemany(
+            "INSERT INTO locations VALUES (?, ?, ?, ?, ?, ?)",
+            self._location_batch,
+        )
+        self._location_batch.clear()
+
+    def _flush_diffs(self) -> None:
+        if not self._diff_batch:
+            return
+        self._require_connection().executemany(
+            "INSERT INTO comparison_diffs VALUES (?, ?)",
+            self._diff_batch,
+        )
+        self._diff_batch.clear()
+
+    def observe_row(self, source_row_index: int, row: Dict[str, Any]) -> None:
+        if not location_row_is_comparable(row):
+            return
+        callback_timestamp_ms = int(row["timestampMs"])
+        location_time_value = row.get("locationTimeMs")
+        if location_time_value is None:
+            location_timestamp_ms = callback_timestamp_ms
+        else:
+            parsed_location_time = parse_number(row, "locationTimeMs")
+            if parsed_location_time is None or not parsed_location_time.is_integer():
+                raise ValueError("locationTimeMs must be a finite integer")
+            location_timestamp_ms = int(parsed_location_time)
+            if location_timestamp_ms == 0:
+                location_timestamp_ms = callback_timestamp_ms
+        location_speed_mps = parse_number(row, "locationSpeedMps")
+        if location_speed_mps is None:
+            return
+        recorded_run_value = row.get("measurementRunId")
+        recorded_run_id = (
+            str(recorded_run_value)
+            if recorded_run_value not in (None, "")
+            else None
+        )
+        self._location_batch.append((
+            source_row_index,
+            recorded_run_id,
+            0 if row.get("measurementActive") is False else 1,
+            callback_timestamp_ms,
+            location_timestamp_ms,
+            location_speed_mps * 3.6,
+        ))
+        if len(self._location_batch) >= self.BATCH_SIZE:
+            self._flush_locations()
+
+    def add_output(self, item: Dict[str, Any]) -> None:
+        source_index = int(item["sourceRowIndex"])
+        timestamp_ms = int(item["timestampMs"])
+        speed_kmh = float(item["speedKmh"])
+        run_value = item.get("measurementRunId")
+        run_id = str(run_value) if run_value not in (None, "") else "__legacy_single_run__"
+        run = self._runs_by_id.get(run_id)
+        if run is None:
+            run = StreamingRunMeta(
+                run_id=run_id,
+                run_key=len(self._runs),
+                run_order=len(self._runs),
+                source_start=source_index,
+                source_end=source_index,
+                timestamp_min=timestamp_ms,
+                timestamp_max=timestamp_ms,
+            )
+            self._runs.append(run)
+            self._runs_by_id[run_id] = run
+        else:
+            run.source_start = min(run.source_start, source_index)
+            run.source_end = max(run.source_end, source_index)
+            run.timestamp_min = min(run.timestamp_min, timestamp_ms)
+            run.timestamp_max = max(run.timestamp_max, timestamp_ms)
+
+        self._output_batch.append((run.run_key, source_index, timestamp_ms, speed_kmh))
+        if len(self._output_batch) >= self.BATCH_SIZE:
+            self._flush_outputs()
+        self.sample_count += 1
+        self.min_speed_kmh = (
+            speed_kmh
+            if self.min_speed_kmh is None
+            else min(self.min_speed_kmh, speed_kmh)
+        )
+        self.max_speed_kmh = (
+            speed_kmh
+            if self.max_speed_kmh is None
+            else max(self.max_speed_kmh, speed_kmh)
+        )
+        self.last_speed_kmh = speed_kmh
+
+    def finalize(self) -> None:
+        if self._finalized:
+            return
+        connection = self._require_connection()
+        self._flush_outputs()
+        self._flush_locations()
+        connection.commit()
+        connection.execute(
+            "CREATE INDEX outputs_run_time ON outputs "
+            "(run_key, timestamp_ms, source_index)"
+        )
+        connection.execute("CREATE INDEX outputs_speed ON outputs (speed_kmh)")
+        connection.commit()
+        self._finalized = True
+
+    def _ordered_speed(self, offset: int) -> float:
+        row = self._require_connection().execute(
+            "SELECT speed_kmh FROM outputs ORDER BY speed_kmh LIMIT 1 OFFSET ?",
+            (offset,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("speed quantile offset is outside the replay output")
+        return float(row[0])
+
+    def speed_summary(self) -> Dict[str, float]:
+        self.finalize()
+        if self.sample_count <= 0:
+            return {}
+        middle = self.sample_count // 2
+        if self.sample_count % 2:
+            median = self._ordered_speed(middle)
+        else:
+            median = (
+                self._ordered_speed(middle - 1) + self._ordered_speed(middle)
+            ) / 2.0
+        p90_offset = round((self.sample_count - 1) * 0.9)
+        return {
+            "minKmh": float(self.min_speed_kmh),
+            "medianKmh": median,
+            "p90Kmh": self._ordered_speed(p90_offset),
+            "maxKmh": float(self.max_speed_kmh),
+            "lastKmh": float(self.last_speed_kmh),
+        }
+
+    def _select_run(
+        self,
+        source_index: int,
+        recorded_run_id: Optional[str],
+        callback_timestamp_ms: int,
+    ) -> Optional[StreamingRunMeta]:
+        if recorded_run_id is not None:
+            return self._runs_by_id.get(recorded_run_id)
+        source_candidates = [
+            run for run in self._runs
+            if run.source_start <= source_index <= run.source_end
+        ]
+        if len(source_candidates) == 1:
+            return source_candidates[0]
+        future_runs = [
+            run for run in self._runs if run.source_start >= source_index
+        ]
+        if future_runs:
+            return min(future_runs, key=lambda run: run.source_start)
+        past_runs = [
+            run for run in self._runs if run.source_end <= source_index
+        ]
+        if past_runs:
+            return max(past_runs, key=lambda run: run.source_end)
+        timestamp_candidates = [
+            run for run in self._runs
+            if run.timestamp_min <= callback_timestamp_ms <= run.timestamp_max
+        ]
+        return timestamp_candidates[0] if len(timestamp_candidates) == 1 else None
+
+    def _interpolate_speed(
+        self,
+        run_key: int,
+        target_timestamp_ms: int,
+    ) -> Optional[float]:
+        connection = self._require_connection()
+        exact = connection.execute(
+            "SELECT speed_kmh FROM outputs "
+            "WHERE run_key = ? AND timestamp_ms = ? "
+            "ORDER BY source_index LIMIT 1",
+            (run_key, target_timestamp_ms),
+        ).fetchone()
+        if exact is not None:
+            return float(exact[0])
+        before = connection.execute(
+            "SELECT timestamp_ms, speed_kmh FROM outputs "
+            "WHERE run_key = ? AND timestamp_ms < ? "
+            "ORDER BY timestamp_ms DESC, source_index DESC LIMIT 1",
+            (run_key, target_timestamp_ms),
+        ).fetchone()
+        after = connection.execute(
+            "SELECT timestamp_ms, speed_kmh FROM outputs "
+            "WHERE run_key = ? AND timestamp_ms > ? "
+            "ORDER BY timestamp_ms, source_index LIMIT 1",
+            (run_key, target_timestamp_ms),
+        ).fetchone()
+        if before is None or after is None:
+            return None
+        before_timestamp = int(before[0])
+        after_timestamp = int(after[0])
+        if after_timestamp == before_timestamp:
+            return float(after[1])
+        fraction = (
+            (target_timestamp_ms - before_timestamp)
+            / (after_timestamp - before_timestamp)
+        )
+        return float(before[1]) + (float(after[1]) - float(before[1])) * fraction
+
+    def _comparison_stats(self, moving_only: bool) -> Dict[str, float]:
+        connection = self._require_connection()
+        where_clause = "WHERE moving = 1" if moving_only else ""
+        aggregate = connection.execute(
+            "SELECT COUNT(*), AVG(diff_kmh), AVG(ABS(diff_kmh)), "
+            f"MAX(ABS(diff_kmh)) FROM comparison_diffs {where_clause}"
+        ).fetchone()
+        count = int(aggregate[0]) if aggregate is not None else 0
+        if count <= 0 or aggregate is None:
+            return {}
+        p90_offset = round((count - 1) * 0.9)
+        p90 = connection.execute(
+            "SELECT ABS(diff_kmh) FROM comparison_diffs "
+            f"{where_clause} ORDER BY ABS(diff_kmh) LIMIT 1 OFFSET ?",
+            (p90_offset,),
+        ).fetchone()
+        if p90 is None:
+            raise RuntimeError("comparison quantile offset is outside the replay output")
+        return {
+            "count": count,
+            "biasKmh": float(aggregate[1]),
+            "maeKmh": float(aggregate[2]),
+            "p90AbsKmh": float(p90[0]),
+            "maxAbsKmh": float(aggregate[3]),
+        }
+
+    def location_comparison(self, lag_ms: int) -> Dict[str, Any]:
+        self.finalize()
+        connection = self._require_connection()
+        connection.execute("DELETE FROM comparison_diffs")
+        connection.commit()
+        paired = 0
+        locations = connection.execute(
+            "SELECT source_index, recorded_run_id, measurement_active, "
+            "callback_timestamp_ms, location_timestamp_ms, location_speed_kmh "
+            "FROM locations ORDER BY source_index"
+        )
+        for (
+            source_index,
+            recorded_run_id,
+            measurement_active,
+            callback_timestamp_ms,
+            location_timestamp_ms,
+            location_speed_kmh,
+        ) in locations:
+            if int(measurement_active) == 0:
+                continue
+            run = self._select_run(
+                int(source_index),
+                str(recorded_run_id) if recorded_run_id is not None else None,
+                int(callback_timestamp_ms),
+            )
+            if run is None:
+                continue
+            estimated_speed_kmh = self._interpolate_speed(
+                run.run_key,
+                int(location_timestamp_ms) - lag_ms,
+            )
+            if estimated_speed_kmh is None:
+                continue
+            location_speed = float(location_speed_kmh)
+            diff = estimated_speed_kmh - location_speed
+            self._diff_batch.append((1 if location_speed >= 3.0 else 0, diff))
+            if len(self._diff_batch) >= self.BATCH_SIZE:
+                self._flush_diffs()
+            paired += 1
+        self._flush_diffs()
+        connection.commit()
+        return {
+            "lagMs": lag_ms,
+            "all": self._comparison_stats(False),
+            "moving": self._comparison_stats(True),
+            "pairedLocationRows": paired,
+        }
+
+
 def compare_bucketed(
     rows: List[Dict[str, Any]],
     outputs: List[Dict[str, Any]],
@@ -2432,14 +2968,26 @@ def compare_bucketed(
             value["runOrder"],
         ),
     ):
+        processing_samples = series["items"]
+        processing_sec_since_cals = [
+            float(item.get("secondsSinceCalibration", 0))
+            for item in processing_samples
+        ]
+        current_cal = next_calibration_index
+        calibration_index_by_item: Dict[int, float] = {}
+        for index, item in enumerate(processing_samples):
+            if (
+                index > 0
+                and processing_sec_since_cals[index - 1]
+                - processing_sec_since_cals[index]
+                > 1.0
+            ):
+                current_cal += 1
+            calibration_index_by_item[id(item)] = float(current_cal)
+
         samples = series["timeItems"]
         sec_since_cals = [float(item.get("secondsSinceCalibration", 0)) for item in samples]
-        cal_indices_f = [float(next_calibration_index)] * len(samples)
-        current_cal = next_calibration_index
-        for i in range(1, len(samples)):
-            if sec_since_cals[i - 1] - sec_since_cals[i] > 1.0:
-                current_cal += 1
-            cal_indices_f[i] = float(current_cal)
+        cal_indices_f = [calibration_index_by_item[id(item)] for item in samples]
         series["secondsSinceCalibration"] = sec_since_cals
         series["calibrationIndices"] = cal_indices_f
         next_calibration_index = current_cal + 1
@@ -3242,6 +3790,89 @@ def estimator_default_kwargs() -> Dict[str, Any]:
     return defaults
 
 
+def analyze_replay_path_streaming_baseline(
+    path: Path,
+    estimator_kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    strict_start: bool = True,
+    infer_start_from_sensor: bool = True,
+    adaptive_gravity: bool = False,
+    gnss_lag_ms: int = 0,
+    allow_truncated_tail: bool = False,
+) -> Tuple[Dict[str, Any], JsonlReadInfo]:
+    """Run the pure-inertial baseline gate without retaining sensor-scale objects.
+
+    This intentionally returns only fields consumed by `_baseline_all.py`.  It is
+    not an output-JSONL path and it does not replace the richer interactive
+    analysis, anchor analysis, lag scans or recorded-estimator diagnostics.
+    """
+    effective_estimator_kwargs = estimator_default_kwargs()
+    if estimator_kwargs:
+        unknown = set(estimator_kwargs) - set(effective_estimator_kwargs)
+        if unknown:
+            raise ValueError(f"unknown estimator parameters: {sorted(unknown)}")
+        effective_estimator_kwargs.update(estimator_kwargs)
+    replay_config = {
+        **effective_estimator_kwargs,
+        "strict_start": strict_start,
+        "infer_start_from_sensor": infer_start_from_sensor,
+        "adaptive_gravity": adaptive_gravity,
+    }
+    estimator_parity = replay_config_matches_app(replay_config)
+    stream = ValidatedJsonlRows(
+        path,
+        allow_truncated_tail=allow_truncated_tail,
+    )
+    with StreamingBaselineStore() as store:
+        def observed_rows() -> Iterator[Dict[str, Any]]:
+            for source_row_index, row in enumerate(stream):
+                store.observe_row(source_row_index, row)
+                yield row
+
+        replay(
+            observed_rows(),
+            strict_start=strict_start,
+            infer_start_from_sensor=infer_start_from_sensor,
+            adaptive_gravity=adaptive_gravity,
+            output_sink=store.add_output,
+            collect_outputs=False,
+            collect_events=False,
+            **effective_estimator_kwargs,
+        )
+        read_info = stream.finish()
+        if store.sample_count <= 0:
+            raise ValueError("replay produced no sensor samples")
+        summary: Dict[str, Any] = {
+            "algorithmVersion": ALGORITHM_VERSION,
+            "analysisMode": "streamingBaseline",
+            "replayConfig": {
+                **replay_config,
+                "estimatorParity": estimator_parity,
+                "anchorParity": False,
+                "appParity": False,
+                "appParityDeprecated": True,
+                "appConfigParity": False,
+                "crossRuntimeParity": "not_verified",
+                "anchorOptions": {
+                    "enabled": False,
+                    "pureZero": False,
+                    "anchorPower": 1.0,
+                    "anchorIntervalMs": 0,
+                    "comparisonGnssLagMs": gnss_lag_ms,
+                },
+                "note": (
+                    "streamingBaseline preserves the complete pure-inertial "
+                    "replay and GNSS comparison required by _baseline_all.py; "
+                    "richer optional analyses are intentionally omitted"
+                ),
+            },
+            "sensorSamples": store.sample_count,
+            "speed": store.speed_summary(),
+            "locationComparison": store.location_comparison(gnss_lag_ms),
+        }
+        return summary, read_info
+
+
 def analyze_replay_rows(
     rows: List[Dict[str, Any]],
     estimator_kwargs: Optional[Dict[str, Any]] = None,
@@ -3370,13 +4001,17 @@ def write_jsonl_atomic(path: Path, outputs: List[Dict[str, Any]]) -> None:
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+        handle = os.fdopen(fd, "w", encoding="utf-8", newline="")
+        fd = -1
+        with handle:
             for item in outputs:
                 handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
     finally:
+        if fd >= 0:
+            os.close(fd)
         try:
             Path(temp_name).unlink()
         except FileNotFoundError:
@@ -3404,6 +4039,11 @@ def main() -> int:
         "--skip-bucketed-comparison",
         action="store_true",
         help="Internal fast path: omit calibration-decay bucket fields from the summary.",
+    )
+    parser.add_argument(
+        "--streaming-baseline-summary",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--no-strict-start", action="store_true", help="Do not abort when current app would reject initial calibration.")
     parser.add_argument("--curve-positive-scale", type=float, default=0.35, help="Scale positive acceleration while in curve state.")
@@ -3506,18 +4146,32 @@ def main() -> int:
     validate_cli_args(args, parser)
     if args.out is not None and paths_refer_to_same_file(args.jsonl, args.out):
         parser.error("--out must not refer to the input JSONL file")
+    if args.streaming_baseline_summary:
+        if args.out is not None:
+            parser.error("--streaming-baseline-summary cannot be combined with --out")
+        if args.anchor_v2 or args.pure_zero:
+            parser.error(
+                "--streaming-baseline-summary currently supports pure-inertial mode only"
+            )
+        if not args.skip_lag_scans or not args.skip_bucketed_comparison:
+            parser.error(
+                "--streaming-baseline-summary requires --skip-lag-scans "
+                "and --skip-bucketed-comparison"
+            )
     curve_negative_scale = args.curve_negative_scale
     low_confidence_negative_scale = args.low_confidence_negative_scale
 
-    try:
-        rows, read_info = read_jsonl_with_info(
-            args.jsonl,
-            allow_truncated_tail=args.allow_truncated_tail,
-        )
-    except (OSError, ValueError) as error:
-        parser.error(str(error))
-    if not rows:
-        parser.error("input JSONL contains no records")
+    rows: List[Dict[str, Any]] = []
+    if not args.streaming_baseline_summary:
+        try:
+            rows, read_info = read_jsonl_with_info(
+                args.jsonl,
+                allow_truncated_tail=args.allow_truncated_tail,
+            )
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        if not rows:
+            parser.error("input JSONL contains no records")
 
     estimator_parameter_names = {
         name for name in inspect.signature(SpeedEstimator.__init__).parameters
@@ -3531,23 +4185,43 @@ def main() -> int:
     estimator_kwargs["low_confidence_negative_scale"] = low_confidence_negative_scale
     estimator_kwargs["use_vibration_guard"] = not args.no_vibration_guard
 
-    summary, outputs = analyze_replay_rows(
-        rows,
-        estimator_kwargs,
-        strict_start=not args.no_strict_start,
-        infer_start_from_sensor=not args.no_infer_start,
-        adaptive_gravity=args.adaptive_gravity,
-        use_anchor_v2=args.anchor_v2,
-        anchor_power=args.anchor_power,
-        pure_zero=args.pure_zero,
-        gnss_lag_ms=args.gnss_lag_ms,
-        anchor_interval_ms=args.anchor_interval_ms,
-        include_lag_scans=not args.skip_lag_scans,
-        include_bucketed_comparison=not args.skip_bucketed_comparison,
-    )
-    if not outputs:
-        parser.error("replay produced no sensor samples")
-    summary["inputIntegrity"] = read_info.summary(args.allow_truncated_tail)
+    try:
+        if args.streaming_baseline_summary:
+            summary, read_info = analyze_replay_path_streaming_baseline(
+                args.jsonl,
+                estimator_kwargs,
+                strict_start=not args.no_strict_start,
+                infer_start_from_sensor=not args.no_infer_start,
+                adaptive_gravity=args.adaptive_gravity,
+                gnss_lag_ms=args.gnss_lag_ms,
+                allow_truncated_tail=args.allow_truncated_tail,
+            )
+            outputs: List[Dict[str, Any]] = []
+        else:
+            summary, outputs = analyze_replay_rows(
+                rows,
+                estimator_kwargs,
+                strict_start=not args.no_strict_start,
+                infer_start_from_sensor=not args.no_infer_start,
+                adaptive_gravity=args.adaptive_gravity,
+                use_anchor_v2=args.anchor_v2,
+                anchor_power=args.anchor_power,
+                pure_zero=args.pure_zero,
+                gnss_lag_ms=args.gnss_lag_ms,
+                anchor_interval_ms=args.anchor_interval_ms,
+                include_lag_scans=not args.skip_lag_scans,
+                include_bucketed_comparison=not args.skip_bucketed_comparison,
+            )
+            if not outputs:
+                raise ValueError("replay produced no sensor samples")
+        summary["inputIntegrity"] = read_info.summary(args.allow_truncated_tail)
+        summary_text = json.dumps(summary, ensure_ascii=False, indent=2)
+        if args.out is not None:
+            write_jsonl_atomic(args.out, outputs)
+    except Exception as error:
+        # Command-line data and destination failures must remain concise so batch
+        # runners never have to scrape Python tracebacks.
+        parser.error(f"replay failed: {error}")
 
     if read_info.complete is False:
         if read_info.ignored_tail_line_number is not None:
@@ -3565,9 +4239,7 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    if args.out is not None:
-        write_jsonl_atomic(args.out, outputs)
+    print(summary_text)
     return 0
 
 

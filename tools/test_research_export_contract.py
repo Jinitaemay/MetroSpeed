@@ -64,6 +64,56 @@ class ResearchExportContractTests(unittest.TestCase):
         self.assertIn("SESSION_LOG_SUFFIX", target_body)
         self.assertNotIn("LEGACY_TEMP_LOG_FILE_NAME", target_body)
 
+    def test_write_failure_keeps_the_primary_error_and_never_recursively_closes(self) -> None:
+        flush_begin = self.source.index("private flushWriteBuffer")
+        flush_end = self.source.index("\n  private markWriteFailure", flush_begin)
+        flush_body = self.source[flush_begin:flush_end]
+        failure_begin = self.source.index("private markWriteFailure")
+        failure_end = self.source.index("\n  private newSessionTarget", failure_begin)
+        failure_body = self.source[failure_begin:failure_end]
+        sync_begin = self.source.index("private flushTempLogFile")
+        sync_end = self.source.index("\n  private emitExportProgress", sync_begin)
+        sync_body = self.source[sync_begin:sync_end]
+        raw_close_begin = self.source.index("private closeTempLogHandle")
+        raw_close_end = self.source.index("\n  private closeTempLogFile", raw_close_begin)
+        raw_close_body = self.source[raw_close_begin:raw_close_end]
+
+        self.assertIn("this.markWriteFailure('record file write failed');", flush_body)
+        self.assertIn("this.closeTempLogHandle()", flush_body)
+        self.assertNotIn("this.closeTempLogFile()", flush_body)
+        self.assertIn("if (this.writeFailed) {", failure_body)
+        self.assertLess(
+            failure_body.index("if (this.writeFailed) {"),
+            failure_body.index("this.lastExportPath = message;"),
+        )
+        self.assertIn("if (!this.tempLogFile || this.writeFailed)", sync_body)
+        self.assertNotIn("this.closeTempLogFile()", sync_body)
+        self.assertIn("this.tempLogFile = undefined;", raw_close_body)
+        self.assertIn("fs.closeSync(file);", raw_close_body)
+        self.assertIn("this.tempLogFile = file;", raw_close_body)
+
+        start_begin = self.source.index("start(timestampMs:")
+        start_end = self.source.index("\n  stop(timestampMs:", start_begin)
+        start_body = self.source[start_begin:start_end]
+        self.assertIn("if (!this.closeTempLogFile())", start_body)
+        self.assertLess(
+            start_body.index("if (!this.closeTempLogFile())"),
+            start_body.index("this.newSessionTarget(timestampMs)"),
+        )
+
+    def test_periodic_records_recover_immediately_from_wall_clock_rollback(self) -> None:
+        estimator_begin = self.source.index("updateEstimator(sample:")
+        estimator_end = self.source.index("\n  markEvent(", estimator_begin)
+        estimator_body = self.source[estimator_begin:estimator_end]
+        self.assertIn("elapsedSinceEstimatorRecordMs >= 0", estimator_body)
+        self.assertIn("elapsedSinceEstimatorRecordMs < ESTIMATOR_RECORD_INTERVAL_MS", estimator_body)
+
+        health_begin = self.source.index("private maybeAppendDeviceHealthRecord")
+        health_end = self.source.index("\n  private appendDeviceHealthRecord", health_begin)
+        health_body = self.source[health_begin:health_end]
+        self.assertIn("elapsedSinceDeviceHealthMs >= 0", health_body)
+        self.assertIn("elapsedSinceDeviceHealthMs < DEVICE_HEALTH_RECORD_INTERVAL_MS", health_body)
+
     def test_failed_session_start_restores_the_previous_exportable_log(self) -> None:
         rollback_begin = self.source.index("private rollbackFailedSessionStart")
         rollback_end = self.source.index("\n  private integrityMarkerPath", rollback_begin)

@@ -207,6 +207,67 @@ class ReplayJsonlTruncatedTailTests(unittest.TestCase):
                 self.assertIn(expected_error, result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
+    def test_excessive_json_nesting_fails_cli_without_traceback(self) -> None:
+        nested_row = (
+            '{"recordType":"event","timestampMs":1001,"payload":'
+            + "[" * 5000
+            + "0"
+            + "]" * 5000
+            + "}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "deep.jsonl"
+            path.write_text(
+                json.dumps(VALID_SENSOR_ROW, separators=(",", ":"))
+                + "\n"
+                + nested_row,
+                encoding="utf-8",
+            )
+
+            result = self.run_cli(path)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("JSONL nesting is too deep", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_invalid_parking_event_field_fails_cli_without_traceback(self) -> None:
+        rows = [
+            VALID_SENSOR_ROW,
+            {
+                "recordType": "event",
+                "timestampMs": 1001,
+                "event": "停车校准请求",
+                "locationSpeedMps": {"invalid": True},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid-event.jsonl"
+            path.write_bytes(b"\n".join(encoded_row(row) for row in rows))
+
+            result = self.run_cli(path)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "parking calibration event locationSpeedMps must be a finite number",
+            result.stderr,
+        )
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_output_failure_is_controlled_and_does_not_print_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            path = temp_path / "input.jsonl"
+            path.write_bytes(encoded_row(VALID_SENSOR_ROW))
+            parent_file = temp_path / "not-a-directory"
+            parent_file.write_text("occupied", encoding="utf-8")
+
+            result = self.run_cli(path, "--out", str(parent_file / "output.jsonl"))
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("replay failed:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_schema_less_valid_json_has_unknown_structural_completeness(self) -> None:
         final_row = {"recordType": "event", "timestampMs": 1001}
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -248,6 +309,40 @@ class ReplayJsonlTruncatedTailTests(unittest.TestCase):
         issues = read_info.structure["issues"]
         self.assertIn("last row is not stop_record", issues)
         self.assertIn("stop_record count is 0, expected 1", issues)
+
+    def test_supported_session_rejects_invalid_required_sensor_fields(self) -> None:
+        sensor = {
+            **protocol_row(2, "sensor"),
+            "measurementActive": True,
+            "accX": "invalid",
+            "accY": 0.0,
+            "accZ": 9.80665,
+        }
+        rows = [
+            protocol_row(1, "lifecycle", "start_record"),
+            sensor,
+            protocol_row(3, "lifecycle", "stop_record"),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid-sensor.jsonl"
+            path.write_bytes(b"\n".join(encoded_row(row) for row in rows))
+
+            _, read_info = read_jsonl_with_info(path)
+            result = self.run_cli(path)
+
+        self.assertFalse(read_info.complete)
+        self.assertEqual(read_info.status, "incomplete_structure")
+        self.assertEqual(
+            read_info.structure["sensorPayload"]["invalidRequiredAccelerationCount"],
+            1,
+        )
+        self.assertIn(
+            "sensor rows with invalid required acceleration fields: 1",
+            read_info.structure["issues"],
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("sensor row has invalid required acceleration fields", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_supported_session_is_complete_without_final_newline(self) -> None:
         rows = [
@@ -294,9 +389,12 @@ class ReplayJsonlTruncatedTailTests(unittest.TestCase):
         for schema in (14, 15, 16, 17):
             with self.subTest(schema=schema), tempfile.TemporaryDirectory() as temp_dir:
                 middle_type = "sensor" if schema == 14 else "sensor_callback"
+                middle = protocol_row(2, middle_type, schema=schema)
+                if middle_type == "sensor":
+                    middle.update({"accX": 0.0, "accY": 0.0, "accZ": 9.80665})
                 rows = [
                     protocol_row(1, "lifecycle", "start_record", schema=schema),
-                    protocol_row(2, middle_type, schema=schema),
+                    middle,
                     protocol_row(3, "lifecycle", "stop_record", schema=schema),
                 ]
                 path = Path(temp_dir) / f"schema-{schema}.jsonl"

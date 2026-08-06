@@ -34,6 +34,7 @@ interface PreCalFrame {
 interface FrameTiming {
   deltaSeconds: number;
   elapsedSeconds: number;
+  clockElapsedSeconds: number;
   continuous: boolean;
 }
 
@@ -43,6 +44,7 @@ const PRE_CAL_BUFFER_SECONDS = 3.6;
 const PRE_CAL_MAX_FRAMES = 800;
 const PARKING_WINDOW_SECONDS = 1.5;
 const PARKING_WINDOW_MIN_SAMPLES = 30;
+const PARKING_WINDOW_MAX_AGE_MS = 300;
 const MOTION_WINDOW_MIN_SECONDS = 0.4;
 const MOTION_WINDOW_MAX_SECONDS = 1.6;
 const MOTION_WINDOW_MAX_FRAMES = 400;
@@ -51,6 +53,8 @@ const DEPARTURE_EVIDENCE_SECONDS = 0.06;
 export class SpeedEstimator {
   private running: boolean = false;
   private startMs: number = 0;
+  private logicalTimestampMs: number = 0;
+  private logicalClockInitialized: boolean = false;
   private lastTimestampMs: number = 0;
   private lastSensorTimestampNs: number | null = null;
   private velocityMps: number = 0;
@@ -85,6 +89,7 @@ export class SpeedEstimator {
   private parkingCalibrationSuccessUntilMs: number = 0;
   private parkingCalibrationResult: number = 0;
   private parkingCalibrationRequestMs: number = 0;
+  private parkingCalibrationEvidenceReferenceMs: number = 0;
   private parkingCalibrationPreviousMs: number = 0;
   private parkingCalibrationSnapshot: PreCalFrame[] = [];
   private parkingPostRequestFrames: PreCalFrame[] = [];
@@ -109,7 +114,9 @@ export class SpeedEstimator {
 
   start(timestampMs: number): RunStats {
     this.running = true;
-    this.startMs = timestampMs;
+    this.startMs = 0;
+    this.logicalTimestampMs = 0;
+    this.logicalClockInitialized = false;
     this.lastTimestampMs = timestampMs;
     this.lastSensorTimestampNs = null;
     this.lastValidDeltaSeconds = REFERENCE_SAMPLE_SECONDS;
@@ -133,17 +140,18 @@ export class SpeedEstimator {
     this.parkingCalibrationSuccessUntilMs = 0;
     this.parkingCalibrationResult = 0;
     this.parkingCalibrationRequestMs = 0;
+    this.parkingCalibrationEvidenceReferenceMs = 0;
     this.parkingCalibrationPreviousMs = 0;
     this.parkingCalibrationSnapshot = [];
     this.parkingPostRequestFrames = [];
     this.lastRawAcceleration = undefined;
     this.initialCalibrationDone = false;
-    this.beginCalibration(timestampMs);
-    return this.currentStats(timestampMs, '校准中，请保持设备静止');
+    this.beginCalibration(this.logicalTimestampMs);
+    return this.currentStats(this.logicalTimestampMs, '校准中，请保持设备静止');
   }
 
   stop(timestampMs: number): RunStats {
-    const stats = this.currentStats(timestampMs, '已停止');
+    const stats = this.currentStats(this.logicalTimestampMs, '已停止');
     this.running = false;
     this.motionState = MotionState.Stopped;
     this.velocityMps = 0;
@@ -155,6 +163,7 @@ export class SpeedEstimator {
     this.parkingCalibrationSuccessUntilMs = 0;
     this.parkingCalibrationResult = 0;
     this.parkingCalibrationRequestMs = 0;
+    this.parkingCalibrationEvidenceReferenceMs = 0;
     this.parkingCalibrationPreviousMs = 0;
     this.parkingCalibrationSnapshot = [];
     this.parkingPostRequestFrames = [];
@@ -175,7 +184,9 @@ export class SpeedEstimator {
 
   reset(timestampMs: number): RunStats {
     this.running = false;
-    this.startMs = timestampMs;
+    this.startMs = 0;
+    this.logicalTimestampMs = 0;
+    this.logicalClockInitialized = false;
     this.lastTimestampMs = timestampMs;
     this.lastSensorTimestampNs = null;
     this.lastValidDeltaSeconds = REFERENCE_SAMPLE_SECONDS;
@@ -208,16 +219,27 @@ export class SpeedEstimator {
     this.parkingCalibrationSuccessUntilMs = 0;
     this.parkingCalibrationResult = 0;
     this.parkingCalibrationRequestMs = 0;
+    this.parkingCalibrationEvidenceReferenceMs = 0;
     this.parkingCalibrationPreviousMs = 0;
     this.parkingCalibrationSnapshot = [];
     this.parkingPostRequestFrames = [];
     this.lastRawAcceleration = undefined;
     this.preCalBuffer = [];
     this.initialCalibrationDone = false;
-    return this.currentStats(timestampMs, '等待开始');
+    return this.currentStats(this.logicalTimestampMs, '等待开始');
   }
 
-  calibrateAtStop(timestampMs: number): RunStats {
+  calibrateAtStop(actionTimestampMs: number): RunStats {
+    // The estimator clock is sensor-driven, but a button press can arrive after
+    // callbacks have paused. Carry just enough bounded wall-clock delay into the
+    // evidence reference to reject stale samples without allowing a system-clock
+    // jump to advance the run clock or calibration deadlines.
+    const actionDelayMs = actionTimestampMs - this.lastTimestampMs;
+    const boundedActionDelayMs = Number.isFinite(actionDelayMs) &&
+      actionDelayMs >= 0 && actionDelayMs <= PARKING_WINDOW_MAX_AGE_MS
+      ? actionDelayMs
+      : PARKING_WINDOW_MAX_AGE_MS + 1;
+    const timestampMs = this.logicalTimestampMs;
     if (!this.initialCalibrationDone) {
       return this.currentStats(timestampMs, '请等待初始校准完成');
     }
@@ -229,6 +251,7 @@ export class SpeedEstimator {
     this.parkingCalibrationSuccessUntilMs = 0;
     this.parkingCalibrationResult = 0;
     this.parkingCalibrationRequestMs = timestampMs;
+    this.parkingCalibrationEvidenceReferenceMs = timestampMs + boundedActionDelayMs;
     this.parkingCalibrationPreviousMs = this.lastCalibrationMs;
     // Freeze the evidence available at click time. Waiting for the 1.5s result must
     // not let high-rate post-click callbacks evict the stationary window.
@@ -243,10 +266,16 @@ export class SpeedEstimator {
 
   ingest(frame: SensorFrame): EstimatorFrame {
     if (!this.running) {
-      return this.makeFrame(frame, this.currentStats(frame.timestampMs, '等待开始'));
+      return this.makeFrame(frame, this.currentStats(this.logicalTimestampMs, '等待开始'));
     }
 
     const timing = this.computeFrameTiming(frame);
+    if (this.logicalClockInitialized) {
+      this.logicalTimestampMs += timing.clockElapsedSeconds * 1000;
+    } else {
+      this.logicalClockInitialized = true;
+    }
+    const timestampMs = this.logicalTimestampMs;
     const dt = timing.deltaSeconds;
     const rawAcceleration = frame.acceleration;
     if (!timing.continuous) {
@@ -258,7 +287,7 @@ export class SpeedEstimator {
       if (!this.initialCalibrationDone && !this.parkingCalibrationPending) {
         // A partially collected initial calibration is not continuous evidence.
         // Restart its timer and statistics without counting a second calibration.
-        this.resetCalibrationEvidence(frame.timestampMs);
+        this.resetCalibrationEvidence(timestampMs);
       }
     }
     const accStep = this.computeAccStep(rawAcceleration, timing.elapsedSeconds, timing.continuous);
@@ -266,13 +295,13 @@ export class SpeedEstimator {
     // Initial calibration duration is measured from the first real sensor sample.
     // This keeps calibrationCount at one and also handles a delayed first callback.
     if (!this.initialCalibrationDone && !this.parkingCalibrationPending && this.calibrationSamples === 0) {
-      this.calibrationUntilMs = frame.timestampMs + 1500;
-      this.lastCalibrationMs = frame.timestampMs;
+      this.calibrationUntilMs = timestampMs + 1500;
+      this.lastCalibrationMs = timestampMs;
     }
 
     const preCalGyro = frame.gyroscope ? magnitude(frame.gyroscope) : 0;
     const preCalFrame: PreCalFrame = {
-      timestampMs: frame.timestampMs,
+      timestampMs,
       acceleration: rawAcceleration,
       gyroMagnitude: preCalGyro,
       accStep,
@@ -288,19 +317,19 @@ export class SpeedEstimator {
       this.parkingPostRequestFrames.push(preCalFrame);
     }
 
-    if (frame.timestampMs <= this.calibrationUntilMs) {
+    if (timestampMs <= this.calibrationUntilMs) {
       const calibrationGyroMagnitude = frame.gyroscope ? magnitude(frame.gyroscope) : 0;
-      this.collectCalibration(frame.timestampMs, rawAcceleration, calibrationGyroMagnitude, accStep);
+      this.collectCalibration(timestampMs, rawAcceleration, calibrationGyroMagnitude, accStep);
       if (!this.parkingCalibrationPending) {
         return {
           sample: this.makeSample(frame.timestampMs, emptyVector()),
-          stats: this.currentStats(frame.timestampMs, '校准中，请保持设备静止'),
+          stats: this.currentStats(timestampMs, '校准中，请保持设备静止'),
           calibration: this.currentCalibration()
         };
       }
     }
 
-    this.finishCalibrationIfNeeded(frame.timestampMs);
+    this.finishCalibrationIfNeeded(timestampMs);
 
     const motionAcceleration = subtract(rawAcceleration, this.gravityEstimate);
     const clipped = clipMagnitude(motionAcceleration, 3.5);
@@ -308,7 +337,7 @@ export class SpeedEstimator {
     this.filteredAcceleration = filtered;
 
     const gyroMagnitude = frame.gyroscope ? magnitude(frame.gyroscope) : 0;
-    this.updateMainAxisLock(frame.timestampMs);
+    this.updateMainAxisLock(timestampMs);
 
     // Classify the current sample before allowing it to teach the vehicle axis.
     // The vibration evidence (acceleration step, gyro and gravity deviation) is
@@ -327,7 +356,7 @@ export class SpeedEstimator {
       timing.continuous
     );
 
-    const axisCandidateState = this.detectMotionState(forwardAcceleration, gyroMagnitude, frame.timestampMs);
+    const axisCandidateState = this.detectMotionState(forwardAcceleration, gyroMagnitude, timestampMs);
     const axisAllowed = this.shouldUpdateMainAxis(filtered, gyroMagnitude, axisCandidateState);
     if (axisAllowed) {
       this.updateMainAxis(filtered, dt);
@@ -337,7 +366,7 @@ export class SpeedEstimator {
       this.replaceLatestWindowProjection(forwardAcceleration, lateralAcceleration);
     }
 
-    const state = this.detectMotionState(forwardAcceleration, gyroMagnitude, frame.timestampMs);
+    const state = this.detectMotionState(forwardAcceleration, gyroMagnitude, timestampMs);
     const effectiveAcceleration = this.effectiveForwardAcceleration(forwardAcceleration, state);
     const previousVelocityMps = this.velocityMps;
     this.velocityMps = Math.max(0, this.velocityMps + effectiveAcceleration * dt);
@@ -345,7 +374,7 @@ export class SpeedEstimator {
 
     const speedKmh = this.velocityMps * 3.6;
     this.maxSpeedKmh = Math.max(this.maxSpeedKmh, speedKmh);
-    this.confidence = this.computeConfidence(state, gyroMagnitude, frame.timestampMs);
+    this.confidence = this.computeConfidence(state, gyroMagnitude, timestampMs);
     this.motionState = state;
     preCalFrame.integrated = true;
 
@@ -353,7 +382,7 @@ export class SpeedEstimator {
 
     return {
       sample,
-      stats: this.currentStats(frame.timestampMs, this.statusFor(state, frame.timestampMs)),
+      stats: this.currentStats(timestampMs, this.statusFor(state, timestampMs)),
       calibration: this.currentCalibration()
     };
   }
@@ -446,8 +475,8 @@ export class SpeedEstimator {
             continue;
           }
           const windowEndTimestampMs = parkingFrames[endIndex].timestampMs;
-          const windowAgeMs = this.parkingCalibrationRequestMs - windowEndTimestampMs;
-          if (windowAgeMs < 0 || windowAgeMs > 300) {
+          const windowAgeMs = this.parkingCalibrationEvidenceReferenceMs - windowEndTimestampMs;
+          if (windowAgeMs < 0 || windowAgeMs > PARKING_WINDOW_MAX_AGE_MS) {
             continue;
           }
           let sum = emptyVector();
@@ -536,6 +565,7 @@ export class SpeedEstimator {
       }
       this.parkingCalibrationPending = false;
       this.parkingCalibrationRequestMs = 0;
+      this.parkingCalibrationEvidenceReferenceMs = 0;
       this.parkingCalibrationPreviousMs = 0;
       this.parkingCalibrationSnapshot = [];
       this.parkingPostRequestFrames = [];
@@ -573,9 +603,11 @@ export class SpeedEstimator {
   private computeFrameTiming(frame: SensorFrame): FrameTiming {
     const timestampMs = frame.timestampMs;
     let rawDt = 0;
+    let sensorClockDelta = false;
     if (frame.sensorTimestamp !== null && frame.sensorTimestamp !== undefined) {
       if (this.lastSensorTimestampNs !== null && frame.sensorTimestamp > this.lastSensorTimestampNs) {
         rawDt = (frame.sensorTimestamp - this.lastSensorTimestampNs) / 1000000000;
+        sensorClockDelta = true;
       } else {
         rawDt = (timestampMs - this.lastTimestampMs) / 1000;
       }
@@ -589,16 +621,22 @@ export class SpeedEstimator {
       return {
         deltaSeconds: this.lastValidDeltaSeconds,
         elapsedSeconds: this.lastValidDeltaSeconds,
+        clockElapsedSeconds: this.lastValidDeltaSeconds,
         continuous: true
       };
     }
     const deltaSeconds = clamp(rawDt, 0.005, 0.08);
     const continuous = rawDt <= MAX_CONTINUOUS_SAMPLE_SECONDS;
     const elapsedSeconds = continuous ? rawDt : this.lastValidDeltaSeconds;
+    // Sensor timestamps are monotonic since boot. They may legitimately span a
+    // callback stall, so use their full positive gap for run/status timing while
+    // keeping integration and evidence windows clamped. A discontinuous wall-clock
+    // fallback is never allowed to jump the estimator clock.
+    const clockElapsedSeconds = continuous || sensorClockDelta ? rawDt : this.lastValidDeltaSeconds;
     if (continuous) {
       this.lastValidDeltaSeconds = deltaSeconds;
     }
-    return { deltaSeconds, elapsedSeconds, continuous };
+    return { deltaSeconds, elapsedSeconds, clockElapsedSeconds, continuous };
   }
 
   private updateMainAxisLock(timestampMs: number): void {

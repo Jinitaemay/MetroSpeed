@@ -18,8 +18,8 @@ import {
 const ESTIMATOR_RECORD_INTERVAL_MS = 500;
 const DEVICE_HEALTH_RECORD_INTERVAL_MS = 10000;
 const RECORD_SCHEMA_VERSION = 17;
-const APP_VERSION_CODE = 1786008552;
-const ALGORITHM_VERSION = 'anchor-delta-20260804-r5';
+const APP_VERSION_CODE = 1786037144;
+const ALGORITHM_VERSION = 'anchor-delta-20260807-r5';
 const LEGACY_TEMP_LOG_FILE_NAME = 'research-current.jsonl';
 const SESSION_LOG_PREFIX = 'research-session-';
 const SESSION_LOG_SUFFIX = '.jsonl';
@@ -233,7 +233,10 @@ export class ResearchRecorder {
       this.lastExportPath = '正在导出，请稍候';
       return this.status();
     }
-    this.closeTempLogFile();
+    if (!this.closeTempLogFile()) {
+      this.refreshExportableLogState();
+      return this.status();
+    }
     const preservedMeasurementRunId = this.measurementRunId;
     const preservedMeasurementActive = this.measurementActive;
     const preservedMeasurementStartMs = this.measurementStartMs;
@@ -415,7 +418,9 @@ export class ResearchRecorder {
     if (!this.running) {
       return;
     }
-    if (sample.timestampMs - this.lastEstimatorRecordMs < ESTIMATOR_RECORD_INTERVAL_MS) {
+    const elapsedSinceEstimatorRecordMs = sample.timestampMs - this.lastEstimatorRecordMs;
+    if (elapsedSinceEstimatorRecordMs >= 0 &&
+      elapsedSinceEstimatorRecordMs < ESTIMATOR_RECORD_INTERVAL_MS) {
       return;
     }
 
@@ -779,7 +784,9 @@ export class ResearchRecorder {
   }
 
   private maybeAppendDeviceHealthRecord(timestampMs: number): void {
-    if (timestampMs - this.lastDeviceHealthRecordMs < DEVICE_HEALTH_RECORD_INTERVAL_MS) {
+    const elapsedSinceDeviceHealthMs = timestampMs - this.lastDeviceHealthRecordMs;
+    if (elapsedSinceDeviceHealthMs >= 0 &&
+      elapsedSinceDeviceHealthMs < DEVICE_HEALTH_RECORD_INTERVAL_MS) {
       return;
     }
     this.appendDeviceHealthRecord(timestampMs, 'periodic');
@@ -867,16 +874,25 @@ export class ResearchRecorder {
       this.writeBuffer = [];
       this.writeBufferStartMs = 0;
     } catch (error) {
-      this.running = false;
-      this.writeFailed = true;
-      this.lastEvent = 'write_record_failed';
-      this.lastExportPath = 'record file write failed';
-      this.persistIntegrityWarning('record file write failed');
+      this.markWriteFailure('record file write failed');
       this.writeBuffer = [];
       this.writeBufferStartMs = 0;
-      this.closeTempLogFile();
+      if (!this.closeTempLogHandle()) {
+        this.markWriteFailure('record file close failed');
+      }
       this.refreshExportableLogState();
     }
+  }
+
+  private markWriteFailure(message: string): void {
+    this.running = false;
+    if (this.writeFailed) {
+      return;
+    }
+    this.writeFailed = true;
+    this.lastEvent = 'write_record_failed';
+    this.lastExportPath = message;
+    this.persistIntegrityWarning(message);
   }
 
   private newSessionTarget(timestampMs: number): SessionTarget {
@@ -1137,16 +1153,17 @@ export class ResearchRecorder {
     if (!this.tempLogFile) {
       return;
     }
+    this.flushWriteBuffer();
+    if (!this.tempLogFile || this.writeFailed) {
+      return;
+    }
     try {
-      this.flushWriteBuffer();
       fs.fsyncSync(this.tempLogFile.fd);
     } catch (error) {
-      this.running = false;
-      this.writeFailed = true;
-      this.lastEvent = 'write_record_failed';
-      this.lastExportPath = 'record file sync failed';
-      this.persistIntegrityWarning('record file sync failed');
-      this.closeTempLogFile();
+      this.markWriteFailure('record file sync failed');
+      if (!this.closeTempLogHandle()) {
+        this.markWriteFailure('record file close failed');
+      }
     }
   }
 
@@ -1288,23 +1305,32 @@ export class ResearchRecorder {
     return false;
   }
 
-  private closeTempLogFile(): void {
+  private closeTempLogHandle(): boolean {
     if (!this.tempLogFile) {
-      return;
+      return true;
     }
-    try {
-      this.flushWriteBuffer();
-      fs.closeSync(this.tempLogFile);
-    } catch (error) {
-      this.running = false;
-      this.writeFailed = true;
-      this.lastEvent = 'write_record_failed';
-      this.lastExportPath = 'record file close failed';
-      this.persistIntegrityWarning('record file close failed');
-    }
+    const file = this.tempLogFile;
     this.tempLogFile = undefined;
+    try {
+      fs.closeSync(file);
+      return true;
+    } catch (error) {
+      // Keep ownership so a later stop/start can retry instead of silently
+      // replacing the only reference to a potentially open descriptor.
+      this.tempLogFile = file;
+      return false;
+    }
+  }
+
+  private closeTempLogFile(): boolean {
+    this.flushWriteBuffer();
+    const closed = this.closeTempLogHandle();
+    if (!closed) {
+      this.markWriteFailure('record file close failed');
+    }
     this.writeBuffer = [];
     this.writeBufferStartMs = 0;
+    return closed;
   }
 
   private refreshExportableLogState(): void {

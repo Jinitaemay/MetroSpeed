@@ -5,6 +5,22 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def contrast_ratio(foreground: str, background: str) -> float:
+    def luminance(color: str) -> float:
+        channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    lighter = max(luminance(foreground), luminance(background))
+    darker = min(luminance(foreground), luminance(background))
+    return (lighter + 0.05) / (darker + 0.05)
+
+
 class ReleaseContractTests(unittest.TestCase):
     def read(self, relative_path: str) -> str:
         return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
@@ -12,6 +28,22 @@ class ReleaseContractTests(unittest.TestCase):
     def test_signing_uses_project_compatible_api(self) -> None:
         source = self.read("tools/sign_app.ps1")
         self.assertIn("Get-ProjectCompatibleApiVersion", source)
+        self.assertIn("function Get-AppVersionMetadata", source)
+        self.assertIn('$packInfoEntry = $archive.GetEntry("pack.info")', source)
+        self.assertIn(
+            '"MetroSpeed-$($appVersion.Name)-$($appVersion.Code)-release.app"',
+            source,
+        )
+        self.assertNotIn('"MetroSpeed-release.app"', source)
+        compression_load = source.index(
+            "Add-Type -AssemblyName System.IO.Compression.FileSystem"
+        )
+        output_guard_start = source.index("if (-not $OutputPath) {")
+        output_guard_end = source.index("\n}\n\n$signingDir", output_guard_start)
+        output_guard = source[output_guard_start:output_guard_end]
+        self.assertLess(compression_load, output_guard_start)
+        self.assertIn("Get-AppVersionMetadata -Path $AppPath", output_guard)
+        self.assertEqual(source.count("Get-AppVersionMetadata -Path"), 1)
         self.assertIn("与项目配置", source)
         self.assertNotIn('$compatibleVersion = "12"', source)
         self.assertIn(
@@ -21,6 +53,27 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("$keyPassword = $keystorePassword", source)
         self.assertIn("'-keyPwd', $keyPassword", source)
         self.assertIn("'-keystorePwd', $keystorePassword", source)
+
+    def test_release_docs_distinguish_source_state_and_candidate_eligibility(self) -> None:
+        readme = self.read("README.md")
+        status = self.read(".trae/documents/investigation_status.md")
+        rules = self.read(".trae/rules/project_rules.md")
+
+        self.assertIn("GitHub Release `v1.2.0`", readme)
+        self.assertIn("不存在远端 `release/1.2.0` 分支", readme)
+        self.assertNotIn("`release/1.2.0` 固定保存", readme)
+        self.assertNotIn("本地正式候选", readme)
+        self.assertIn("当前没有具备发布资格的 1.2.1 候选", status)
+        self.assertIn("versionCode `1786008552` 不得提交", status)
+        self.assertIn("`REG-001` 精确清单尚未闭环", status)
+        self.assertIn(
+            "1,541,653,379 字节（约 1.54 GB / 1.44 GiB）", status
+        )
+        self.assertNotIn("1.47 GB", status)
+        self.assertNotIn("<四个显式输入>", status)
+        self.assertIn("四条当前代真实记录", rules)
+        self.assertIn("README 不维护真实回归记录的数据资产表", rules)
+        self.assertNotIn("**数据资产表** —", rules)
 
     def test_background_task_uses_no_extra_background_location_permission(self) -> None:
         module = self.read("entry/src/main/module.json5")
@@ -247,11 +300,13 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("this.magneticFieldSubscribed = true;", controller)
         self.assertIn("this.uncalibratedGyroscopeSubscribed = true;", controller)
         self.assertIn("this.uncalibratedMagneticFieldSubscribed = true;", controller)
-        self.assertIn("const coreCleanupSucceeded = this.stop();", controller)
+        self.assertIn("this.stop();", controller)
+        self.assertIn("this.accelerometerSubscribed || this.gyroscopeSubscribed", controller)
         self.assertIn("上次核心传感器退订失败，请重试", controller)
         self.assertIn("private auxiliaryCleanupPending: boolean = false;", controller)
         self.assertIn("if (this.auxiliaryCleanupPending)", controller)
         self.assertIn("上次辅助传感器退订失败，仍记录核心传感器", controller)
+        self.assertIn("上次辅助传感器退订失败，仍启动核心传感器", controller)
         auxiliary_start = controller[
             controller.index("  startAuxiliarySensors(): void {"):
             controller.index("  stopAuxiliarySensors(): boolean {")
@@ -265,8 +320,10 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("let coreCleanupSucceeded = true;", stop_block)
         self.assertIn("let auxiliaryCleanupSucceeded = true;", stop_block)
         self.assertIn("this.auxiliaryCleanupPending = !auxiliaryCleanupSucceeded;", stop_block)
-        self.assertIn("return coreCleanupSucceeded;", stop_block)
-        self.assertNotIn("return auxiliaryCleanupSucceeded;", stop_block)
+        self.assertIn(
+            "return coreCleanupSucceeded && auxiliaryCleanupSucceeded;",
+            stop_block,
+        )
 
     def test_location_unsubscribe_is_owned_and_blocks_duplicate_restart(self) -> None:
         controller = self.read("entry/src/main/ets/model/LocationController.ets")
@@ -334,11 +391,12 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("if (this.tunnelState !== 'inside')", page)
         self.assertIn("const anchorApplied = this.hasGnssAnchor && this.gnssAnchorUsable;", page)
         self.assertNotIn("const gnssReliable = this.gnssSpeedAccuracyMps", page)
-        anchor_start = page.index("const reliableAnchor =")
-        anchor_end = page.index("this.gnssAnchorUsable = reliableAnchor;", anchor_start)
+        anchor_start = page.index("private isReliableGnssAnchor")
+        anchor_end = page.index("private isCurrentGnss", anchor_start)
         reliable_anchor_block = page[anchor_start:anchor_end]
-        self.assertIn("location.speedMps >= speedAcc", reliable_anchor_block)
-        self.assertIn("(src === 1 || src === 4)", reliable_anchor_block)
+        self.assertIn("location.speedMps >= speedAccuracyMps", reliable_anchor_block)
+        self.assertIn("(sourceType === 1 || sourceType === 4)", reliable_anchor_block)
+        self.assertNotIn("locationAgeMs", reliable_anchor_block)
         self.assertNotIn("MotionState", reliable_anchor_block)
         self.assertNotIn("Vibration", reliable_anchor_block)
 
@@ -352,8 +410,42 @@ class ReleaseContractTests(unittest.TestCase):
     def test_display_statistics_follow_the_displayed_speed(self) -> None:
         page = self.read("entry/src/main/ets/pages/InertialSpeed.ets")
         self.assertIn("updateDisplayStats(this.stats.currentSpeedKmh", page)
+        self.assertIn("Number.isFinite(frame.sensorTimestamp)", page)
+        self.assertIn("frame.sensorTimestamp > 0", page)
+        self.assertIn("? frame.sensorTimestamp / 1000000", page)
+        self.assertIn(": frame.timestampMs", page)
         self.assertIn("stats.maxSpeedKmh = this.displayMaxSpeedKmh;", page)
         self.assertIn("this.displayDistanceM / (this.displayElapsedMs / 1000)", page)
+
+    def test_gnss_display_rejects_invalid_or_stale_updates_and_expires(self) -> None:
+        page = self.read("entry/src/main/ets/pages/InertialSpeed.ets")
+        location = page[
+            page.index("  private startLocationForAll"):
+            page.index("  private stopLocationIfUnused")
+        ]
+        validation = page[
+            page.index("function isFiniteLocationSnapshot"):
+            page.index("@Entry")
+        ]
+        self.assertIn("Number.isFinite(location.speedMps)", validation)
+        self.assertIn("Number.isFinite(satellite.satelliteCn0Max)", validation)
+        self.assertLess(
+            location.index("if (!isFiniteLocationSnapshot(location))"),
+            location.index("this.researchRecorder.updateLocation(location)"),
+        )
+        self.assertIn("this.isReliableGnssAnchor(location)", location)
+        self.assertIn("this.isDisplayableGnss(location)", location)
+        self.assertNotIn("reliableAnchor && this.isCurrentGnss(location)", location)
+        self.assertIn("location.locationAgeMs <= this.GNSS_DISPLAY_FRESHNESS_MS", location)
+        self.assertIn("sourceType === 1 || sourceType === 4", location)
+        self.assertIn("this.GNSS_DISPLAY_FRESHNESS_MS - locationAgeMs", location)
+        self.assertIn("}, remainingFreshnessMs);", location)
+        self.assertIn("const generation = ++this.gnssDisplayGeneration;", location)
+        self.assertIn("generation === this.gnssDisplayGeneration", location)
+        self.assertIn("this.gnssSpeedKmh = null;", location)
+        self.assertIn("Text(this.gnssSpeedKmh === null ? '—'", page)
+        self.assertIn("const cleanupSucceeded = this.locationController.stop();", page)
+        self.assertIn("定位退订失败，请重试", page)
 
     def test_replay_labels_anchor_and_display_speed_separately(self) -> None:
         replay = self.read("tools/replay_estimator.py")
@@ -393,6 +485,12 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn(".width('58%')", page)
         self.assertIn(".border({ width: 1, color: '#FECACA' })", page)
         self.assertIn(".backgroundColor('#DC2626')", page)
+        warning_body = page[
+            page.index("Text('请将设备稳定放置"):
+            page.index(".margin({ top: 14 });", page.index("Text('请将设备稳定放置"))
+        ]
+        self.assertIn(".fontColor('#FFFFFF')", warning_body)
+        self.assertGreaterEqual(contrast_ratio("#FFFFFF", "#DC2626"), 4.5)
         self.assertNotIn("Button('留在此页'", page)
 
     def test_mode_pages_guard_back_navigation_and_label_light_distance(self) -> None:

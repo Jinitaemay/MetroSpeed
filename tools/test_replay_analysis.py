@@ -50,6 +50,23 @@ class ReplayAnalysisTests(unittest.TestCase):
         self.assertEqual(result["cal_0"]["all"]["biasKmh"], 10.0)
         self.assertEqual(result["cal_1"]["all"]["biasKmh"], 20.0)
 
+    def test_bucket_calibration_boundary_survives_same_run_wall_clock_rollback(self) -> None:
+        rows = [location_row("run-a", 10_000), location_row("run-a", 5_000)]
+        before_calibration = output_sample("run-a", 10_000, 0, 10.0)
+        before_calibration["secondsSinceCalibration"] = 5.0
+        after_calibration = output_sample("run-a", 5_000, 1, 20.0)
+        after_calibration["secondsSinceCalibration"] = 0.0
+
+        result = replay_estimator.compare_bucketed(
+            rows,
+            [before_calibration, after_calibration],
+        )
+
+        self.assertEqual(result["cal_0"]["all"]["count"], 1)
+        self.assertEqual(result["cal_0"]["all"]["biasKmh"], 10.0)
+        self.assertEqual(result["cal_1"]["all"]["count"], 1)
+        self.assertEqual(result["cal_1"]["all"]["biasKmh"], 20.0)
+
     def test_lag_scan_indexes_location_rows_once(self) -> None:
         rows = [
             location_row("run-a", 1_050),

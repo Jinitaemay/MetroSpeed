@@ -14,9 +14,11 @@ from __future__ import annotations
 import argparse
 import codecs
 import hashlib
+import os
 import shutil
 import stat
 import sys
+import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Iterator
@@ -142,10 +144,27 @@ def command_extract(fs: ExtFS, args: argparse.Namespace) -> int:
     if output.exists() and not args.force:
         raise FileExistsError(f"{output} already exists; pass --force to replace it")
     output.parent.mkdir(parents=True, exist_ok=True)
-    with node.open() as source, output.open("wb") as destination:
-        shutil.copyfileobj(source, destination, length=1024 * 1024)
-    with output.open("rb") as extracted:
-        digest = sha256_stream(extracted)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as destination:
+            fd = -1
+            with node.open() as source:
+                shutil.copyfileobj(source, destination, length=1024 * 1024)
+            destination.flush()
+            os.fsync(destination.fileno())
+        with temp_path.open("rb") as extracted:
+            digest = sha256_stream(extracted)
+        os.replace(temp_path, output)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
     print(f"{output}\nsize={output.stat().st_size}\nsha256={digest}")
     return 0
 

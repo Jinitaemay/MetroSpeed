@@ -1,5 +1,6 @@
 import sensor from '@ohos.sensor';
 import { BusinessError } from '@ohos.base';
+import { systemDateTime } from '@kit.BasicServicesKit';
 import { SensorCallbackSample, SensorFrame, Vector3, Quaternion } from './SpeedTypes';
 
 type SensorFrameCallback = (frame: SensorFrame) => void;
@@ -23,6 +24,14 @@ const CORE_SENSOR_WATCHDOG_INTERVAL_MS = 250;
 const ACCELEROMETER_INITIAL_TIMEOUT_MS = 3000;
 const ACCELEROMETER_STALE_TIMEOUT_MS = 2000;
 const ACCELEROMETER_STALL_CONFIRM_MS = 500;
+
+function isFiniteVector3(x: number, y: number, z: number): boolean {
+  return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z);
+}
+
+function isFiniteSensorTimestamp(timestamp: number): boolean {
+  return Number.isFinite(timestamp);
+}
 
 export class SensorController {
   private frameCallback?: SensorFrameCallback;
@@ -58,13 +67,15 @@ export class SensorController {
   private optionalGyroscopeDegraded: boolean = false;
   private gyroscopeFreshFrameSeen: boolean = false;
   private accelerometerFrameSeen: boolean = false;
-  private coreStartCallbackMs: number = 0;
-  private accelerometerStallSuspectSinceMs: number = 0;
+  private coreStartMonotonicMs: number = 0;
+  private accelerometerStallSuspectSinceMonotonicMs: number = 0;
   private coreSensorWatchdogTimer: number = -1;
   private lastAccelerationTimestamp: number | null = null;
-  private lastAccelerationCallbackMs: number = 0;
+  private lastAccelerationMonotonicMs: number = 0;
   private gyroscopeMissingSinceTimestamp: number | null = null;
-  private gyroscopeMissingSinceCallbackMs: number = 0;
+  private gyroscopeMissingSinceMonotonicMs: number = 0;
+  private lastMonotonicMs: number = 0;
+  private lastMonotonicFallbackWallMs: number = 0;
   private subscriptionGeneration: number = 0;
   private auxiliaryGeneration: number = 0;
   private auxiliaryCleanupPending: boolean = false;
@@ -76,15 +87,18 @@ export class SensorController {
     requireGyroscope: boolean = true,
     fatalCallback?: CoreSensorFatalCallback
   ): boolean {
-    const coreCleanupSucceeded = this.stop();
+    this.stop();
     this.frameCallback = frameCallback;
     this.statusCallback = statusCallback;
     this.sensorSampleCallback = sensorSampleCallback;
     this.fatalCallback = fatalCallback;
 
-    if (!coreCleanupSucceeded) {
+    if (this.accelerometerSubscribed || this.gyroscopeSubscribed) {
       this.emitStatus('上次核心传感器退订失败，请重试');
       return false;
+    }
+    if (this.auxiliaryCleanupPending) {
+      this.emitStatus('上次辅助传感器退订失败，仍启动核心传感器');
     }
 
     this.latestGyroscope = undefined;
@@ -103,10 +117,10 @@ export class SensorController {
     this.optionalGyroscopeDegraded = false;
     this.gyroscopeFreshFrameSeen = false;
     this.accelerometerFrameSeen = false;
-    this.coreStartCallbackMs = Date.now();
-    this.accelerometerStallSuspectSinceMs = 0;
+    this.coreStartMonotonicMs = this.readMonotonicNowMs();
+    this.accelerometerStallSuspectSinceMonotonicMs = 0;
     this.lastAccelerationTimestamp = null;
-    this.lastAccelerationCallbackMs = 0;
+    this.lastAccelerationMonotonicMs = 0;
     this.clearGyroscopeMissingWindow();
 
     this.running = true;
@@ -218,15 +232,15 @@ export class SensorController {
     this.optionalGyroscopeDegraded = false;
     this.gyroscopeFreshFrameSeen = false;
     this.accelerometerFrameSeen = false;
-    this.coreStartCallbackMs = 0;
-    this.accelerometerStallSuspectSinceMs = 0;
+    this.coreStartMonotonicMs = 0;
+    this.accelerometerStallSuspectSinceMonotonicMs = 0;
     this.lastAccelerationTimestamp = null;
-    this.lastAccelerationCallbackMs = 0;
+    this.lastAccelerationMonotonicMs = 0;
     this.clearGyroscopeMissingWindow();
     this.frameCallback = undefined;
     this.sensorSampleCallback = undefined;
     this.fatalCallback = undefined;
-    return coreCleanupSucceeded;
+    return coreCleanupSucceeded && auxiliaryCleanupSucceeded;
   }
 
   private subscribeAcceleration(): boolean {
@@ -234,6 +248,9 @@ export class SensorController {
     try {
       sensor.on(sensor.SensorId.ACCELEROMETER, (data: sensor.AccelerometerResponse) => {
         if (!this.isCoreSubscriptionActive(generation)) {
+          return;
+        }
+        if (!isFiniteSensorTimestamp(data.timestamp) || !isFiniteVector3(data.x, data.y, data.z)) {
           return;
         }
         this.emitSensorSample({
@@ -262,6 +279,9 @@ export class SensorController {
     try {
       sensor.on(sensor.SensorId.GYROSCOPE, (data: sensor.GyroscopeResponse) => {
         if (!this.isCoreSubscriptionActive(generation)) {
+          return;
+        }
+        if (!isFiniteSensorTimestamp(data.timestamp) || !isFiniteVector3(data.x, data.y, data.z)) {
           return;
         }
         this.emitSensorSample({
@@ -298,6 +318,10 @@ export class SensorController {
         if (!this.isAuxiliarySubscriptionActive(generation, auxiliaryGeneration)) {
           return;
         }
+        if (!isFiniteSensorTimestamp(data.timestamp) ||
+          !isFiniteVector3(data.x, data.y, data.z) || !Number.isFinite(data.w)) {
+          return;
+        }
         this.emitSensorSample({
           sensorType: 'rotation_vector',
           callbackTimestampMs: Date.now(),
@@ -327,6 +351,9 @@ export class SensorController {
     try {
       sensor.on(sensor.SensorId.MAGNETIC_FIELD, (data: sensor.MagneticFieldResponse) => {
         if (!this.isAuxiliarySubscriptionActive(generation, auxiliaryGeneration)) {
+          return;
+        }
+        if (!isFiniteSensorTimestamp(data.timestamp) || !isFiniteVector3(data.x, data.y, data.z)) {
           return;
         }
         this.emitSensorSample({
@@ -359,6 +386,10 @@ export class SensorController {
         if (!this.isAuxiliarySubscriptionActive(generation, auxiliaryGeneration)) {
           return;
         }
+        if (!isFiniteSensorTimestamp(data.timestamp) || !isFiniteVector3(data.x, data.y, data.z) ||
+          !isFiniteVector3(data.biasX, data.biasY, data.biasZ)) {
+          return;
+        }
         this.emitSensorSample({
           sensorType: 'gyroscope_uncalibrated',
           callbackTimestampMs: Date.now(),
@@ -388,6 +419,10 @@ export class SensorController {
     try {
       sensor.on(sensor.SensorId.MAGNETIC_FIELD_UNCALIBRATED, (data: sensor.MagneticFieldUncalibratedResponse) => {
         if (!this.isAuxiliarySubscriptionActive(generation, auxiliaryGeneration)) {
+          return;
+        }
+        if (!isFiniteSensorTimestamp(data.timestamp) || !isFiniteVector3(data.x, data.y, data.z) ||
+          !isFiniteVector3(data.biasX, data.biasY, data.biasZ)) {
           return;
         }
         this.emitSensorSample({
@@ -432,12 +467,17 @@ export class SensorController {
     if (!this.running || !this.frameCallback) {
       return;
     }
+    if (!isFiniteVector3(acceleration.x, acceleration.y, acceleration.z) ||
+      (sensorTimestamp !== null && !Number.isFinite(sensorTimestamp))) {
+      return;
+    }
 
-    const callbackTimestampMs = Date.now();
-    this.observeAccelerationContinuity(sensorTimestamp, callbackTimestampMs);
+    const wallNowMs = Date.now();
+    const monotonicNowMs = this.readMonotonicNowMs();
+    this.observeAccelerationContinuity(sensorTimestamp, monotonicNowMs);
 
     const frame: SensorFrame = {
-      timestampMs: callbackTimestampMs,
+      timestampMs: wallNowMs,
       sensorTimestamp,
       acceleration
     };
@@ -459,7 +499,7 @@ export class SensorController {
         this.emitStatus('陀螺仪回调已恢复，研究记录恢复完整传感器采集');
       }
     } else {
-      this.handleMissingGyroscope(sensorTimestamp, callbackTimestampMs);
+      this.handleMissingGyroscope(sensorTimestamp, monotonicNowMs);
       if (this.requireGyroscope) {
         // Required-gyro measurement frames must never reach the estimator with
         // an implicit zero gyro. A short skew can recover; a sustained gap is
@@ -487,13 +527,13 @@ export class SensorController {
     this.frameCallback(frame);
   }
 
-  private observeAccelerationContinuity(sensorTimestamp: number | null, callbackTimestampMs: number): void {
+  private observeAccelerationContinuity(sensorTimestamp: number | null, monotonicNowMs: number): void {
     let continuous = true;
     if (sensorTimestamp !== null && this.lastAccelerationTimestamp !== null) {
       const sensorGapNs = sensorTimestamp - this.lastAccelerationTimestamp;
       continuous = sensorGapNs > 0 && sensorGapNs <= GYROSCOPE_WATCHDOG_MAX_ACCEL_GAP_NS;
-    } else if (this.lastAccelerationCallbackMs > 0) {
-      const callbackGapMs = callbackTimestampMs - this.lastAccelerationCallbackMs;
+    } else if (this.lastAccelerationMonotonicMs > 0) {
+      const callbackGapMs = monotonicNowMs - this.lastAccelerationMonotonicMs;
       continuous = callbackGapMs > 0 &&
         callbackGapMs * 1000000 <= GYROSCOPE_WATCHDOG_MAX_ACCEL_GAP_NS;
     }
@@ -501,20 +541,20 @@ export class SensorController {
       this.clearGyroscopeMissingWindow();
     }
     this.accelerometerFrameSeen = true;
-    this.accelerometerStallSuspectSinceMs = 0;
+    this.accelerometerStallSuspectSinceMonotonicMs = 0;
     this.lastAccelerationTimestamp = sensorTimestamp;
-    this.lastAccelerationCallbackMs = callbackTimestampMs;
+    this.lastAccelerationMonotonicMs = monotonicNowMs;
   }
 
-  private handleMissingGyroscope(sensorTimestamp: number | null, callbackTimestampMs: number): void {
-    if (this.gyroscopeMissingSinceCallbackMs <= 0) {
+  private handleMissingGyroscope(sensorTimestamp: number | null, monotonicNowMs: number): void {
+    if (this.gyroscopeMissingSinceMonotonicMs <= 0) {
       this.gyroscopeMissingSinceTimestamp = sensorTimestamp;
-      this.gyroscopeMissingSinceCallbackMs = callbackTimestampMs;
+      this.gyroscopeMissingSinceMonotonicMs = monotonicNowMs;
       return;
     }
 
     let missingDurationNs = Math.max(0,
-      callbackTimestampMs - this.gyroscopeMissingSinceCallbackMs) * 1000000;
+      monotonicNowMs - this.gyroscopeMissingSinceMonotonicMs) * 1000000;
     if (sensorTimestamp !== null && this.gyroscopeMissingSinceTimestamp !== null &&
       sensorTimestamp >= this.gyroscopeMissingSinceTimestamp) {
       missingDurationNs = sensorTimestamp - this.gyroscopeMissingSinceTimestamp;
@@ -539,7 +579,37 @@ export class SensorController {
 
   private clearGyroscopeMissingWindow(): void {
     this.gyroscopeMissingSinceTimestamp = null;
-    this.gyroscopeMissingSinceCallbackMs = 0;
+    this.gyroscopeMissingSinceMonotonicMs = 0;
+  }
+
+  private readMonotonicNowMs(): number {
+    try {
+      const uptimeMs = systemDateTime.getUptime(systemDateTime.TimeType.STARTUP);
+      const normalizedUptimeMs = Math.max(1, uptimeMs);
+      if (Number.isFinite(normalizedUptimeMs) && normalizedUptimeMs >= this.lastMonotonicMs) {
+        this.lastMonotonicMs = normalizedUptimeMs;
+        this.lastMonotonicFallbackWallMs = Date.now();
+        return normalizedUptimeMs;
+      }
+    } catch (error) {
+      // Fall through to a clamped wall-clock delta. It may delay a watchdog,
+      // but a wall-clock jump must never create a false core-sensor failure.
+    }
+
+    const wallNowMs = Date.now();
+    if (this.lastMonotonicMs <= 0) {
+      this.lastMonotonicMs = 1;
+      this.lastMonotonicFallbackWallMs = wallNowMs;
+      return this.lastMonotonicMs;
+    }
+    if (Number.isFinite(wallNowMs) && Number.isFinite(this.lastMonotonicFallbackWallMs)) {
+      const wallDeltaMs = wallNowMs - this.lastMonotonicFallbackWallMs;
+      if (wallDeltaMs > 0) {
+        this.lastMonotonicMs += Math.min(wallDeltaMs, CORE_SENSOR_WATCHDOG_INTERVAL_MS * 2);
+      }
+      this.lastMonotonicFallbackWallMs = wallNowMs;
+    }
+    return this.lastMonotonicMs;
   }
 
   private scheduleCoreSensorWatchdog(generation: number): void {
@@ -567,22 +637,22 @@ export class SensorController {
   }
 
   private checkAccelerometerWatchdog(): void {
-    const now = Date.now();
+    const now = this.readMonotonicNowMs();
     const referenceMs = this.accelerometerFrameSeen
-      ? this.lastAccelerationCallbackMs
-      : this.coreStartCallbackMs;
+      ? this.lastAccelerationMonotonicMs
+      : this.coreStartMonotonicMs;
     const timeoutMs = this.accelerometerFrameSeen
       ? ACCELEROMETER_STALE_TIMEOUT_MS
       : ACCELEROMETER_INITIAL_TIMEOUT_MS;
     if (referenceMs <= 0 || now - referenceMs < timeoutMs) {
-      this.accelerometerStallSuspectSinceMs = 0;
+      this.accelerometerStallSuspectSinceMonotonicMs = 0;
       return;
     }
-    if (this.accelerometerStallSuspectSinceMs <= 0) {
-      this.accelerometerStallSuspectSinceMs = now;
+    if (this.accelerometerStallSuspectSinceMonotonicMs <= 0) {
+      this.accelerometerStallSuspectSinceMonotonicMs = now;
       return;
     }
-    if (now - this.accelerometerStallSuspectSinceMs < ACCELEROMETER_STALL_CONFIRM_MS) {
+    if (now - this.accelerometerStallSuspectSinceMonotonicMs < ACCELEROMETER_STALL_CONFIRM_MS) {
       return;
     }
 

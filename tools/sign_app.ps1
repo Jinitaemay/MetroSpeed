@@ -16,7 +16,52 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 
 $buildDir = Join-Path $projectRoot "build\outputs\default"
 if (-not $AppPath) { $AppPath = Join-Path $buildDir "MetroSpeed-default-unsigned.app" }
-if (-not $OutputPath) { $OutputPath = Join-Path $buildDir "MetroSpeed-release.app" }
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+function Get-AppVersionMetadata {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "无法读取 APP 版本，输入文件不存在: $Path"
+    }
+
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $packInfoEntry = $archive.GetEntry("pack.info")
+        if (-not $packInfoEntry) {
+            throw "输入 APP 缺少 pack.info，无法生成版本化输出文件名: $Path"
+        }
+        $reader = [System.IO.StreamReader]::new(
+            $packInfoEntry.Open(),
+            [System.Text.Encoding]::UTF8,
+            $true
+        )
+        try {
+            $packInfo = $reader.ReadToEnd() | ConvertFrom-Json
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $archive.Dispose()
+    }
+
+    $versionName = [string]$packInfo.summary.app.version.name
+    $versionCode = [string]$packInfo.summary.app.version.code
+    if ($versionName -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$' -or
+        $versionCode -notmatch '^\d+$') {
+        throw "pack.info 中的 versionName/versionCode 无效，无法生成版本化输出文件名"
+    }
+
+    return [PSCustomObject]@{
+        Name = $versionName
+        Code = $versionCode
+    }
+}
+
+if (-not $OutputPath) {
+    $appVersion = Get-AppVersionMetadata -Path $AppPath
+    $OutputPath = Join-Path $buildDir "MetroSpeed-$($appVersion.Name)-$($appVersion.Code)-release.app"
+}
 
 $signingDir = Join-Path $projectRoot "signing"
 
@@ -158,7 +203,6 @@ $signedOutputTemp = Join-Path $outputDirectory ".$outputFileName.$PID.$(Get-Rand
 try {
     Write-Host "=== 步骤 1/4: 解压 .app 包 ===" -ForegroundColor Cyan
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::ExtractToDirectory($AppPath, $tempDir)
     Write-Host "解压完成: $tempDir"
 

@@ -2,7 +2,7 @@
 
 基于手机惯性传感器与 GNSS 的轨道交通测速工具，提供稳定放置的连续惯性测速和手持灯光打点测速两种模式。
 
-> **公开状态**：`release/1.2.0` 固定保存已提交 AppGallery 复审的候选源码；当前开发分支已生成 `1.2.1` 本地正式候选，但尚未提交 GitHub 或 AppGallery。应用市场版本、冻结分支与开发分支的功能可能不同。
+> **公开状态**：GitHub Release `v1.2.0` 及同名 tag 保存 1.2.0 公开源码；仓库不存在远端 `release/1.2.0` 分支。`fix/post-1.2.0-known-issues` 已作为 GitHub 源码分支推送，但当前没有具备发布资格的 1.2.1 候选，也没有 1.2.1 GitHub Release 或 AppGallery 提交。应用市场版本、公开 Release 与开发分支的功能可能不同。
 >
 > **系统要求**：HarmonyOS 手机，`compatibleSdkVersion 6.0.0(20)`，`targetSdkVersion 6.1.1(24)`。
 >
@@ -136,8 +136,8 @@ CURVE > CONDUCTION_VIB > STRONG_VIB > LOW_CONFIDENCE
 
 ### 技术基线
 
-- 当前开发线：`1.2.1` 本地正式候选（未发布）
-- **算法版本**：`anchor-delta-20260804-r5`
+- 当前开发线：`1.2.1` 源码开发中，当前没有具备发布资格的正式候选
+- **算法版本**：`anchor-delta-20260807-r5`
 - 研究记录格式：schema v17
 - SDK：`compatibleSdkVersion 6.0.0(20)`、`targetSdkVersion 6.1.1(24)`
 - 工具：DevEco Studio、HarmonyOS SDK、Python 3.10 或更高版本

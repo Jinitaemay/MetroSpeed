@@ -81,6 +81,48 @@ class ParameterSensitivityTests(unittest.TestCase):
         self.assertEqual(replay_one.call_args_list[1].args[1:3], ("curve_positive_scale", 0.6))
         self.assertEqual(replay_one.call_args_list[2].args[1:3], ("curve_positive_scale", 0.4))
 
+    def test_sensitivity_threshold_uses_largest_one_sided_mae_change(self) -> None:
+        replay_results = [
+            {"mae": 1.0, "bias": 0.0, "count": 10},
+            {"mae": 1.3, "bias": 0.0, "count": 10},
+            {"mae": 1.3, "bias": 0.0, "count": 10},
+        ]
+        argv = [
+            "param_sensitivity.py",
+            "sample.jsonl",
+            "--param",
+            "curve_positive_scale",
+            "--min-paired",
+            "1",
+        ]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            param_sensitivity,
+            "validate_scan_schema",
+            return_value=[],
+        ), mock.patch.object(
+            param_sensitivity,
+            "read_jsonl_with_info",
+            return_value=(
+                [{"timestampMs": 1}],
+                SimpleNamespace(complete=True, status="complete"),
+            ),
+        ), mock.patch.object(
+            param_sensitivity,
+            "estimator_default_kwargs",
+            return_value={"curve_positive_scale": 0.5},
+        ), mock.patch.object(
+            param_sensitivity,
+            "replay_one",
+            side_effect=replay_results,
+        ), contextlib.redirect_stdout(output):
+            return_code = param_sensitivity.main()
+
+        self.assertEqual(return_code, 0)
+        self.assertIn("0.30", output.getvalue())
+        self.assertIn("no parameters exceeded impact 0.5 threshold", output.getvalue())
+        self.assertNotIn(" sensitive (impact > 0.5)", output.getvalue())
+
     def test_main_reports_baseline_failure_without_traceback(self) -> None:
         argv = ["param_sensitivity.py", "sample.jsonl", "--min-paired", "1"]
         stderr = io.StringIO()

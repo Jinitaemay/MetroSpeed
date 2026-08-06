@@ -102,6 +102,50 @@ class AuxSensorLocationDiagTest(unittest.TestCase):
         self.assertTrue(result)
         self.assertNotIn("Device health:", output)
 
+    def test_rejects_inconsistent_protocol_metadata(self) -> None:
+        mutations = {
+            "appVersionCode": 2,
+            "algorithmVersion": "other-algorithm",
+            "sessionId": "other-session",
+        }
+        for field_name, value in mutations.items():
+            with self.subTest(field_name=field_name):
+                callback = sensor_callback_row(16, 2, 1010)
+                callback[field_name] = value
+                rows = [
+                    lifecycle_row(16, 1, 1000, "start_record"),
+                    callback,
+                    lifecycle_row(16, 3, 2000, "stop_record"),
+                ]
+
+                result, output = self.diagnose_rows(rows)
+
+                self.assertFalse(result)
+                self.assertIn("invalid metadata lines: 2", output)
+                self.assertIn(f"{field_name}_mismatch", output)
+
+    def test_rejects_missing_or_invalid_protocol_metadata(self) -> None:
+        mutations = {
+            "appVersionCode": 0,
+            "algorithmVersion": " ",
+            "sessionId": None,
+        }
+        for field_name, value in mutations.items():
+            with self.subTest(field_name=field_name):
+                callback = sensor_callback_row(16, 2, 1010)
+                callback[field_name] = value
+                rows = [
+                    lifecycle_row(16, 1, 1000, "start_record"),
+                    callback,
+                    lifecycle_row(16, 3, 2000, "stop_record"),
+                ]
+
+                result, output = self.diagnose_rows(rows)
+
+                self.assertFalse(result)
+                self.assertIn("invalid metadata lines: 2", output)
+                self.assertIn(field_name, output)
+
     def test_schema16_success_report_matches_legacy_summary(self) -> None:
         rows = [lifecycle_row(16, 1, 1000, "start_record")]
         rows.extend(

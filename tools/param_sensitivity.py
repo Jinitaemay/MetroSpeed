@@ -247,7 +247,7 @@ def main() -> int:
             continue
         up_d = up_mae - baseline["mae"]
         dn_d = dn_mae - baseline["mae"]
-        impact = abs(up_d) + abs(dn_d)
+        impact = max(abs(up_d), abs(dn_d))
         results.append({
             "param": name, "default": default,
             "up_delta": up_d, "dn_delta": dn_d,

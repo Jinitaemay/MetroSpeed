@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import sys
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -366,10 +367,10 @@ def command_calls(
     args: argparse.Namespace,
 ) -> int:
     root = index.select_one(args.function)
-    queue: list[tuple[Function, int]] = [(root, 0)]
+    queue = deque([(root, 0)])
     visited: set[int] = set()
     while queue:
-        caller, level = queue.pop(0)
+        caller, level = queue.popleft()
         if caller.address in visited:
             continue
         visited.add(caller.address)

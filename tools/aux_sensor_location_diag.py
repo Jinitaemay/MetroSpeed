@@ -359,6 +359,10 @@ def _diagnose_snapshot(
     invalid_json_count = 0
     invalid_record_seq_lines: list[int] = []
     invalid_record_seq_count = 0
+    invalid_metadata_lines: list[int] = []
+    invalid_metadata_count = 0
+    invalid_metadata_fields: Counter[str] = Counter()
+    metadata_reference: dict[str, int | str] = {}
     invalid_sensor_callback_lines: list[int] = []
     invalid_sensor_callback_count = 0
     invalid_sensor_callback_fields: Counter[str] = Counter()
@@ -399,10 +403,44 @@ def _diagnose_snapshot(
         if schema_version is not None:
             schema_versions[schema_version] += 1
 
-        record_seq = optional_int(row.get("recordSeq"))
+        metadata_errors: list[str] = []
+        app_version_code = optional_int(row.get("appVersionCode"))
+        if app_version_code is None or app_version_code < 1:
+            metadata_errors.append("appVersionCode")
+        elif "appVersionCode" not in metadata_reference:
+            metadata_reference["appVersionCode"] = app_version_code
+        elif app_version_code != metadata_reference["appVersionCode"]:
+            metadata_errors.append("appVersionCode_mismatch")
+
+        algorithm_version = row.get("algorithmVersion")
+        if not isinstance(algorithm_version, str) or not algorithm_version.strip():
+            metadata_errors.append("algorithmVersion")
+        elif "algorithmVersion" not in metadata_reference:
+            metadata_reference["algorithmVersion"] = algorithm_version
+        elif algorithm_version != metadata_reference["algorithmVersion"]:
+            metadata_errors.append("algorithmVersion_mismatch")
+
         session_id = row.get("sessionId")
+        if not isinstance(session_id, str) or not session_id.strip():
+            metadata_errors.append("sessionId")
+        elif "sessionId" not in metadata_reference:
+            metadata_reference["sessionId"] = session_id
+        elif session_id != metadata_reference["sessionId"]:
+            metadata_errors.append("sessionId_mismatch")
+
+        if metadata_errors:
+            invalid_metadata_count += 1
+            invalid_metadata_fields.update(metadata_errors)
+            remember_line(invalid_metadata_lines, line_no)
+
+        record_seq = optional_int(row.get("recordSeq"))
         if record_seq is not None:
-            session_sequences[str(session_id or "<missing>")].add(record_seq)
+            sequence_session = (
+                session_id
+                if isinstance(session_id, str) and session_id.strip()
+                else "<invalid>"
+            )
+            session_sequences[sequence_session].add(record_seq)
         else:
             invalid_record_seq_count += 1
             remember_line(invalid_record_seq_lines, line_no)
@@ -581,6 +619,11 @@ def _diagnose_snapshot(
         suffix = " ..." if invalid_record_seq_count > len(invalid_record_seq_lines) else ""
         print(f"missing/invalid recordSeq lines: {shown}{suffix}")
         sequence_integrity_ok = False
+    if invalid_metadata_count:
+        shown = ", ".join(str(line) for line in invalid_metadata_lines)
+        suffix = " ..." if invalid_metadata_count > len(invalid_metadata_lines) else ""
+        print(f"invalid metadata lines: {shown}{suffix}")
+        print(f"invalid metadata fields: {dict(sorted(invalid_metadata_fields.items()))}")
     if invalid_sensor_callback_count:
         shown = ", ".join(str(line) for line in invalid_sensor_callback_lines)
         suffix = (
@@ -740,6 +783,7 @@ def _diagnose_snapshot(
         and valid_sensor_callback_rows > 0
         and invalid_sensor_callback_count == 0
         and invalid_json_count == 0
+        and invalid_metadata_count == 0
         and schema_ok
         and sensor_set_ok
         and device_health_ok

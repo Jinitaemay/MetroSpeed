@@ -121,6 +121,11 @@ for fname in FILES:
     ]
     if ANCHOR_V2:
         cmd.append("--anchor-v2")
+    elif not PURE_ZERO:
+        # The default gate needs exact pure-inertial speed/GNSS statistics, not
+        # millions of replay-output dictionaries. This path still validates and
+        # replays every JSONL row in source order, with disk-backed exact stats.
+        cmd.append("--streaming-baseline-summary")
     if PURE_ZERO:
         cmd.append("--pure-zero")
     if extra_args:

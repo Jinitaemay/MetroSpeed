@@ -709,6 +709,62 @@ class RateIndependentEstimatorTests(unittest.TestCase):
                 break
         self.assertEqual(result, -1)
 
+    def test_parking_action_delay_only_controls_evidence_freshness(self) -> None:
+        base_wall_ms = 1_780_000_000_000
+
+        def run_request(action_delay_ms: float, next_sensor_delay_ms: int) -> Tuple[SpeedEstimator, int]:
+            estimator = prepared_estimator()
+            estimator.last_timestamp_ms = base_wall_ms
+            for elapsed_ms in range(0, 2000 + 20, 20):
+                estimator.ingest(SensorFrame(
+                    timestamp_ms=base_wall_ms + elapsed_ms,
+                    sensor_timestamp=float(elapsed_ms) * 1_000_000.0,
+                    acceleration=(0.0, 0.0, GRAVITY),
+                    gyroscope=(0.0, 0.0, 0.0),
+                    gyroscope_timestamp=None,
+                ))
+
+            logical_before_click = estimator.logical_timestamp_ms
+            action_timestamp_ms = base_wall_ms + 2000 + action_delay_ms
+            self.assertTrue(estimator.calibrate_at_stop(action_timestamp_ms))
+            self.assertEqual(estimator.logical_timestamp_ms, logical_before_click)
+            self.assertEqual(estimator.parking_calibration_request_ms, logical_before_click)
+
+            result = 0
+            first_elapsed_ms = 2000 + next_sensor_delay_ms + 20
+            for elapsed_ms in range(first_elapsed_ms, 3800, 20):
+                estimator.ingest(SensorFrame(
+                    timestamp_ms=base_wall_ms + elapsed_ms,
+                    sensor_timestamp=float(elapsed_ms) * 1_000_000.0,
+                    acceleration=(0.0, 0.0, GRAVITY),
+                    gyroscope=(0.0, 0.0, 0.0),
+                    gyroscope_timestamp=None,
+                ))
+                result = estimator.consume_parking_calibration_result()
+                if result != 0:
+                    break
+            return estimator, result
+
+        accepted, accepted_result = run_request(200.0, 200)
+        self.assertEqual(accepted_result, 1)
+        self.assertEqual(accepted.last_calibration_ms, 2000.0)
+
+        for action_delay_ms, next_sensor_delay_ms in (
+            (301.0, 301),
+            (500.0, 500),
+            (86_400_000.0, 500),
+            (-100.0, 0),
+            (float("nan"), 0),
+            (float("inf"), 0),
+        ):
+            with self.subTest(action_delay_ms=action_delay_ms):
+                rejected, rejected_result = run_request(
+                    action_delay_ms,
+                    next_sensor_delay_ms,
+                )
+                self.assertEqual(rejected_result, -1)
+                self.assertEqual(rejected.last_calibration_ms, 0)
+
     def test_gap_drops_pre_gap_filter_tail_during_parking_replay(self) -> None:
         for rate_hz in (50, 100):
             estimator = prepared_estimator()
@@ -756,6 +812,82 @@ class RateIndependentEstimatorTests(unittest.TestCase):
             estimator.ingest(sensor_frame(timestamp_ms))
         self.assertTrue(estimator.initial_calibration_done)
         self.assertEqual(estimator.calibration_count, 1)
+
+    def test_wall_clock_jump_does_not_advance_estimator_clock(self) -> None:
+        reference = prepared_estimator()
+        jumped = prepared_estimator()
+
+        for sample_index in range(200):
+            sensor_timestamp = float(sample_index * 20) * 1_000_000.0
+            reference.ingest(SensorFrame(
+                timestamp_ms=sample_index * 20,
+                sensor_timestamp=sensor_timestamp,
+                acceleration=(0.30, 0.0, GRAVITY),
+                gyroscope=(0.0, 0.0, 0.0),
+                gyroscope_timestamp=None,
+            ))
+            jumped.ingest(SensorFrame(
+                timestamp_ms=sample_index * 20 + (86_400_000 if sample_index >= 100 else 0),
+                sensor_timestamp=sensor_timestamp,
+                acceleration=(0.30, 0.0, GRAVITY),
+                gyroscope=(0.0, 0.0, 0.0),
+                gyroscope_timestamp=None,
+            ))
+
+        self.assertAlmostEqual(jumped.logical_timestamp_ms, 3980.0)
+        self.assertAlmostEqual(jumped.logical_timestamp_ms, reference.logical_timestamp_ms)
+        self.assertAlmostEqual(jumped.velocity_mps, reference.velocity_mps, places=12)
+        self.assertAlmostEqual(jumped.confidence, reference.confidence, places=12)
+
+    def test_wall_clock_only_fallback_clamps_discontinuous_jump(self) -> None:
+        estimator = prepared_estimator()
+        estimator.ingest(SensorFrame(
+            timestamp_ms=0,
+            sensor_timestamp=None,
+            acceleration=(0.30, 0.0, GRAVITY),
+            gyroscope=(0.0, 0.0, 0.0),
+            gyroscope_timestamp=None,
+        ))
+        estimator.ingest(SensorFrame(
+            timestamp_ms=86_400_000,
+            sensor_timestamp=None,
+            acceleration=(0.30, 0.0, GRAVITY),
+            gyroscope=(0.0, 0.0, 0.0),
+            gyroscope_timestamp=None,
+        ))
+
+        self.assertAlmostEqual(estimator.logical_timestamp_ms, 20.0)
+        self.assertFalse(estimator.last_sample_continuous)
+
+    def test_replay_seconds_since_calibration_uses_logical_clock(self) -> None:
+        rows = [
+            {"timestampMs": 0, "event": "\u5f00\u59cb\u6d4b\u901f"},
+            {
+                "timestampMs": 0,
+                "recordType": "sensor",
+                "sensorTimestamp": 0.0,
+                "accX": 0.0,
+                "accY": 0.0,
+                "accZ": GRAVITY,
+            },
+            {
+                "timestampMs": 86_400_020,
+                "recordType": "sensor",
+                "sensorTimestamp": 20_000_000.0,
+                "accX": 0.0,
+                "accY": 0.0,
+                "accZ": GRAVITY,
+            },
+        ]
+
+        outputs, _ = replay_module.replay(
+            rows,
+            strict_start=False,
+            infer_start_from_sensor=False,
+        )
+
+        self.assertEqual(len(outputs), 2)
+        self.assertAlmostEqual(outputs[-1]["secondsSinceCalibration"], 0.02)
 
 
 if __name__ == "__main__":

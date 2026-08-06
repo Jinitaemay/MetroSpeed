@@ -59,6 +59,46 @@ function emptyResearchStatus(): ResearchRecorderStatus {
   };
 }
 
+function isFiniteNullable(value: number | null): boolean {
+  return value === null || Number.isFinite(value);
+}
+
+function isFiniteLocationSnapshot(location: LocationSnapshot): boolean {
+  return Number.isFinite(location.timestampMs) &&
+    Number.isFinite(location.latitude) &&
+    Number.isFinite(location.longitude) &&
+    Number.isFinite(location.altitude) &&
+    Number.isFinite(location.accuracy) &&
+    isFiniteNullable(location.altitudeAccuracy) &&
+    Number.isFinite(location.speedMps) &&
+    isFiniteNullable(location.speedAccuracyMps) &&
+    Number.isFinite(location.directionDeg) &&
+    isFiniteNullable(location.directionAccuracyDeg) &&
+    Number.isFinite(location.locationTimeMs) &&
+    isFiniteNullable(location.timeSinceBootNs) &&
+    isFiniteNullable(location.uncertaintyOfTimeSinceBootNs) &&
+    isFiniteNullable(location.locationSourceType) &&
+    Number.isFinite(location.locationAgeMs) &&
+    isFiniteNullable(location.satelliteCount) &&
+    isFiniteNullable(location.satelliteFixCount) &&
+    isFiniteNullable(location.satelliteCn0Avg) &&
+    isFiniteNullable(location.satelliteCn0Max) &&
+    isFiniteNullable(location.satelliteCn0PositiveCount) &&
+    isFiniteNullable(location.satelliteCn0PositiveAvg) &&
+    isFiniteNullable(location.satelliteCn0UsedAvg);
+}
+
+function isFiniteSatelliteSnapshot(satellite: SatelliteSnapshot): boolean {
+  return Number.isFinite(satellite.timestampMs) &&
+    Number.isFinite(satellite.satelliteCount) &&
+    Number.isFinite(satellite.satelliteFixCount) &&
+    Number.isFinite(satellite.satelliteCn0Avg) &&
+    Number.isFinite(satellite.satelliteCn0Max) &&
+    Number.isFinite(satellite.satelliteCn0PositiveCount) &&
+    Number.isFinite(satellite.satelliteCn0PositiveAvg) &&
+    Number.isFinite(satellite.satelliteCn0UsedAvg);
+}
+
 @Entry
 @Component
 struct InertialSpeed {
@@ -77,7 +117,7 @@ struct InertialSpeed {
   @State private lastMarkedEvent: string = '';
   @State private tunnelSwitchOn: boolean = false;
   @State private pureInertialSpeedKmh: number = 0;
-  @State private gnssSpeedKmh: number = 0;
+  @State private gnssSpeedKmh: number | null = null;
   @State private showPlacementWarning: boolean = false;
   @State private speedStatsHeight: number = 0;
   @State private researchPanelHeight: number = 0;
@@ -104,6 +144,8 @@ struct InertialSpeed {
   private inertialSpeedHistory: SpeedHistoryEntry[] = [];
   private readonly INERTIAL_HISTORY_RETENTION_MS: number = 200;
   private readonly GNSS_LAG_MS: number = 40;
+  private readonly GNSS_DISPLAY_FRESHNESS_MS: number = 3000;
+  private gnssDisplayGeneration: number = 0;
   private displayDistanceM: number = 0;
   private displayElapsedMs: number = 0;
   private displayMaxSpeedKmh: number = 0;
@@ -162,9 +204,9 @@ struct InertialSpeed {
     this.hasGnssAnchor = false;
     this.gnssAnchorUsable = false;
     this.pureInertialSpeedKmh = 0;
-    this.gnssSpeedKmh = 0;
-    this.sensorController.stop();
-    this.locationController.stop();
+    this.clearGnssDisplay();
+    const sensorCleanupSucceeded = this.sensorController.stop();
+    const locationCleanupSucceeded = this.locationController.stop();
     this.researchSensorActive = false;
     this.measurementLocationActive = false;
     this.inertialSpeedHistory = [];
@@ -174,8 +216,12 @@ struct InertialSpeed {
     BackgroundState.measurementActive = false;
     BackgroundState.recordingActive = false;
     this.notifyCollectionStateChanged();
-    this.sensorStatus = '后台连续采集已中止，请回到前台重新开始';
-    this.locationStatus = '后台长时任务不可用或已取消';
+    this.sensorStatus = sensorCleanupSucceeded
+      ? '后台连续采集已中止，请回到前台重新开始'
+      : '后台采集中止，但传感器退订失败，请重试';
+    this.locationStatus = locationCleanupSucceeded
+      ? '后台长时任务不可用或已取消'
+      : '后台采集中止，但定位退订失败，请重试';
   }
 
   private onBgRestoreSensors(): void {
@@ -225,8 +271,12 @@ struct InertialSpeed {
     this.researchStatus = this.researchStatus.running
       ? this.researchRecorder.stop(now)
       : this.researchRecorder.flush();
-    this.sensorController.stop();
-    this.locationController.stop();
+    const sensorCleanupSucceeded = this.sensorController.stop();
+    const locationCleanupSucceeded = this.locationController.stop();
+    this.clearGnssDisplay();
+    if (!sensorCleanupSucceeded || !locationCleanupSucceeded) {
+      console.warn('page cleanup left one or more subscriptions pending');
+    }
     if (this.backgroundHandlerRegistered) {
       emitter.off(100, this.backgroundEventHandler);
       this.backgroundHandlerRegistered = false;
@@ -260,7 +310,7 @@ struct InertialSpeed {
     this.hasGnssAnchor = false;
     this.gnssAnchorUsable = false;
     this.pureInertialSpeedKmh = 0;
-    this.gnssSpeedKmh = 0;
+    this.clearGnssDisplay();
     this.inertialSpeedHistory = [];
     this.showPlacementWarning = false;
     this.placementWarningShownThisRun = false;
@@ -318,26 +368,32 @@ struct InertialSpeed {
   }
 
   private startLocationForAll(forRecording?: boolean): boolean {
-    return this.locationController.start(
+    const started = this.locationController.start(
       (location: LocationSnapshot) => {
+        if (!isFiniteLocationSnapshot(location)) {
+          this.clearGnssDisplay();
+          if (this.tunnelState !== 'inside') {
+            this.gnssAnchorUsable = false;
+          }
+          this.updateLocationStatus('定位数据无效，已忽略');
+          return;
+        }
         if (this.researchStatus.running) {
           this.researchRecorder.updateLocation(location);
         }
         const satelliteText = location.satelliteCount === null ? '' : ` 星${location.satelliteFixCount}/${location.satelliteCount}`;
         this.updateLocationStatus(`定位 ${location.accuracy.toFixed(0)}m ${location.speedMps.toFixed(1)}m/s${satelliteText}`);
         this.researchStatus = this.researchRecorder.status();
-        this.gnssSpeedKmh = Math.max(0, location.speedMps * 3.6);
+        const reliableAnchor = this.isReliableGnssAnchor(location);
+        if (this.isDisplayableGnss(location)) {
+          this.showCurrentGnssSpeed(location.speedMps, location.locationAgeMs);
+        } else {
+          this.clearGnssDisplay();
+        }
         this.syncResearchRuntimeState();
 
         if (this.isRunning) {
-          const speedAcc = location.speedAccuracyMps;
-          const src = location.locationSourceType;
           if (this.tunnelState !== 'inside') {
-            const reliableAnchor = speedAcc !== null &&
-              speedAcc > 0 &&
-              location.speedMps >= speedAcc &&
-              src !== null &&
-              (src === 1 || src === 4);
             this.gnssAnchorUsable = reliableAnchor;
             if (reliableAnchor) {
               this.lastAnchorGnssMps = location.speedMps;
@@ -348,6 +404,10 @@ struct InertialSpeed {
         }
       },
       (satellite: SatelliteSnapshot) => {
+        if (!isFiniteSatelliteSnapshot(satellite)) {
+          this.updateLocationStatus('卫星状态数据无效，已忽略');
+          return;
+        }
         if (this.researchStatus.running) {
           this.researchRecorder.updateSatellite(satellite);
         }
@@ -359,6 +419,50 @@ struct InertialSpeed {
       },
       forRecording
     );
+    if (!started) {
+      this.clearGnssDisplay();
+    }
+    return started;
+  }
+
+  private isReliableGnssAnchor(location: LocationSnapshot): boolean {
+    const speedAccuracyMps = location.speedAccuracyMps;
+    const sourceType = location.locationSourceType;
+    return location.speedMps >= 0 &&
+      speedAccuracyMps !== null &&
+      speedAccuracyMps > 0 &&
+      location.speedMps >= speedAccuracyMps &&
+      sourceType !== null &&
+      (sourceType === 1 || sourceType === 4);
+  }
+
+  private isCurrentGnss(location: LocationSnapshot): boolean {
+    return location.locationAgeMs >= 0 &&
+      location.locationAgeMs <= this.GNSS_DISPLAY_FRESHNESS_MS;
+  }
+
+  private isDisplayableGnss(location: LocationSnapshot): boolean {
+    const sourceType = location.locationSourceType;
+    return location.speedMps >= 0 &&
+      sourceType !== null &&
+      (sourceType === 1 || sourceType === 4) &&
+      this.isCurrentGnss(location);
+  }
+
+  private showCurrentGnssSpeed(speedMps: number, locationAgeMs: number): void {
+    const generation = ++this.gnssDisplayGeneration;
+    this.gnssSpeedKmh = Math.max(0, speedMps * 3.6);
+    const remainingFreshnessMs = Math.max(0, this.GNSS_DISPLAY_FRESHNESS_MS - locationAgeMs);
+    setTimeout(() => {
+      if (generation === this.gnssDisplayGeneration) {
+        this.gnssSpeedKmh = null;
+      }
+    }, remainingFreshnessMs);
+  }
+
+  private clearGnssDisplay(): void {
+    this.gnssDisplayGeneration += 1;
+    this.gnssSpeedKmh = null;
   }
 
   private stopLocationIfUnused(): void {
@@ -366,21 +470,22 @@ struct InertialSpeed {
       return;
     }
     this.measurementLocationActive = false;
-    this.locationController.stop();
-    this.locationStatus = '定位已停止';
+    this.clearGnssDisplay();
+    const cleanupSucceeded = this.locationController.stop();
+    this.locationStatus = cleanupSucceeded ? '定位已停止' : '定位退订失败，请重试';
   }
 
-  private stopMeasurement(reason: string = 'manual'): void {
+  private stopMeasurement(reason: string = 'manual'): boolean {
     if (!this.isRunning) {
-      return;
+      return true;
     }
 
     this.measurementOperationId += 1;
     BackgroundState.measurementActive = false;
     this.notifyCollectionStateChanged();
     const now = Date.now();
-    this.sensorController.stop();
-    this.sensorStatus = '传感器已停止';
+    const sensorCleanupSucceeded = this.sensorController.stop();
+    this.sensorStatus = sensorCleanupSucceeded ? '传感器已停止' : '传感器退订失败，请重试';
     this.researchStatus = this.researchRecorder.endMeasurement(now,
       `reason=${reason} speed=${this.stats.currentSpeedKmh.toFixed(2)}km/h`);
     this.syncResearchRuntimeState();
@@ -396,11 +501,12 @@ struct InertialSpeed {
     this.researchSensorActive = false;
     this.stopLocationIfUnused();
     if (!this.locationController.isRunning) {
-      this.gnssSpeedKmh = 0;
+      this.clearGnssDisplay();
     }
     if (this.researchStatus.running) {
       this.ensureResearchSensorsOrStop();
     }
+    return sensorCleanupSucceeded;
   }
 
   private handleMeasurementCoreSensorFatal(error: CoreSensorFatalError, operationId: number): void {
@@ -411,10 +517,12 @@ struct InertialSpeed {
         return;
       }
       const reason = `core_sensor_failure sensor=${error.sensor} phase=${error.phase}`;
-      this.stopMeasurement(reason);
+      const sensorCleanupSucceeded = this.stopMeasurement(reason);
       const recordingContinues = this.researchStatus.running;
       this.sensorStatus = `测速已中止：${error.message}` +
-        (recordingContinues ? '；研究记录继续' : '，请重新开始');
+        (sensorCleanupSucceeded
+          ? (recordingContinues ? '；研究记录继续' : '，请重新开始')
+          : '；传感器退订失败，请重试');
     }, 0);
   }
 
@@ -430,13 +538,15 @@ struct InertialSpeed {
         '研究记录传感器中断',
         `sensor=${error.sensor} phase=${error.phase} message=${error.message}`
       );
-      this.sensorController.stop();
+      const sensorCleanupSucceeded = this.sensorController.stop();
       this.researchSensorActive = false;
       this.researchStatus = this.researchRecorder.stop(now);
       BackgroundState.recordingActive = false;
       this.notifyCollectionStateChanged();
       this.stopLocationIfUnused();
-      this.sensorStatus = `研究记录已停止：${error.message}，请重新开始`;
+      this.sensorStatus = sensorCleanupSucceeded
+        ? `研究记录已停止：${error.message}，请重新开始`
+        : `研究记录已停止：${error.message}；传感器退订失败，请重试`;
     }, 0);
   }
 
@@ -488,7 +598,7 @@ struct InertialSpeed {
       this.lastAnchorInertialMps = 0;
       this.hasGnssAnchor = true;
       this.gnssAnchorUsable = true;
-      this.gnssSpeedKmh = 0;
+      this.clearGnssDisplay();
       this.inertialSpeedHistory = [];
     }
 
@@ -505,9 +615,12 @@ struct InertialSpeed {
       const anchorSpeedKmh = Math.max(0, (this.lastAnchorGnssMps + delta) * 3.6);
       this.stats.currentSpeedKmh = anchorSpeedKmh;
     }
-    const displayTimestampMs = frame.sensorTimestamp === null || frame.sensorTimestamp === undefined
-      ? frame.timestampMs
-      : frame.sensorTimestamp / 1000000;
+    const displayTimestampMs = frame.sensorTimestamp !== null &&
+      frame.sensorTimestamp !== undefined &&
+      Number.isFinite(frame.sensorTimestamp) &&
+      frame.sensorTimestamp > 0
+      ? frame.sensorTimestamp / 1000000
+      : frame.timestampMs;
     this.updateDisplayStats(this.stats.currentSpeedKmh, displayTimestampMs);
     this.researchRecorder.updateEstimator(nextFrame.sample, nextFrame.stats, nextFrame.calibration);
     this.researchStatus = this.researchRecorder.status();
@@ -702,7 +815,7 @@ struct InertialSpeed {
     BackgroundState.measurementActive = false;
     this.notifyCollectionStateChanged();
     const now = Date.now();
-    this.sensorController.stop();
+    const sensorCleanupSucceeded = this.sensorController.stop();
     this.researchSensorActive = false;
     this.estimator.reset(now);
     this.stats = {
@@ -721,9 +834,11 @@ struct InertialSpeed {
     this.hasGnssAnchor = false;
     this.gnssAnchorUsable = false;
     this.pureInertialSpeedKmh = 0;
-    this.gnssSpeedKmh = 0;
+    this.clearGnssDisplay();
     this.showPlacementWarning = false;
-    this.sensorStatus = '开始失败：初始校准不稳';
+    this.sensorStatus = sensorCleanupSucceeded
+      ? '开始失败：初始校准不稳'
+      : '开始失败：初始校准不稳；传感器退订失败，请重试';
     this.researchStatus = this.researchRecorder.cancelMeasurement(now, rejectionNotes);
     this.syncResearchRuntimeState();
     this.stopLocationIfUnused();
@@ -739,8 +854,8 @@ struct InertialSpeed {
     const operationId = ++this.researchOperationId;
     const now = Date.now();
     if (this.researchStatus.running) {
-      this.stopResearchSensorsIfIdle();
-      if (!this.isRunning) {
+      const sensorCleanupSucceeded = this.stopResearchSensorsIfIdle();
+      if (!this.isRunning && sensorCleanupSucceeded) {
         this.sensorStatus = '传感器未启动';
       }
       this.researchStatus = this.researchRecorder.stop(now);
@@ -877,19 +992,24 @@ struct InertialSpeed {
     return false;
   }
 
-  private stopResearchSensorsIfIdle(): void {
+  private stopResearchSensorsIfIdle(): boolean {
     if (!this.researchSensorActive) {
-      return;
+      return true;
     }
 
+    let cleanupSucceeded: boolean;
     if (this.isRunning) {
-      this.sensorController.stopAuxiliarySensors();
+      cleanupSucceeded = this.sensorController.stopAuxiliarySensors();
       this.researchSensorActive = false;
-      return;
+    } else {
+      cleanupSucceeded = this.sensorController.stop();
+      this.researchSensorActive = false;
     }
 
-    this.sensorController.stop();
-    this.researchSensorActive = false;
+    if (!cleanupSucceeded) {
+      this.sensorStatus = '传感器退订失败，请重试';
+    }
+    return cleanupSucceeded;
   }
 
   private onResearchSensorFrame(frame: SensorFrame): void {
@@ -1264,7 +1384,7 @@ struct InertialSpeed {
 
         Column() {
           Row() {
-            Text(this.gnssSpeedKmh.toFixed(1))
+            Text(this.gnssSpeedKmh === null ? '—' : this.gnssSpeedKmh.toFixed(1))
               .fontSize(15)
               .fontWeight(FontWeight.Medium)
               .fontColor('#60A5FA')
@@ -1655,7 +1775,7 @@ struct InertialSpeed {
                     .letterSpacing(3);
                   Text('请将设备稳定放置，\n停车时重新开始测速，\n设备移动会中止测速。')
                     .fontSize(15)
-                    .fontColor('#FECACA')
+                    .fontColor('#FFFFFF')
                     .lineHeight(26)
                     .margin({ top: 14 });
                 }

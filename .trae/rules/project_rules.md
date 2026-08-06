@@ -106,14 +106,14 @@ $env:PATH = "$env:NODE_HOME;$env:JAVA_HOME\bin;" + $env:PATH
 1. 复制模板：`Copy-Item build-profile.template.json5 build-profile.json5`
 2. 用 DevEco Studio 打开工程，让其自动填充 debug 签名；或手动配置签名
 
-release 签名使用 `tools/sign_app.ps1` 脚本手动签名。脚本默认从实际 `build-profile.json5` 和仓库模板解析 compatible API，要求所有可用配置得到唯一一致的值；显式传入 `-CompatibleApiVersion` 时也必须与配置一致，禁止硬编码旧 API。脚本默认交互读取密码；仅自动化环境显式使用 `-NonInteractivePassword`，并按脚本接口在进程运行时提供所需环境变量。不得把变量值回显、写入仓库文件或复制到构建/验签记录：
+release 签名使用 `tools/sign_app.ps1` 脚本手动签名。脚本默认从实际 `build-profile.json5` 和仓库模板解析 compatible API，要求所有可用配置得到唯一一致的值；显式传入 `-CompatibleApiVersion` 时也必须与配置一致，禁止硬编码旧 API。未显式指定 `-OutputPath` 时，脚本必须从输入 APP 的 `pack.info` 读取实际 `versionName` / `versionCode`，默认输出为 `MetroSpeed-<versionName>-<versionCode>-release.app`；不能退回不含版本的通用正式文件名。脚本默认交互读取密码；仅自动化环境显式使用 `-NonInteractivePassword`，并按脚本接口在进程运行时提供所需环境变量。不得把变量值回显、写入仓库文件或复制到构建/验签记录：
 ```powershell
 $env:METROSPEED_KEYSTORE_PASSWORD = "<密钥库密码>"
 $env:METROSPEED_KEY_PASSWORD = "<密钥密码>"
 ```
 
 ```powershell
-# 默认输入输出（交互输入密码）
+# 默认输入与版本化输出（交互输入密码）
 powershell -ExecutionPolicy Bypass -File tools\sign_app.ps1
 
 # 指定输入输出
@@ -206,18 +206,23 @@ python tools/replay_estimator.py "<数据目录>\<文件名>.jsonl"
 ### 5.1 当前代主回归集
 
 当前代主回归集的长期权威入口必须是**受版本控制且经人工确认的
-manifest**，至少记录每个输入的稳定逻辑 ID、场景、文件 SHA-256、字节数、
-schema、完整性口径和必跑参数配置。算法或融合逻辑改动必须严格使用 manifest
-锁定的全部输入，不能按目录当时恰好存在的文件静默增删，也不能仅因单文件
-体积较大而跳过。
+manifest**，至少记录每个输入的脱敏稳定逻辑 ID、场景类别、文件 SHA-256、
+字节数、schema、完整性口径和必跑参数配置。原始 JSONL 只保存在本地数据目录，
+原始文件名、路线、精确坐标和本地绝对路径不得进入公开仓库。算法或融合逻辑
+改动必须严格使用 manifest 锁定的全部输入，不能按目录当时恰好存在的文件静默
+增删，也不能仅因单文件体积较大而跳过。README 不承担回归数据资产清单职责。
 
 > **待办 `REG-MANIFEST-001`（尚未落地）**：当前仓库没有经过人工确认、可
 > 安全提交的回归 manifest；本规则不伪造文件名、记录名或哈希。在该待办完成
 > 前，`METROSPEED_DATA_DIR` 根目录中的 JSONL 暂作为当前代候选集合，明确
 > 归档到 `50Hz/`、`旧记录/` 等子目录的文件不自动计入。每次基线开始前必须
-> 先生成并保存本轮精确输入清单（路径或脱敏逻辑 ID、字节数、SHA-256、schema、
-> 完整性和完整命令行参数），由人工确认仍对应地铁、公交、驾车三条当前记录；
-> 缺少这份清单时不得声称完成“当前代全量回归”。
+> 先生成本轮精确输入清单，并在
+> [`.trae/documents/investigation_status.md`](../documents/investigation_status.md)
+> 保存可安全提交的脱敏逻辑 ID、场景类别、字节数、SHA-256、schema、完整性、
+> 完整命令行参数和清单自身 SHA-256；原始文件名及行程信息仍不得公开。该清单
+> 必须由人工确认包含四条当前代真实记录并至少覆盖地铁、公交、驾车三类场景。
+> 缺项、使用占位参数、混入历史兼容记录或未经人工确认时，不得声称完成
+> “当前代全量回归”，也不得让正式候选进入发布资格。
 
 - 改动前跑主回归基线：`python tools/_baseline_all.py --dir <METROSPEED_DATA_DIR>`
 - 改动后用相同文件、相同参数跑对比；涉及锚点时同时使用 `--anchor-v2 --pure-zero`
@@ -299,7 +304,7 @@ schema、完整性口径和必跑参数配置。算法或融合逻辑改动必�
 | [`.trae/rules/project_rules.md`](project_rules.md) | 约束 AI 行为的硬规则 | 发现缺失或不适用时，仅在用户明确确认后更新 |
 | [`.trae/documents/investigation_status.md`](../documents/investigation_status.md) | 当前工作交接快照：当前候选、已完成验证、关键结论边界、外部状态和下一步；隧道机制只保留可恢复上下文的摘要并链接主记录 | 任何持久代码、配置或文档改动，新验证证据或外部提交状态生效后，在提交或交接前更新 |
 | [`.trae/documents/harmonyos_tunnel_positioning_reverse_engineering.md`](../documents/harmonyos_tunnel_positioning_reverse_engineering.md) | HarmonyOS 隧道定位研究的权威长记录：镜像/真机对象、哈希、函数链、证据等级、复现方法、未知项和研究时间线 | 系统机制研究出现新证据、反证、边界变化或解释修正时更新；纯 MetroSpeed 发版状态不写入此文档 |
-| [`README.md`](../../README.md) | 面向公开仓库的稳定项目说明：当前公开版或下一公开候选、用户可见功能与限制、公式、数据资产、仓库结构和里程碑 | 公开事实、产品行为、限制、算法版本、数据资产或仓库结构变化时同步更新；不展开内部候选流水账 |
+| [`README.md`](../../README.md) | 面向公开仓库的稳定项目说明：当前公开版或下一公开候选、用户可见功能与限制、公式、研究记录格式与隐私边界、仓库结构和里程碑 | 公开事实、产品行为、限制、算法版本、研究记录格式/隐私边界或仓库结构变化时同步更新；不展开内部候选流水账或私有回归资产 |
 
 同一隧道机制结论以逆向主记录为权威来源；status 只摘要当前结论与未决项，README 只保留公开层面的研究边界和里程碑，禁止三处复制整段机制正文。
 
@@ -308,9 +313,11 @@ schema、完整性口径和必跑参数配置。算法或融合逻辑改动必�
 README 中以下内容随项目演进变化，改动时一并更新：
 - **算法版本号** — 与 `ALGORITHM_VERSION` 同步
 - **速度公式** — 与当前显示逻辑一致
-- **数据资产表** — 新增记录、新增 MAE 列
+- **研究记录格式与隐私边界** — schema、采集范围、保留/导出语义或隐私边界变化
 - **时间线** — 阶段性成果
 - **项目结构** — 新增/移除/重命名工具文件
+
+README 不维护真实回归记录的数据资产表，也不公开原始文件名、行程、精确坐标、文件哈希、字节数或逐记录 MAE。`REG-001` 要求的精确输入身份、参数和结果只按可安全提交的脱敏形式维护在交接 status 或后续经人工确认的 manifest 中；实际 JSONL 始终留在本地私有数据目录。
 
 AppGallery 和 GitHub Release 的更新说明是发布页面输入，默认不写入 README、status 或逆向主记录；只有用户明确指定仓库文件时才落盘。README 时间线只记录阶段性里程碑。更新说明必须以“上一公开分发版本 → 当前待发布版本”的用户可见差异为基准，不得把仅在开发候选中出现并在公开前修掉的问题包装成面向用户的修复，也不得把请求频率写成设备必然回调频率。
 
