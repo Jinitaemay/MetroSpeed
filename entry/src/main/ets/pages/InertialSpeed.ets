@@ -1256,7 +1256,7 @@ struct InertialSpeed {
     }
     this.navigationInProgress = true;
     try {
-      this.getUIContext().getRouter().replaceUrl({ url: 'pages/TunnelLight' }).then(() => {
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/TunnelLight' }).then(() => {
         this.navigationInProgress = false;
       }).catch(() => {
         this.navigationInProgress = false;

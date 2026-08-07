@@ -354,8 +354,9 @@ class ResearchExportContractTests(unittest.TestCase):
         switch_guard_index = switch_body.index(
             "if (this.navigationInProgress || this.researchExportInProgress)"
         )
-        replace_index = switch_body.index("getRouter().replaceUrl", switch_guard_index)
-        self.assertLess(switch_guard_index, replace_index)
+        push_index = switch_body.index("getRouter().pushUrl", switch_guard_index)
+        self.assertLess(switch_guard_index, push_index)
+        self.assertNotIn("getRouter().replaceUrl", switch_body)
 
         overlay_begin = self.page_source.index("private ExportOverlay()")
         overlay_end = self.page_source.index("\n  @Builder\n  private ResearchPanel", overlay_begin)
