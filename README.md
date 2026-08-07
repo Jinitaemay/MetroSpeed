@@ -2,7 +2,7 @@
 
 基于手机惯性传感器与 GNSS 的轨道交通测速工具，提供稳定放置的连续惯性测速和手持灯光打点测速两种模式。
 
-> **公开状态**：GitHub Release `v1.2.0` 及同名 tag 保存 1.2.0 公开源码；仓库不存在远端 `release/1.2.0` 分支。`fix/post-1.2.0-known-issues` 已作为 GitHub 源码分支推送，但当前没有具备发布资格的 1.2.1 候选，也没有 1.2.1 GitHub Release 或 AppGallery 提交。应用市场版本、公开 Release 与开发分支的功能可能不同。
+> **公开状态**：AppGallery 当前已上架 `1.2.1`（versionCode `1786008552`）；GitHub 最新公开 Release 仍为 `v1.2.0`，同名 tag 保存 1.2.0 公开源码。当前开发源码为 `1.2.1`（versionCode `1786070991`），较 AppGallery 在架包更新，尚无与其同源的正式 APP 或 GitHub `v1.2.1` Release。仓库不存在远端 `release/1.2.0` 分支，应用市场版本、GitHub Release 与当前源码的功能可能不同。
 >
 > **系统要求**：HarmonyOS 手机，`compatibleSdkVersion 6.0.0(20)`，`targetSdkVersion 6.1.1(24)`。
 >
@@ -136,7 +136,7 @@ CURVE > CONDUCTION_VIB > STRONG_VIB > LOW_CONFIDENCE
 
 ### 技术基线
 
-- 当前开发线：`1.2.1` 源码开发中，当前没有具备发布资格的正式候选
+- 当前开发线：`1.2.1` / versionCode `1786070991`；尚无与该源码同源的正式 APP
 - **算法版本**：`anchor-delta-20260807-r5`
 - 研究记录格式：schema v17
 - SDK：`compatibleSdkVersion 6.0.0(20)`、`targetSdkVersion 6.1.1(24)`
@@ -191,9 +191,9 @@ python tools/aux_sensor_location_diag.py ".\records\sample.jsonl"
 - **2026 年 6 月**：以原始加速度计、自算重力、统计主轴和停车校准重建 MetroSpeed；首个公开版本通过 AppGallery 审核。
 - **2026 年 7 月上旬**：持续完善初始校准、停车校准、置信度、手持检测与后台采集。
 - **2026 年 7 月下旬**：加入并列的灯光打点测速，升级至 API 24 和请求 100 Hz 的时间化估算，并独立开展 HarmonyOS 隧道定位静态研究。
-- **2026 年 8 月**：完成研究记录 schema v17、可靠性与无障碍修正，将 `1.2.0` 源码候选提交 AppGallery 复审；随后冻结该候选，并在独立分支继续处理导出、传感器失活和振动主轴学习问题。
+- **2026 年 8 月**：完成研究记录 schema v17、可靠性与无障碍修正，`1.2.1`（versionCode `1786008552`）上架 AppGallery；GitHub 最新公开 Release 仍为 `v1.2.0`。随后继续处理导出、传感器失活、振动主轴学习及手持模式切换问题，当前源码推进至 versionCode `1786070991`。
 
-逐项改动和面向用户的更新说明见 GitHub Releases；README 只保留稳定项目里程碑。
+逐项改动见 Git 历史；GitHub Releases 当前仍以 `v1.2.0` 为最新公开 Release，AppGallery 在架版本以应用市场页面为准。README 只保留稳定项目里程碑。
 
 ## 许可证
 

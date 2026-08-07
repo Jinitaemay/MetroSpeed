@@ -59,12 +59,15 @@ class ReleaseContractTests(unittest.TestCase):
         status = self.read(".trae/documents/investigation_status.md")
         rules = self.read(".trae/rules/project_rules.md")
 
-        self.assertIn("GitHub Release `v1.2.0`", readme)
+        self.assertIn("GitHub 最新公开 Release 仍为 `v1.2.0`", readme)
+        self.assertIn("AppGallery 当前已上架 `1.2.1`", readme)
         self.assertIn("不存在远端 `release/1.2.0` 分支", readme)
         self.assertNotIn("`release/1.2.0` 固定保存", readme)
         self.assertNotIn("本地正式候选", readme)
-        self.assertIn("当前没有具备发布资格的 1.2.1 候选", status)
-        self.assertIn("versionCode `1786008552` 不得提交", status)
+        self.assertIn("AppGallery 当前在架版本", status)
+        self.assertIn("当前源码发布状态：尚无同源正式 APP", status)
+        self.assertIn("不能作为当前源码的 GitHub Release 资产", status)
+        self.assertNotIn("versionCode `1786008552` 不得提交", status)
         self.assertIn("`REG-001` 精确清单尚未闭环", status)
         self.assertIn(
             "1,541,653,379 字节（约 1.54 GB / 1.44 GiB）", status
